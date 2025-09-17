@@ -18,10 +18,10 @@ const UserSchema = new mongoose.Schema(
     },
     password: { type: String, required: true, minlength: 6 },
     mobile: { type: String, required: true, trim: true },
-    aadhaar: { type: String, default: null }, // optional, editable only from profile page
+    aadhaar: { type: String, default: null },
 
     // 🔹 Profile update fields
-    dateOfBirth: { type: String, default: null }, // stored as "YYYY-MM-DD"
+    dateOfBirth: { type: String, default: null }, // format: YYYY-MM-DD
     age: { type: Number, default: null },
     gender: { type: String, default: null },
     bloodType: { type: String, default: null },
@@ -58,15 +58,15 @@ const UserSchema = new mongoose.Schema(
         type: {
           type: String,
           enum: ["report", "prescription", "bill", "insurance"],
-          required: true
+          required: true,
         },
         title: String,
         date: Date,
         status: { type: String, enum: ["reviewed", "pending"] },
-        fileType: String, // pdf, image, etc
+        fileType: String,
         size: String,
-        fileUrl: String
-      }
+        fileUrl: String,
+      },
     ],
 
     // 🔹 System fields
@@ -100,8 +100,8 @@ UserSchema.pre("save", async function (next) {
 
 // 🔐 Compare password
 UserSchema.methods.comparePassword = async function (candidatePassword) {
-  return await bcrypt.compare(candidatePassword, this.password);
+  return bcrypt.compare(candidatePassword, this.password);
 };
 
-const User = mongoose.model("User", UserSchema);
-export default User;
+// ✅ Named export (consistent with DoctorUser, File, Appointment)
+export const User = mongoose.model("User", UserSchema);
