@@ -1,6 +1,5 @@
 import mongoose from "mongoose";
-import bcrypt from "bcrypt";
-
+import bcrypt from "bcryptjs"; 
 const doctorUserSchema = new mongoose.Schema({
   // Required fields for signup
   name: { type: String, required: [true, "Name is required"], trim: true },
