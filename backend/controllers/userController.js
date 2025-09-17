@@ -1,4 +1,4 @@
-import User from '../models/User.js';
+import { User } from "../models/User.js";
 
 // @desc    Update user profile
 // @route   PUT /api/user/profile

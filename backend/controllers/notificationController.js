@@ -1,5 +1,5 @@
 import { sendPushNotification } from '../config/firebase.js';
-import User from '../models/User.js';
+import { User } from "../models/User.js";
 
 // @desc    Send push notification to a specific user
 // @route   POST /api/notifications/send
