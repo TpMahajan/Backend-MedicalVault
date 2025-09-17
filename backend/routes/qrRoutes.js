@@ -2,7 +2,7 @@
 import express from "express";
 import jwt from "jsonwebtoken";
 import { auth } from "../middleware/auth.js";
-import User from "../models/User.js";
+import { User } from "../models/User.js";
 import QRCode from "../models/QRCode.js"; // <-- new model
 
 const router = express.Router();
