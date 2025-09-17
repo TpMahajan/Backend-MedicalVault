@@ -1,106 +1,70 @@
-const express = require("express");
-const Appointment = require("../models/Appointment");
-const auth = require("../middleware/auth");
+import express from "express";
+import { Appointment } from "../models/Appointment.js";
+import { auth } from "../middleware/auth.js";
 
 const router = express.Router();
 
-// POST /api/appointments - Create new appointment
+// ================= Create Appointment =================
 router.post("/", auth, async (req, res) => {
   try {
-    console.log("Create appointment API called");
-    console.log("Appointment data:", req.body);
-    
-    const { 
-      patientId, 
-      patientName, 
-      patientEmail, 
-      patientPhone, 
-      appointmentDate, 
-      appointmentTime, 
+    const {
+      patientId,
+      patientName,
+      patientEmail,
+      patientPhone,
+      appointmentDate,
+      appointmentTime,
       duration,
-      reason, 
+      reason,
       appointmentType,
-      notes 
+      notes,
     } = req.body;
-    
-    // Validate required fields
+
     if (!patientId || !patientName || !appointmentDate || !appointmentTime || !reason) {
       return res.status(400).json({
         success: false,
-        message: "Patient ID, name, appointment date, time, and reason are required.",
+        message:
+          "Patient ID, name, appointment date, time, and reason are required.",
       });
     }
 
-    // Create new appointment
     const appointment = new Appointment({
       patientId: patientId.trim(),
       patientName: patientName.trim(),
-      patientEmail: patientEmail ? patientEmail.trim() : "",
-      patientPhone: patientPhone ? patientPhone.trim() : "",
+      patientEmail: patientEmail?.trim() || "",
+      patientPhone: patientPhone?.trim() || "",
       appointmentDate: new Date(appointmentDate),
       appointmentTime: appointmentTime.trim(),
       duration: duration || 30,
       reason: reason.trim(),
       appointmentType: appointmentType || "consultation",
-      notes: notes ? notes.trim() : "",
+      notes: notes?.trim() || "",
       doctorId: req.doctor._id,
       doctorName: req.doctor.name,
     });
 
     await appointment.save();
 
-    console.log("Appointment created successfully:", {
-      id: appointment._id,
-      patientName: appointment.patientName,
-      appointmentDate: appointment.appointmentDate,
-      appointmentTime: appointment.appointmentTime,
-      reason: appointment.reason,
-      doctorId: appointment.doctorId
-    });
-
     res.status(201).json({
       success: true,
       message: "Appointment created successfully.",
-      appointment: {
-        id: appointment._id,
-        patientName: appointment.patientName,
-        appointmentDate: appointment.appointmentDate,
-        appointmentTime: appointment.appointmentTime,
-        reason: appointment.reason,
-        notes: appointment.notes,
-        status: appointment.status,
-        createdAt: appointment.createdAt,
-      },
+      appointment,
     });
   } catch (error) {
-    console.error("Appointment creation error:", error);
-    
-    if (error.name === "ValidationError") {
-      const errors = Object.values(error.errors).map(err => err.message);
-      return res.status(400).json({
-        success: false,
-        message: "Validation error.",
-        errors,
-      });
-    }
-
     res.status(500).json({
       success: false,
       message: "Internal server error while creating appointment.",
+      error: error.message,
     });
   }
 });
 
-// GET /api/appointments - Get all appointments for the doctor
+// ================= Get All Appointments =================
 router.get("/", auth, async (req, res) => {
   try {
-    console.log("Get appointments API called for doctor:", req.doctor._id);
-    
     const appointments = await Appointment.find({ doctorId: req.doctor._id })
       .sort({ appointmentDate: 1, appointmentTime: 1 })
       .select("-doctorId");
-
-    console.log(`Found ${appointments.length} appointments`);
 
     res.json({
       success: true,
@@ -109,15 +73,15 @@ router.get("/", auth, async (req, res) => {
       count: appointments.length,
     });
   } catch (error) {
-    console.error("Get appointments error:", error);
     res.status(500).json({
       success: false,
       message: "Internal server error while retrieving appointments.",
+      error: error.message,
     });
   }
 });
 
-// GET /api/appointments/:id - Get specific appointment
+// ================= Get Appointment by ID =================
 router.get("/:id", auth, async (req, res) => {
   try {
     const appointment = await Appointment.findOne({
@@ -132,38 +96,31 @@ router.get("/:id", auth, async (req, res) => {
       });
     }
 
-    res.json({
-      success: true,
-      message: "Appointment retrieved successfully.",
-      appointment,
-    });
+    res.json({ success: true, appointment });
   } catch (error) {
-    console.error("Get appointment error:", error);
     res.status(500).json({
       success: false,
       message: "Internal server error while retrieving appointment.",
+      error: error.message,
     });
   }
 });
 
-// PUT /api/appointments/:id - Update appointment
+// ================= Update Appointment =================
 router.put("/:id", auth, async (req, res) => {
   try {
     const { patientName, appointmentDate, appointmentTime, reason, notes, status } = req.body;
-    
+
     const updateData = {
-      patientName: patientName ? patientName.trim() : undefined,
+      patientName: patientName?.trim(),
       appointmentDate: appointmentDate ? new Date(appointmentDate) : undefined,
-      appointmentTime: appointmentTime ? appointmentTime.trim() : undefined,
-      reason: reason ? reason.trim() : undefined,
-      notes: notes ? notes.trim() : undefined,
+      appointmentTime: appointmentTime?.trim(),
+      reason: reason?.trim(),
+      notes: notes?.trim(),
       status: status || undefined,
     };
 
-    // Remove undefined values
-    Object.keys(updateData).forEach(key => 
-      updateData[key] === undefined && delete updateData[key]
-    );
+    Object.keys(updateData).forEach((key) => updateData[key] === undefined && delete updateData[key]);
 
     const appointment = await Appointment.findOneAndUpdate(
       { _id: req.params.id, doctorId: req.doctor._id },
@@ -178,21 +135,17 @@ router.put("/:id", auth, async (req, res) => {
       });
     }
 
-    res.json({
-      success: true,
-      message: "Appointment updated successfully.",
-      appointment,
-    });
+    res.json({ success: true, message: "Appointment updated successfully.", appointment });
   } catch (error) {
-    console.error("Update appointment error:", error);
     res.status(500).json({
       success: false,
       message: "Internal server error while updating appointment.",
+      error: error.message,
     });
   }
 });
 
-// DELETE /api/appointments/:id - Delete appointment
+// ================= Delete Appointment =================
 router.delete("/:id", auth, async (req, res) => {
   try {
     const appointment = await Appointment.findOneAndDelete({
@@ -207,18 +160,15 @@ router.delete("/:id", auth, async (req, res) => {
       });
     }
 
-    res.json({
-      success: true,
-      message: "Appointment deleted successfully.",
-    });
+    res.json({ success: true, message: "Appointment deleted successfully." });
   } catch (error) {
-    console.error("Delete appointment error:", error);
     res.status(500).json({
       success: false,
       message: "Internal server error while deleting appointment.",
+      error: error.message,
     });
   }
 });
 
+// ✅ ESM Export
 export default router;
-
