@@ -3,8 +3,9 @@ import multer from "multer";
 import path from "path";
 import { CloudinaryStorage } from "multer-storage-cloudinary";
 import { v2 as cloudinary } from "cloudinary";
-import axios from "axios";   // ✅ add this
-import File from "../models/File.js";
+import axios from "axios";
+import { auth } from "../middleware/auth.js";  // ✅ auth middleware
+import { Document } from "../models/File.js"; // ✅ unified Document model
 
 const router = express.Router();
 
@@ -22,233 +23,157 @@ const storage = new CloudinaryStorage({
     const baseName = path.parse(file.originalname).name.replace(/\s+/g, "_");
     const ext = path.extname(file.originalname).toLowerCase();
 
-    if (ext === ".pdf") {
-      return {
-        folder: "medical-vault",
-        public_id: `${Date.now()}-${baseName}`,
-        resource_type: "auto",
-        format: "pdf",   // ✅ force pdf format
-      };
-    }
-
     return {
       folder: "medical-vault",
       public_id: `${Date.now()}-${baseName}`,
       resource_type: "auto",
+      format: ext === ".pdf" ? "pdf" : undefined,
     };
   },
 });
 
-// ---------------- Multer Fix ----------------
+// ---------------- Multer ----------------
 const upload = multer({
   storage,
-  limits: { fileSize: 50 * 1024 * 1024 },
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
   fileFilter: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     if (ext === ".pdf" && file.mimetype === "application/octet-stream") {
-      console.log(`🔧 FILEFILTER: Fixing PDF mimetype → application/pdf`);
-      file.mimetype = "application/pdf";
+      file.mimetype = "application/pdf"; // fix for some clients
     }
     cb(null, true);
   },
 });
 
 // ---------------- Upload ----------------
-router.post("/upload", upload.single("file"), async (req, res) => {
+router.post("/upload", auth, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
 
-    const ext = path.extname(req.file.originalname).toLowerCase();
-    if (ext === ".pdf" && req.file.mimetype !== "application/pdf") {
-      req.file.mimetype = "application/pdf";
-    }
+    const { patientId, title, category, date, notes } = req.body;
 
-    console.log("📂 Uploaded file:", req.file);
-
-    const { email, title, category, date, notes } = req.body;
-
-    const newFile = await File.create({
-      userId: email,
+    const doc = await Document.create({
+      patientId,
+      doctorId: req.auth?.role === "doctor" ? req.auth.id : undefined,
       title: title || req.file.originalname,
-      notes: notes || "",
-      date: date || new Date().toISOString(),
-      originalName: req.file.originalname,
-      mimeType: req.file.mimetype,
-      size: req.file.size,
-      url: req.file.path,
-      publicId: req.file.filename,
-      resourceType: "auto",
-      category: category || "Other",
+      type: category || "Other",
+      description: notes || "",
+      cloudinaryUrl: req.file.path,
+      cloudinaryPublicId: req.file.filename,
+      fileType: req.file.mimetype,
+      fileSize: req.file.size,
+      uploadedAt: date || new Date(),
     });
 
-    res.json({
-      ok: true,
-      file: {
-        id: newFile._id.toString(),
-        userId: newFile.userId,
-        title: newFile.title,
-        notes: newFile.notes,
-        date: newFile.date,
-        fileName: newFile.originalName,
-        fileType: newFile.mimeType?.split("/").pop() || "file",
-        uploadedAt: newFile.createdAt,
-        url: newFile.url,
-        category: newFile.category,
-        resourceType: newFile.resourceType,
-        publicId: newFile.publicId,
-      },
-    });
+    res.json({ success: true, document: doc });
   } catch (err) {
-    res.status(500).json({ msg: "Upload failed", err: err.message });
+    res.status(500).json({ msg: "Upload failed", error: err.message });
   }
 });
 
 // ---------------- List Files ----------------
-router.get("/", async (req, res) => {
+router.get("/patient/:patientId", auth, async (req, res) => {
   try {
-    const { email, category } = req.query;
-    const query = {};
-    if (email) query.userId = email;
-    if (category) query.category = { $regex: new RegExp(`^${category}$`, "i") };
-
-    const files = await File.find(query).sort({ createdAt: -1 });
-
-    res.json({
-      success: true,
-      count: files.length,
-      documents: files.map((f) => ({
-        id: f._id.toString(),
-        userId: f.userId,
-        title: f.title || f.originalName,
-        notes: f.notes,
-        date: f.date,
-        fileName: f.originalName,
-        fileType: f.mimeType?.split("/").pop() || "file",
-        uploadedAt: f.createdAt,
-        url: f.url,
-        category: f.category,
-        resourceType: f.resourceType || "auto",
-      })),
-    });
+    const docs = await Document.find({ patientId: req.params.patientId }).sort({ createdAt: -1 });
+    res.json({ success: true, count: docs.length, documents: docs });
   } catch (err) {
-    res.status(500).json({ success: false, msg: "Error fetching files", err: err.message });
+    res.status(500).json({ success: false, msg: "Error fetching files", error: err.message });
   }
 });
 
-// ---------------- Download ----------------
-router.get("/download/:id", async (req, res) => {
+// ---------------- Grouped Files ----------------
+router.get("/patient/:patientId/grouped", auth, async (req, res) => {
   try {
-    const file = await File.findById(req.params.id);
-    if (!file) return res.status(404).json({ msg: "File not found" });
-
-    const downloadUrl = cloudinary.url(file.publicId, {
-      resource_type: file.resourceType || "auto",
-      secure: true,
-      flags: "attachment",
-    });
-
-    return res.redirect(downloadUrl);
-  } catch (err) {
-    res.status(500).json({ msg: "Error downloading file", err: err.message });
-  }
-});
-
-// ---------------- Proxy for Preview ----------------
-router.get("/proxy/:id", async (req, res) => {
-  try {
-    const file = await File.findById(req.params.id);
-    if (!file) return res.status(404).json({ msg: "File not found" });
-
-    // ✅ Generate a proper Cloudinary delivery URL instead of using stored file.url
-    const previewUrl = cloudinary.url(file.publicId, {
-      resource_type: file.resourceType || "auto",
-      secure: true,
-      format: file.originalName.toLowerCase().endsWith(".pdf") ? "pdf" : undefined
-    });
-
-    console.log(`📄 Proxy fetching from: ${previewUrl}`);
-
-    const response = await axios.get(previewUrl, { responseType: "arraybuffer" });
-
-    // Force correct content type
-    if (file.originalName.toLowerCase().endsWith(".pdf")) {
-      res.setHeader("Content-Type", "application/pdf");
-    } else {
-      res.setHeader("Content-Type", file.mimeType || "application/octet-stream");
-    }
-
-    res.send(response.data);
-  } catch (err) {
-    console.error("❌ Proxy error:", err.message);
-    res.status(500).json({ msg: "Error proxying file", err: err.message });
-  }
-});
-
-
-// ---------------- Delete ----------------
-router.delete("/:id", async (req, res) => {
-  try {
-    const file = await File.findById(req.params.id);
-    if (!file) return res.status(404).json({ msg: "File not found" });
-
-    if (file.publicId) {
-      try {
-        await cloudinary.uploader.destroy(file.publicId, {
-          resource_type: file.resourceType || "auto",
-        });
-      } catch (cloudinaryErr) {
-        console.error("⚠️ Cloudinary deletion failed:", cloudinaryErr);
-      }
-    }
-
-    await File.deleteOne({ _id: file._id });
-
-    res.json({
-      ok: true,
-      msg: "File deleted successfully",
-      deletedFile: { id: file._id.toString(), title: file.title, fileName: file.originalName },
-    });
-  } catch (err) {
-    res.status(500).json({ msg: "Error deleting file", err: err.message });
-  }
-});
-
-// ---------------- Grouped Files by Category ----------------
-router.get("/grouped/:email", async (req, res) => {
-  try {
-    const { email } = req.params;
-    const files = await File.find({ userId: email });
+    const docs = await Document.find({ patientId: req.params.patientId });
 
     const grouped = {
-      reports: files.filter(f => f.category?.toLowerCase() === "report"),
-      prescriptions: files.filter(f => f.category?.toLowerCase() === "prescription"),
-      bills: files.filter(f => f.category?.toLowerCase() === "bill"),
-      insurance: files.filter(f => f.category?.toLowerCase() === "insurance"),
-      others: files.filter(
-        f =>
-          !["report", "prescription", "bill", "insurance"].includes(
-            f.category?.toLowerCase()
-          )
+      reports: docs.filter(d => d.type?.toLowerCase() === "lab report" || d.type?.toLowerCase() === "imaging"),
+      prescriptions: docs.filter(d => d.type?.toLowerCase() === "prescription"),
+      bills: docs.filter(d => d.type?.toLowerCase() === "bill"),
+      insurance: docs.filter(d => d.type?.toLowerCase() === "insurance"),
+      others: docs.filter(d =>
+        !["lab report", "imaging", "prescription", "bill", "insurance"].includes(d.type?.toLowerCase())
       ),
     };
 
     res.json({
       success: true,
-      email,
-      counts: {
-        reports: grouped.reports.length,
-        prescriptions: grouped.prescriptions.length,
-        bills: grouped.bills.length,
-        insurance: grouped.insurance.length,
-        others: grouped.others.length,
-      },
+      patientId: req.params.patientId,
+      counts: Object.fromEntries(Object.entries(grouped).map(([k, v]) => [k, v.length])),
       records: grouped,
     });
-  } catch (error) {
-    console.error("❌ Error fetching grouped files:", error);
-    res.status(500).json({ message: "Failed to fetch grouped files" });
+  } catch (err) {
+    res.status(500).json({ success: false, msg: "Error grouping files", error: err.message });
   }
 });
 
+// ---------------- Preview ----------------
+router.get("/:id/preview", auth, async (req, res) => {
+  try {
+    const doc = await Document.findById(req.params.id);
+    if (!doc) return res.status(404).json({ msg: "File not found" });
+
+    // Return Cloudinary secure URL
+    res.json({ success: true, url: doc.cloudinaryUrl });
+  } catch (err) {
+    res.status(500).json({ msg: "Preview failed", error: err.message });
+  }
+});
+
+// ---------------- Download ----------------
+router.get("/:id/download", auth, async (req, res) => {
+  try {
+    const doc = await Document.findById(req.params.id);
+    if (!doc) return res.status(404).json({ msg: "File not found" });
+
+    const downloadUrl = cloudinary.url(doc.cloudinaryPublicId, {
+      resource_type: "auto",
+      secure: true,
+      flags: "attachment",
+    });
+
+    res.redirect(downloadUrl);
+  } catch (err) {
+    res.status(500).json({ msg: "Download failed", error: err.message });
+  }
+});
+
+// ---------------- Proxy (for inline preview) ----------------
+router.get("/:id/proxy", auth, async (req, res) => {
+  try {
+    const doc = await Document.findById(req.params.id);
+    if (!doc) return res.status(404).json({ msg: "File not found" });
+
+    const previewUrl = cloudinary.url(doc.cloudinaryPublicId, {
+      resource_type: "auto",
+      secure: true,
+      format: doc.fileType?.includes("pdf") ? "pdf" : undefined,
+    });
+
+    const response = await axios.get(previewUrl, { responseType: "arraybuffer" });
+
+    res.setHeader("Content-Type", doc.fileType || "application/octet-stream");
+    res.send(response.data);
+  } catch (err) {
+    res.status(500).json({ msg: "Proxy failed", error: err.message });
+  }
+});
+
+// ---------------- Delete ----------------
+router.delete("/:id", auth, async (req, res) => {
+  try {
+    const doc = await Document.findById(req.params.id);
+    if (!doc) return res.status(404).json({ msg: "File not found" });
+
+    if (doc.cloudinaryPublicId) {
+      await cloudinary.uploader.destroy(doc.cloudinaryPublicId, { resource_type: "auto" });
+    }
+
+    await doc.deleteOne();
+    res.json({ success: true, msg: "File deleted successfully" });
+  } catch (err) {
+    res.status(500).json({ msg: "Delete failed", error: err.message });
+  }
+});
 
 export default router;

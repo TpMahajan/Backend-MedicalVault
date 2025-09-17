@@ -15,10 +15,11 @@ dotenv.config({ path: "./db.env" });
 import connectDB from "./config/database.js";
 
 // Routes
-import authRoutes from "./routes/authRoutes.js";
-import documentRoutes from "./routes/document.js";
-import qrRoutes from "./routes/qrRoutes.js";
-
+import authRoutes from "./routes/authRoutes.js";        // patient auth
+import documentRoutes from "./routes/document.js";      // file/documents
+import qrRoutes from "./routes/qrRoutes.js";            // QR
+import doctorAuthRoutes from "./routes/doctorAuth.js";  // doctor auth ✅
+import appointmentRoutes from "./routes/appointments.js"; // appointments ✅
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -42,17 +43,32 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Serve uploads folder publicly
-app.use("/uploads", express.static(process.env.UPLOAD_DIR || path.join(__dirname, "../uploads")));
+app.use(
+  "/uploads",
+  express.static(process.env.UPLOAD_DIR || path.join(__dirname, "../uploads"))
+);
 
 // -------------------- Routes --------------------
-app.use("/api/auth", authRoutes);
-app.use("/api/files", documentRoutes);
-app.use("/api/qr", qrRoutes);
+app.use("/api/auth", authRoutes);             // patients
+app.use("/api/doctors", doctorAuthRoutes);    // doctors ✅
+app.use("/api/files", documentRoutes);        // documents
+app.use("/api/appointments", appointmentRoutes); // appointments ✅
+app.use("/api/qr", qrRoutes);                 // QR
 
-
-// Health check
+// -------------------- Health Check --------------------
 app.get("/health", (req, res) =>
-  res.json({ ok: true, env: ENV, time: new Date().toISOString() })
+  res.json({
+    ok: true,
+    env: ENV,
+    time: new Date().toISOString(),
+    routes: [
+      "/api/auth",
+      "/api/doctors",
+      "/api/files",
+      "/api/appointments",
+      "/api/qr",
+    ],
+  })
 );
 
 // -------------------- Start Server --------------------
