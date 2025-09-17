@@ -66,9 +66,57 @@ router.post("/generate", auth, async (req, res) => {
 });
 
 /**
+ * GET /api/qr/resolve/:token
+ * Public (no auth): resolves QR token and returns user's grouped documents
+ */
+router.get("/resolve/:token", async (req, res) => {
+  try {
+    const { token } = req.params;
+    if (!token)
+      return res.status(400).json({ success: false, msg: "Missing token" });
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (decoded.typ !== "vault_share") {
+      return res.status(400).json({ success: false, msg: "Invalid token type" });
+    }
+
+    // Check DB to see if this QR is still active
+    const qrDoc = await QRCode.findOne({ token, status: "active" });
+    if (!qrDoc) {
+      return res.status(400).json({ success: false, msg: "QR expired or invalid" });
+    }
+
+    // Fetch user's grouped documents
+    const { Document } = await import("../models/File.js");
+    const docs = await Document.find({ patientId: decoded.uid });
+
+    const grouped = {
+      reports: docs.filter(d => d.type?.toLowerCase() === "lab report" || d.type?.toLowerCase() === "imaging"),
+      prescriptions: docs.filter(d => d.type?.toLowerCase() === "prescription"),
+      bills: docs.filter(d => d.type?.toLowerCase() === "bill"),
+      insurance: docs.filter(d => d.type?.toLowerCase() === "insurance"),
+      others: docs.filter(d =>
+        !["lab report", "imaging", "prescription", "bill", "insurance"].includes(d.type?.toLowerCase())
+      ),
+    };
+
+    return res.json({
+      success: true,
+      patientId: decoded.uid,
+      counts: Object.fromEntries(Object.entries(grouped).map(([k, v]) => [k, v.length])),
+      records: grouped,
+    });
+  } catch (e) {
+    return res
+      .status(400)
+      .json({ success: false, msg: "Invalid/expired token", error: e.message });
+  }
+});
+
+/**
  * GET /api/qr/preview?token=...
  * Public (no auth): used by the web portal after scanning to show
- * patient info before the doctor clicks “Request Access”.
+ * patient info before the doctor clicks "Request Access".
  */
 router.get("/preview", async (req, res) => {
   try {

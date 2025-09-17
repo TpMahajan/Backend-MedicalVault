@@ -50,10 +50,11 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
 
-    const { patientId, title, category, date, notes } = req.body;
+    const { patientId, userId, title, category, date, notes } = req.body;
+    const actualPatientId = patientId || userId || req.auth.id;
 
     const doc = await Document.create({
-      patientId,
+      patientId: actualPatientId,
       doctorId: req.auth?.role === "doctor" ? req.auth.id : undefined,
       title: title || req.file.originalname,
       type: category || "Other",
