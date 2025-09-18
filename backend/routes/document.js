@@ -6,7 +6,7 @@ import { v2 as cloudinary } from "cloudinary";
 import axios from "axios";
 import { auth } from "../middleware/auth.js";
 import { Document } from "../models/File.js";
-import User from "../models/User.js";
+import { User } from "../models/User.js";
 
 const router = express.Router();
 
