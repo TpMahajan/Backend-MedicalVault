@@ -46,6 +46,7 @@ const upload = multer({
 });
 
 // ---------------- Upload ----------------
+// ---------------- Upload ----------------
 router.post("/upload", auth, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
@@ -53,16 +54,30 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
     const { patientId, userId, title, category, date, notes } = req.body;
     const actualPatientId = patientId || userId || req.auth.id;
 
+    // Normalize category
+    const validCategories = ["Report", "Prescription", "Bill", "Insurance"];
+    const chosenCategory = validCategories.includes(category)
+      ? category
+      : "Report"; // fallback
+
     const doc = await Document.create({
       patientId: actualPatientId,
       doctorId: req.auth?.role === "doctor" ? req.auth.id : undefined,
       title: title || req.file.originalname,
-      type: category || "Other",
       description: notes || "",
-      cloudinaryUrl: req.file.path,
-      cloudinaryPublicId: req.file.filename,
+
+      // ✅ Save both fields with same normalized value
+      type: chosenCategory,
+      category: chosenCategory,
+
+      originalName: req.file.originalname,
+      mimeType: req.file.mimetype,
       fileType: req.file.mimetype,
+      size: req.file.size,
       fileSize: req.file.size,
+
+      cloudinaryUrl: req.file.path,       // secure_url from multer-cloudinary
+      cloudinaryPublicId: req.file.filename, // public_id from multer-cloudinary
       uploadedAt: date || new Date(),
     });
 
@@ -83,17 +98,16 @@ router.get("/patient/:patientId", auth, async (req, res) => {
 });
 
 // ---------------- Grouped Files ----------------
+// ---------------- Grouped Files ----------------
 router.get("/patient/:patientId/grouped", auth, async (req, res) => {
   try {
     const docs = await Document.find({ patientId: req.params.patientId });
 
     const grouped = {
-      reports: docs.filter(d =>
-        ["lab report", "imaging"].includes(d.type?.toLowerCase())
-      ),
-      prescriptions: docs.filter(d => d.type?.toLowerCase() === "prescription"),
-      bills: docs.filter(d => d.type?.toLowerCase() === "bill"),
-      insurance: docs.filter(d => d.type?.toLowerCase() === "insurance"),
+      reports: docs.filter(d => d.category?.toLowerCase() === "report"),
+      prescriptions: docs.filter(d => d.category?.toLowerCase() === "prescription"),
+      bills: docs.filter(d => d.category?.toLowerCase() === "bill"),
+      insurance: docs.filter(d => d.category?.toLowerCase() === "insurance"),
     };
 
     res.json({
@@ -108,6 +122,7 @@ router.get("/patient/:patientId/grouped", auth, async (req, res) => {
     res.status(500).json({ success: false, msg: "Error grouping files", error: err.message });
   }
 });
+
 
 
 // ---------------- Preview ----------------
