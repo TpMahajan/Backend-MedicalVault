@@ -4,8 +4,8 @@ import path from "path";
 import { CloudinaryStorage } from "multer-storage-cloudinary";
 import { v2 as cloudinary } from "cloudinary";
 import axios from "axios";
-import { auth } from "../middleware/auth.js";  // ✅ auth middleware
-import { Document } from "../models/File.js"; // ✅ unified Document model
+import { auth } from "../middleware/auth.js";
+import { Document } from "../models/File.js";
 
 const router = express.Router();
 
@@ -16,7 +16,7 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// ---------------- Cloudinary Storage ----------------
+// ---------------- Storage ----------------
 const storage = new CloudinaryStorage({
   cloudinary,
   params: async (req, file) => {
@@ -32,52 +32,34 @@ const storage = new CloudinaryStorage({
   },
 });
 
-// ---------------- Multer ----------------
-const upload = multer({
-  storage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
-  fileFilter: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (ext === ".pdf" && file.mimetype === "application/octet-stream") {
-      file.mimetype = "application/pdf"; // fix for some clients
-    }
-    cb(null, true);
-  },
-});
+const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
 
-// ---------------- Upload ----------------
 // ---------------- Upload ----------------
 router.post("/upload", auth, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
 
-    const { patientId, userId, title, category, date, notes } = req.body;
-    const actualPatientId = patientId || userId || req.auth.id;
+    const { title, category, date, notes } = req.body;
 
-    // Normalize category
     const validCategories = ["Report", "Prescription", "Bill", "Insurance"];
     const chosenCategory = validCategories.includes(category)
       ? category
-      : "Report"; // fallback
+      : "Report";
 
     const doc = await Document.create({
-      patientId: actualPatientId,
+      userId: req.auth.id,   // ✅ Always use userId
       doctorId: req.auth?.role === "doctor" ? req.auth.id : undefined,
       title: title || req.file.originalname,
       description: notes || "",
-
-      // ✅ Save both fields with same normalized value
       type: chosenCategory,
       category: chosenCategory,
-
       originalName: req.file.originalname,
       mimeType: req.file.mimetype,
       fileType: req.file.mimetype,
       size: req.file.size,
       fileSize: req.file.size,
-
-      cloudinaryUrl: req.file.path,       // secure_url from multer-cloudinary
-      cloudinaryPublicId: req.file.filename, // public_id from multer-cloudinary
+      cloudinaryUrl: req.file.path,
+      cloudinaryPublicId: req.file.filename,
       uploadedAt: date || new Date(),
     });
 
@@ -88,9 +70,9 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
 });
 
 // ---------------- List Files ----------------
-router.get("/patient/:patientId", auth, async (req, res) => {
+router.get("/user/:userId", auth, async (req, res) => {
   try {
-    const docs = await Document.find({ patientId: req.params.patientId }).sort({ createdAt: -1 });
+    const docs = await Document.find({ userId: req.params.userId }).sort({ createdAt: -1 });
     res.json({ success: true, count: docs.length, documents: docs });
   } catch (err) {
     res.status(500).json({ success: false, msg: "Error fetching files", error: err.message });
@@ -98,10 +80,9 @@ router.get("/patient/:patientId", auth, async (req, res) => {
 });
 
 // ---------------- Grouped Files ----------------
-// ---------------- Grouped Files ----------------
-router.get("/patient/:patientId/grouped", auth, async (req, res) => {
+router.get("/user/:userId/grouped", auth, async (req, res) => {
   try {
-    const docs = await Document.find({ patientId: req.params.patientId });
+    const docs = await Document.find({ userId: req.params.userId });
 
     const grouped = {
       reports: docs.filter(d => d.category?.toLowerCase() === "report"),
@@ -112,10 +93,8 @@ router.get("/patient/:patientId/grouped", auth, async (req, res) => {
 
     res.json({
       success: true,
-      patientId: req.params.patientId,
-      counts: Object.fromEntries(
-        Object.entries(grouped).map(([k, v]) => [k, v.length])
-      ),
+      userId: req.params.userId,
+      counts: Object.fromEntries(Object.entries(grouped).map(([k, v]) => [k, v.length])),
       records: grouped,
     });
   } catch (err) {

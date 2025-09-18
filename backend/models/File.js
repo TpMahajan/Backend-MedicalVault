@@ -2,11 +2,8 @@ import mongoose from "mongoose";
 
 const fileSchema = new mongoose.Schema(
   {
-    // User linkage
-    patientId: { type: String, trim: true },
-    userId: { type: String, trim: true },
-
-    // Doctor linkage
+    // Linkage
+    userId: { type: String, required: true, trim: true },   // ✅ Always use userId
     doctorId: { type: mongoose.Schema.Types.ObjectId, ref: "DoctorUser" },
 
     // File info
@@ -14,7 +11,7 @@ const fileSchema = new mongoose.Schema(
     description: { type: String, trim: true, default: "" },
     notes: { type: String },
 
-    // Categorization (only 4 types now ✅)
+    // Categorization (only 4 types)
     type: {
       type: String,
       enum: ["Report", "Prescription", "Bill", "Insurance"],
@@ -33,7 +30,7 @@ const fileSchema = new mongoose.Schema(
     size: { type: Number },
     fileSize: { type: Number },
 
-    // Cloudinary storage ✅
+    // Cloudinary storage
     cloudinaryUrl: { type: String, required: true },
     cloudinaryPublicId: { type: String, required: true },
 
@@ -53,4 +50,5 @@ const fileSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// ✅ Store in "files" collection
 export const Document = mongoose.model("Document", fileSchema, "files");
