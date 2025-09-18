@@ -17,10 +17,14 @@ const documentSchema = new mongoose.Schema(
     // Categorization
     type: {
       type: String,
-      enum: ["Lab Report", "Imaging", "Prescription", "Bill", "Insurance", "Other"],
-      default: "Other",
+      enum: ["Report", "Prescription", "Bill", "Insurance"], // ✅ only 4 values
+      required: true,
     },
-    category: { type: String, default: "Other" },
+    category: {
+      type: String,
+      enum: ["Report", "Prescription", "Bill", "Insurance"], // ✅ match type
+      default: "Report",
+    },
 
     // Original file details
     originalName: { type: String },
@@ -42,7 +46,11 @@ const documentSchema = new mongoose.Schema(
     uploadedAt: { type: Date, default: Date.now },
 
     // Review workflow (for doctors)
-    status: { type: String, enum: ["pending", "reviewed", "archived"], default: "pending" },
+    status: {
+      type: String,
+      enum: ["pending", "reviewed", "archived"],
+      default: "pending",
+    },
     reviewedAt: { type: Date },
     reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: "DoctorUser" },
   },
