@@ -33,6 +33,8 @@ const fileSchema = new mongoose.Schema(
     // Cloudinary storage
     cloudinaryUrl: { type: String, required: true },
     cloudinaryPublicId: { type: String, required: true },
+    // ✅ Add url field for frontend compatibility (virtual field)
+    url: { type: String }, // This will be set to cloudinaryUrl in responses
 
     // Dates
     date: { type: String },

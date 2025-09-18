@@ -60,6 +60,7 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
       fileSize: req.file.size,
       cloudinaryUrl: req.file.path,
       cloudinaryPublicId: req.file.filename,
+      url: req.file.path, // ✅ Set url field for frontend compatibility
       uploadedAt: date || new Date(),
     });
 
@@ -73,7 +74,27 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
 router.get("/user/:userId", auth, async (req, res) => {
   try {
     const docs = await Document.find({ userId: req.params.userId }).sort({ createdAt: -1 });
-    res.json({ success: true, count: docs.length, documents: docs });
+    // ✅ Add url field for frontend compatibility
+    const docsWithUrl = docs.map(doc => ({
+      ...doc.toObject(),
+      url: doc.cloudinaryUrl // ✅ Frontend expects 'url' field
+    }));
+    res.json({ success: true, count: docsWithUrl.length, documents: docsWithUrl });
+  } catch (err) {
+    res.status(500).json({ success: false, msg: "Error fetching files", error: err.message });
+  }
+});
+
+// ---------------- Patient Files (alias for user) ----------------
+router.get("/patient/:patientId", auth, async (req, res) => {
+  try {
+    const docs = await Document.find({ userId: req.params.patientId }).sort({ createdAt: -1 });
+    // ✅ Add url field for frontend compatibility
+    const docsWithUrl = docs.map(doc => ({
+      ...doc.toObject(),
+      url: doc.cloudinaryUrl // ✅ Frontend expects 'url' field
+    }));
+    res.json({ success: true, count: docsWithUrl.length, documents: docsWithUrl });
   } catch (err) {
     res.status(500).json({ success: false, msg: "Error fetching files", error: err.message });
   }
@@ -91,11 +112,63 @@ router.get("/user/:userId/grouped", auth, async (req, res) => {
       insurance: docs.filter(d => d.category?.toLowerCase() === "insurance"),
     };
 
+    // ✅ Add url field to each document for frontend compatibility
+    const groupedWithUrl = Object.fromEntries(
+      Object.entries(grouped).map(([key, docs]) => [
+        key,
+        docs.map(doc => ({
+          ...doc.toObject(),
+          url: doc.cloudinaryUrl // ✅ Frontend expects 'url' field
+        }))
+      ])
+    );
+
     res.json({
       success: true,
       userId: req.params.userId,
-      counts: Object.fromEntries(Object.entries(grouped).map(([k, v]) => [k, v.length])),
-      records: grouped,
+      counts: Object.fromEntries(Object.entries(groupedWithUrl).map(([k, v]) => [k, v.length])),
+      records: groupedWithUrl,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, msg: "Error grouping files", error: err.message });
+  }
+});
+
+// ---------------- Grouped Files by Email (for ProfilePageSettings compatibility) ----------------
+router.get("/grouped/:email", auth, async (req, res) => {
+  try {
+    // ✅ Find user by email first, then get their files
+    const User = (await import("../models/User.js")).default;
+    const user = await User.findOne({ email: req.params.email });
+    if (!user) {
+      return res.status(404).json({ success: false, msg: "User not found" });
+    }
+
+    const docs = await Document.find({ userId: user._id.toString() });
+
+    const grouped = {
+      reports: docs.filter(d => d.category?.toLowerCase() === "report"),
+      prescriptions: docs.filter(d => d.category?.toLowerCase() === "prescription"),
+      bills: docs.filter(d => d.category?.toLowerCase() === "bill"),
+      insurance: docs.filter(d => d.category?.toLowerCase() === "insurance"),
+    };
+
+    // ✅ Add url field to each document for frontend compatibility
+    const groupedWithUrl = Object.fromEntries(
+      Object.entries(grouped).map(([key, docs]) => [
+        key,
+        docs.map(doc => ({
+          ...doc.toObject(),
+          url: doc.cloudinaryUrl // ✅ Frontend expects 'url' field
+        }))
+      ])
+    );
+
+    res.json({
+      success: true,
+      userId: user._id.toString(),
+      counts: Object.fromEntries(Object.entries(groupedWithUrl).map(([k, v]) => [k, v.length])),
+      records: groupedWithUrl,
     });
   } catch (err) {
     res.status(500).json({ success: false, msg: "Error grouping files", error: err.message });
