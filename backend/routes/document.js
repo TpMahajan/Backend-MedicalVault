@@ -88,25 +88,27 @@ router.get("/patient/:patientId/grouped", auth, async (req, res) => {
     const docs = await Document.find({ patientId: req.params.patientId });
 
     const grouped = {
-      reports: docs.filter(d => d.type?.toLowerCase() === "lab report" || d.type?.toLowerCase() === "imaging"),
+      reports: docs.filter(d =>
+        ["lab report", "imaging"].includes(d.type?.toLowerCase())
+      ),
       prescriptions: docs.filter(d => d.type?.toLowerCase() === "prescription"),
       bills: docs.filter(d => d.type?.toLowerCase() === "bill"),
       insurance: docs.filter(d => d.type?.toLowerCase() === "insurance"),
-      others: docs.filter(d =>
-        !["lab report", "imaging", "prescription", "bill", "insurance"].includes(d.type?.toLowerCase())
-      ),
     };
 
     res.json({
       success: true,
       patientId: req.params.patientId,
-      counts: Object.fromEntries(Object.entries(grouped).map(([k, v]) => [k, v.length])),
+      counts: Object.fromEntries(
+        Object.entries(grouped).map(([k, v]) => [k, v.length])
+      ),
       records: grouped,
     });
   } catch (err) {
     res.status(500).json({ success: false, msg: "Error grouping files", error: err.message });
   }
 });
+
 
 // ---------------- Preview ----------------
 router.get("/:id/preview", auth, async (req, res) => {
