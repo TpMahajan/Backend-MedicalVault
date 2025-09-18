@@ -6,6 +6,7 @@ import { v2 as cloudinary } from "cloudinary";
 import axios from "axios";
 import { auth } from "../middleware/auth.js";
 import { Document } from "../models/File.js";
+import User from "../models/User.js";
 
 const router = express.Router();
 
@@ -138,13 +139,15 @@ router.get("/user/:userId/grouped", auth, async (req, res) => {
 router.get("/grouped/:email", auth, async (req, res) => {
   try {
     // ✅ Find user by email first, then get their files
-    const User = (await import("../models/User.js")).default;
     const user = await User.findOne({ email: req.params.email });
     if (!user) {
       return res.status(404).json({ success: false, msg: "User not found" });
     }
 
+    console.log(`🔍 Found user: ${user._id} for email: ${req.params.email}`);
+    
     const docs = await Document.find({ userId: user._id.toString() });
+    console.log(`📁 Found ${docs.length} documents for user`);
 
     const grouped = {
       reports: docs.filter(d => d.category?.toLowerCase() === "report"),
@@ -152,6 +155,8 @@ router.get("/grouped/:email", auth, async (req, res) => {
       bills: docs.filter(d => d.category?.toLowerCase() === "bill"),
       insurance: docs.filter(d => d.category?.toLowerCase() === "insurance"),
     };
+
+    console.log(`📊 Grouped counts:`, Object.fromEntries(Object.entries(grouped).map(([k, v]) => [k, v.length])));
 
     // ✅ Add url field to each document for frontend compatibility
     const groupedWithUrl = Object.fromEntries(
@@ -171,6 +176,7 @@ router.get("/grouped/:email", auth, async (req, res) => {
       records: groupedWithUrl,
     });
   } catch (err) {
+    console.error("❌ Error in grouped/:email route:", err);
     res.status(500).json({ success: false, msg: "Error grouping files", error: err.message });
   }
 });
