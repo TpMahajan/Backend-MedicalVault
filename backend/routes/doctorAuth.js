@@ -1,7 +1,47 @@
 import express from "express";
 import jwt from "jsonwebtoken";
+import multer from "multer";
+import { CloudinaryStorage } from "multer-storage-cloudinary";
+import { v2 as cloudinary } from "cloudinary";
+import path from "path";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { auth } from "../middleware/auth.js";
+
+// ---------------- Cloudinary Config ----------------
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+// ---------------- Storage ----------------
+const storage = new CloudinaryStorage({
+  cloudinary,
+  params: async (req, file) => {
+    const baseName = path.parse(file.originalname).name.replace(/\s+/g, "_");
+    return {
+      folder: "medical-vault/doctor-avatars",
+      public_id: `doctor-${req.doctor._id}-${Date.now()}-${baseName}`,
+      resource_type: "image",
+      transformation: [
+        { width: 300, height: 300, crop: "fill", gravity: "face" },
+        { quality: "auto", fetch_format: "auto" }
+      ],
+    };
+  },
+});
+
+const upload = multer({ 
+  storage, 
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed'), false);
+    }
+  }
+});
 
 const router = express.Router();
 
@@ -144,6 +184,49 @@ router.put("/profile", auth, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Internal server error while updating profile.",
+    });
+  }
+});
+
+// ================= Upload Doctor Avatar =================
+router.post("/profile/avatar", auth, upload.single("avatar"), async (req, res) => {
+  try {
+    if (!req.doctor) {
+      return res.status(404).json({ success: false, message: "Doctor not found." });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: "No image file uploaded." });
+    }
+
+    // Delete old avatar if exists
+    if (req.doctor.avatar) {
+      try {
+        const publicId = req.doctor.avatar.split('/').pop().split('.')[0];
+        await cloudinary.uploader.destroy(`medical-vault/doctor-avatars/${publicId}`);
+      } catch (deleteError) {
+        console.warn("Could not delete old avatar:", deleteError.message);
+      }
+    }
+
+    // Update doctor with new avatar URL
+    const updatedDoctor = await DoctorUser.findByIdAndUpdate(
+      req.doctor._id,
+      { avatar: req.file.path },
+      { new: true, runValidators: true }
+    ).select("-password");
+
+    res.json({
+      success: true,
+      message: "Avatar uploaded successfully.",
+      doctor: updatedDoctor,
+      avatarUrl: req.file.path,
+    });
+  } catch (error) {
+    console.error("Avatar upload error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error while uploading avatar.",
     });
   }
 });

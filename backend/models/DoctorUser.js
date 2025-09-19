@@ -27,6 +27,7 @@ const doctorUserSchema = new mongoose.Schema({
   },
 
   // Profile fields (optional)
+  avatar: { type: String, trim: true, default: "" },
   specialty: { type: String, trim: true, default: "" },
   license: { type: String, trim: true, default: "" },
   experience: { type: String, trim: true, default: "" },
