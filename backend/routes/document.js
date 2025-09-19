@@ -43,9 +43,19 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
     const { title, category, date, notes } = req.body;
 
     const validCategories = ["Report", "Prescription", "Bill", "Insurance"];
-    const chosenCategory = validCategories.includes(category)
-      ? category
-      : "Report";
+    let chosenCategory = "Report"; // Default
+    
+    // Normalize the category to match valid categories
+    const normalizedCategory = category?.toLowerCase()?.trim();
+    if (normalizedCategory?.contains("report")) {
+      chosenCategory = "Report";
+    } else if (normalizedCategory?.contains("prescription")) {
+      chosenCategory = "Prescription";
+    } else if (normalizedCategory?.contains("bill")) {
+      chosenCategory = "Bill";
+    } else if (normalizedCategory?.contains("insurance")) {
+      chosenCategory = "Insurance";
+    }
 
     // ✅ Ensure correct Cloudinary public_id is stored
     const publicId =
@@ -163,21 +173,39 @@ router.get("/user/:userId/grouped", auth, async (req, res) => {
 // ---------------- Grouped by Email ----------------
 router.get("/grouped/:email", auth, async (req, res) => {
   try {
+    console.log(`🔍 Fetching grouped docs for email: ${req.params.email}`);
+    
     const user = await User.findOne({ email: req.params.email });
     if (!user) {
+      console.log(`❌ User not found for email: ${req.params.email}`);
       return res.status(404).json({ success: false, msg: "User not found" });
     }
 
+    console.log(`✅ User found: ${user._id}`);
+    
     const docs = await Document.find({ userId: user._id.toString() });
+    console.log(`📁 Found ${docs.length} documents for user`);
 
     const grouped = {
-      reports: docs.filter((d) => d.category?.toLowerCase() === "report"),
-      prescriptions: docs.filter(
-        (d) => d.category?.toLowerCase() === "prescription"
-      ),
-      bills: docs.filter((d) => d.category?.toLowerCase() === "bill"),
-      insurance: docs.filter((d) => d.category?.toLowerCase() === "insurance"),
+      reports: docs.filter((d) => {
+        const cat = d.category?.toLowerCase()?.trim();
+        return cat === "report";
+      }),
+      prescriptions: docs.filter((d) => {
+        const cat = d.category?.toLowerCase()?.trim();
+        return cat === "prescription";
+      }),
+      bills: docs.filter((d) => {
+        const cat = d.category?.toLowerCase()?.trim();
+        return cat === "bill";
+      }),
+      insurance: docs.filter((d) => {
+        const cat = d.category?.toLowerCase()?.trim();
+        return cat === "insurance";
+      }),
     };
+
+    console.log(`📊 Grouped counts: Reports: ${grouped.reports.length}, Prescriptions: ${grouped.prescriptions.length}, Bills: ${grouped.bills.length}, Insurance: ${grouped.insurance.length}`);
 
     const groupedWithUrl = Object.fromEntries(
       Object.entries(grouped).map(([key, docs]) => [
@@ -189,15 +217,19 @@ router.get("/grouped/:email", auth, async (req, res) => {
       ])
     );
 
-    res.json({
+    const response = {
       success: true,
       userId: user._id.toString(),
       counts: Object.fromEntries(
         Object.entries(groupedWithUrl).map(([k, v]) => [k, v.length])
       ),
       records: groupedWithUrl,
-    });
+    };
+
+    console.log(`✅ Sending response with ${Object.values(response.records).map((list) => list.length).join(', ')} documents`);
+    res.json(response);
   } catch (err) {
+    console.error("❌ Grouped fetch error:", err);
     res
       .status(500)
       .json({ success: false, msg: "Error grouping files", error: err.message });
@@ -222,18 +254,27 @@ router.get("/:id/download", auth, async (req, res) => {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
+    // Check if user owns this document or is authorized to access it
+    if (doc.userId.toString() !== req.auth.id.toString()) {
+      return res.status(403).json({ msg: "Unauthorized access" });
+    }
+
     if (!doc.cloudinaryPublicId) {
       return res.status(400).json({ msg: "Missing Cloudinary publicId" });
     }
 
+    // Generate a signed URL for download with attachment flag
     const downloadUrl = cloudinary.url(doc.cloudinaryPublicId, {
       resource_type: "auto",
       secure: true,
       flags: "attachment",
+      sign_url: true,
+      expires_at: Math.floor(Date.now() / 1000) + 3600, // 1 hour expiry
     });
 
     res.redirect(downloadUrl);
   } catch (err) {
+    console.error("Download error:", err);
     res.status(500).json({ msg: "Download failed", error: err.message });
   }
 });
@@ -244,17 +285,34 @@ router.get("/:id/proxy", auth, async (req, res) => {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
+    // Check if user owns this document or is authorized to access it
+    if (doc.userId.toString() !== req.auth.id.toString()) {
+      return res.status(403).json({ msg: "Unauthorized access" });
+    }
+
+    if (!doc.cloudinaryPublicId) {
+      return res.status(400).json({ msg: "Missing Cloudinary publicId" });
+    }
+
+    // Generate a signed URL for preview
     const previewUrl = cloudinary.url(doc.cloudinaryPublicId, {
       resource_type: "auto",
       secure: true,
+      sign_url: true,
+      expires_at: Math.floor(Date.now() / 1000) + 3600, // 1 hour expiry
       format: doc.fileType?.includes("pdf") ? "pdf" : undefined,
     });
 
-    const response = await axios.get(previewUrl, { responseType: "arraybuffer" });
+    const response = await axios.get(previewUrl, { 
+      responseType: "arraybuffer",
+      timeout: 10000 // 10 second timeout
+    });
 
     res.setHeader("Content-Type", doc.fileType || "application/octet-stream");
+    res.setHeader("Cache-Control", "public, max-age=3600"); // Cache for 1 hour
     res.send(response.data);
   } catch (err) {
+    console.error("Proxy error:", err);
     res.status(500).json({ msg: "Proxy failed", error: err.message });
   }
 });
@@ -265,15 +323,31 @@ router.delete("/:id", auth, async (req, res) => {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
-    if (doc.cloudinaryPublicId) {
-      await cloudinary.uploader.destroy(doc.cloudinaryPublicId, {
-        resource_type: "auto",
-      });
+    // Check if user owns this document or is authorized to delete it
+    if (doc.userId.toString() !== req.auth.id.toString()) {
+      return res.status(403).json({ msg: "Unauthorized access" });
     }
 
+    // Delete from Cloudinary if public ID exists
+    if (doc.cloudinaryPublicId) {
+      try {
+        const cloudinaryResult = await cloudinary.uploader.destroy(doc.cloudinaryPublicId, {
+          resource_type: "auto",
+        });
+        console.log("Cloudinary deletion result:", cloudinaryResult);
+      } catch (cloudinaryErr) {
+        console.error("Cloudinary deletion error:", cloudinaryErr);
+        // Continue with database deletion even if Cloudinary fails
+      }
+    }
+
+    // Delete from database
     await doc.deleteOne();
+    
+    console.log(`Document ${req.params.id} deleted successfully`);
     res.json({ success: true, msg: "File deleted successfully" });
   } catch (err) {
+    console.error("Delete error:", err);
     res.status(500).json({ msg: "Delete failed", error: err.message });
   }
 });
