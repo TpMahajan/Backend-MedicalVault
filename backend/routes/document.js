@@ -46,14 +46,14 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
     let chosenCategory = "Report"; // Default
     
     // Normalize the category to match valid categories
-    const normalizedCategory = category?.toLowerCase()?.trim();
-    if (normalizedCategory?.contains("report")) {
+    const normalizedCategory = String(category || "").toLowerCase().trim();
+    if (normalizedCategory.includes("report")) {
       chosenCategory = "Report";
-    } else if (normalizedCategory?.contains("prescription")) {
+    } else if (normalizedCategory.includes("prescription")) {
       chosenCategory = "Prescription";
-    } else if (normalizedCategory?.contains("bill")) {
+    } else if (normalizedCategory.includes("bill")) {
       chosenCategory = "Bill";
-    } else if (normalizedCategory?.contains("insurance")) {
+    } else if (normalizedCategory.includes("insurance")) {
       chosenCategory = "Insurance";
     }
 
