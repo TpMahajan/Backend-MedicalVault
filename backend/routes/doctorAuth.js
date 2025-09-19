@@ -88,6 +88,8 @@ router.post("/signup", async (req, res) => {
         name: doctor.name,
         email: doctor.email,
         mobile: doctor.mobile,
+        avatar: doctor.avatar,
+        specialty: doctor.specialty,
       },
       token,
     });
@@ -137,6 +139,8 @@ router.post("/login", async (req, res) => {
         name: doctor.name,
         email: doctor.email,
         mobile: doctor.mobile,
+        avatar: doctor.avatar,
+        specialty: doctor.specialty,
         createdAt: doctor.createdAt,
       },
     });
