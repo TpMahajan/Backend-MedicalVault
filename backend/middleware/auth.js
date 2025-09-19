@@ -15,15 +15,29 @@ export const auth = async (req, res, next) => {
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
+    // Handle different token formats
+    let userId, role;
+    if (decoded.userId && decoded.role) {
+      // Standard format: { userId, role }
+      userId = decoded.userId;
+      role = decoded.role;
+    } else if (decoded.uid && decoded.typ) {
+      // Vault share format: { uid, typ }
+      userId = decoded.uid;
+      role = decoded.typ === "vault_share" ? "patient" : decoded.typ;
+    } else {
+      return res.status(401).json({ success: false, message: "Invalid token format." });
+    }
+
     let account;
-    if (decoded.role === "doctor") {
-      account = await DoctorUser.findById(decoded.userId).select("-password");
+    if (role === "doctor") {
+      account = await DoctorUser.findById(userId).select("-password");
       if (!account) {
         return res.status(401).json({ success: false, message: "Doctor not found" });
       }
       req.doctor = account;
     } else {
-      account = await User.findById(decoded.userId).select("-password");
+      account = await User.findById(userId).select("-password");
       if (!account) {
         return res.status(401).json({ success: false, message: "User not found" });
       }
@@ -33,7 +47,7 @@ export const auth = async (req, res, next) => {
       req.user = account;
     }
 
-    req.auth = { id: decoded.userId, role: decoded.role };
+    req.auth = { id: userId, role: role };
     next();
   } catch (error) {
     if (error.name === "JsonWebTokenError") {
@@ -53,14 +67,31 @@ export const optionalAuth = async (req, res, next) => {
     const token = req.header("Authorization")?.replace("Bearer ", "");
     if (token) {
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      if (decoded.role === "doctor") {
-        const doctor = await DoctorUser.findById(decoded.userId).select("-password");
+      
+      // Handle different token formats
+      let userId, role;
+      if (decoded.userId && decoded.role) {
+        // Standard format: { userId, role }
+        userId = decoded.userId;
+        role = decoded.role;
+      } else if (decoded.uid && decoded.typ) {
+        // Vault share format: { uid, typ }
+        userId = decoded.uid;
+        role = decoded.typ === "vault_share" ? "patient" : decoded.typ;
+      } else {
+        console.warn("Invalid token format in optional auth");
+        next();
+        return;
+      }
+      
+      if (role === "doctor") {
+        const doctor = await DoctorUser.findById(userId).select("-password");
         if (doctor) req.doctor = doctor;
       } else {
-        const user = await User.findById(decoded.userId).select("-password");
+        const user = await User.findById(userId).select("-password");
         if (user && user.isActive !== false) req.user = user;
       }
-      req.auth = { id: decoded.userId, role: decoded.role };
+      req.auth = { id: userId, role: role };
     }
     next();
   } catch (err) {

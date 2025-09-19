@@ -174,4 +174,56 @@ router.post("/doctor/login", async (req, res) => {
 router.get("/me", auth, getMe);
 router.put("/me", auth, updateMe);
 
+// ================= Test Endpoint for QR Scanner =================
+router.post("/test-patient", async (req, res) => {
+  try {
+    // Create a test patient for QR scanner testing
+    const testPatient = new User({
+      name: "Test Patient",
+      email: "test.patient@example.com",
+      password: "test123",
+      mobile: "+1234567890",
+      age: 30,
+      gender: "Male",
+      bloodType: "O+"
+    });
+
+    // Check if test patient already exists
+    const existingPatient = await User.findOne({ email: "test.patient@example.com" });
+    let patient;
+    
+    if (existingPatient) {
+      patient = existingPatient;
+    } else {
+      await testPatient.save();
+      patient = testPatient;
+    }
+
+    // Generate token
+    const token = jwt.sign(
+      { userId: patient._id, role: "patient" },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
+    );
+
+    res.json({
+      success: true,
+      message: "Test patient token generated",
+      token,
+      patient: {
+        id: patient._id.toString(),
+        name: patient.name,
+        email: patient.email,
+        mobile: patient.mobile
+      }
+    });
+  } catch (error) {
+    console.error("Test patient creation error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to create test patient"
+    });
+  }
+});
+
 export default router;
