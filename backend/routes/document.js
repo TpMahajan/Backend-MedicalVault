@@ -81,33 +81,6 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
       uploadedAt: date || new Date(),
     });
 
-    // ✅ Add document reference to user's medicalRecords field
-    try {
-      await User.findByIdAndUpdate(
-        req.auth.id,
-        {
-          $push: {
-            medicalRecords: {
-              documentId: doc._id,
-              title: doc.title,
-              category: chosenCategory,
-              uploadedAt: doc.uploadedAt,
-              fileType: doc.fileType,
-              cloudinaryUrl: doc.cloudinaryUrl,
-              cloudinaryPublicId: doc.cloudinaryPublicId,
-              originalName: doc.originalName,
-              size: doc.size
-            }
-          }
-        },
-        { new: true }
-      );
-      console.log(`✅ Added document ${doc._id} to user ${req.auth.id} medicalRecords`);
-    } catch (updateErr) {
-      console.error("❌ Error updating user medicalRecords:", updateErr);
-      // Continue even if user update fails
-    }
-
     res.json({ success: true, document: doc });
   } catch (err) {
     res.status(500).json({ msg: "Upload failed", error: err.message });
@@ -368,23 +341,6 @@ router.delete("/:id", auth, async (req, res) => {
       }
     }
 
-    // ✅ Remove document reference from user's medicalRecords field
-    try {
-      await User.findByIdAndUpdate(
-        doc.userId,
-        {
-          $pull: {
-            medicalRecords: { documentId: doc._id }
-          }
-        },
-        { new: true }
-      );
-      console.log(`✅ Removed document ${req.params.id} from user ${doc.userId} medicalRecords`);
-    } catch (updateErr) {
-      console.error("❌ Error removing document from user medicalRecords:", updateErr);
-      // Continue even if user update fails
-    }
-
     // Delete from database
     await doc.deleteOne();
     
@@ -393,64 +349,6 @@ router.delete("/:id", auth, async (req, res) => {
   } catch (err) {
     console.error("Delete error:", err);
     res.status(500).json({ msg: "Delete failed", error: err.message });
-  }
-});
-
-// ---------------- Get User Medical Records from User Document ----------------
-router.get("/user/:userId/medical-records", auth, async (req, res) => {
-  try {
-    console.log(`🔍 Fetching medical records for user: ${req.params.userId}`);
-    
-    const user = await User.findById(req.params.userId).select('medicalRecords name email');
-    if (!user) {
-      console.log(`❌ User not found: ${req.params.userId}`);
-      return res.status(404).json({ success: false, msg: "User not found" });
-    }
-
-    console.log(`✅ User found: ${user.name} (${user.email})`);
-    console.log(`📁 Found ${user.medicalRecords?.length || 0} medical records in user document`);
-
-    // Group the medical records by category
-    const medicalRecords = user.medicalRecords || [];
-    const grouped = {
-      reports: medicalRecords.filter((record) => {
-        const cat = record.category?.toLowerCase()?.trim();
-        return cat === "report";
-      }),
-      prescriptions: medicalRecords.filter((record) => {
-        const cat = record.category?.toLowerCase()?.trim();
-        return cat === "prescription";
-      }),
-      bills: medicalRecords.filter((record) => {
-        const cat = record.category?.toLowerCase()?.trim();
-        return cat === "bill";
-      }),
-      insurance: medicalRecords.filter((record) => {
-        const cat = record.category?.toLowerCase()?.trim();
-        return cat === "insurance";
-      }),
-    };
-
-    console.log(`📊 Grouped counts: Reports: ${grouped.reports.length}, Prescriptions: ${grouped.prescriptions.length}, Bills: ${grouped.bills.length}, Insurance: ${grouped.insurance.length}`);
-
-    const response = {
-      success: true,
-      userId: user._id.toString(),
-      userName: user.name,
-      userEmail: user.email,
-      counts: Object.fromEntries(
-        Object.entries(grouped).map(([k, v]) => [k, v.length])
-      ),
-      records: grouped,
-    };
-
-    console.log(`✅ Sending medical records response with ${Object.values(response.records).map((list) => list.length).join(', ')} documents`);
-    res.json(response);
-  } catch (err) {
-    console.error("❌ Medical records fetch error:", err);
-    res
-      .status(500)
-      .json({ success: false, msg: "Error fetching medical records", error: err.message });
   }
 });
 
