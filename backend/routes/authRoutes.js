@@ -3,10 +3,11 @@ import jwt from "jsonwebtoken";
 import { User } from "../models/User.js";
 import { auth } from "../middleware/auth.js";
 import { getMe, updateMe } from "../controllers/authController.js";
+import { DoctorUser } from "../models/DoctorUser.js";  // doctor model
 
 const router = express.Router();
 
-// ================= Signup =================
+// ================= Patient Signup =================
 router.post("/signup", async (req, res) => {
   try {
     const { name, email, password, mobile } = req.body;
@@ -51,7 +52,7 @@ router.post("/signup", async (req, res) => {
   }
 });
 
-// ================= Login =================
+// ================= Patient Login =================
 router.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -88,10 +89,89 @@ router.post("/login", async (req, res) => {
   }
 });
 
-// ================= Get Current User =================
-router.get("/me", auth, getMe);
+// ================= Doctor Signup =================
+router.post("/doctor/signup", async (req, res) => {
+  try {
+    const { name, email, password, specialization } = req.body;
 
-// ================= Update Current User =================
+    if (!name || !email || !password || !specialization) {
+      return res.status(400).json({ message: "All fields are required" });
+    }
+
+    const existingDoctor = await DoctorUser.findOne({ email: email.toLowerCase() });
+    if (existingDoctor) {
+      return res.status(400).json({ message: "Doctor already exists" });
+    }
+
+    const newDoctor = new DoctorUser({
+      name,
+      email: email.toLowerCase(),
+      password,
+      specialization,
+    });
+
+    await newDoctor.save();
+
+    const token = jwt.sign(
+      { doctorId: newDoctor._id, role: "doctor" },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Doctor registered successfully",
+      doctor: {
+        id: newDoctor._id.toString(),
+        name: newDoctor.name,
+        email: newDoctor.email,
+        specialization: newDoctor.specialization,
+      },
+      token,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// ================= Doctor Login =================
+router.post("/doctor/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    const doctor = await DoctorUser.findOne({ email: email.toLowerCase() });
+    if (!doctor) return res.status(400).json({ message: "Invalid credentials" });
+
+    const isValid = await doctor.comparePassword(password);
+    if (!isValid) return res.status(400).json({ message: "Invalid credentials" });
+
+    const token = jwt.sign(
+      { doctorId: doctor._id, role: "doctor" },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
+    );
+
+    doctor.lastLogin = new Date();
+    await doctor.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Login successful",
+      doctor: {
+        id: doctor._id.toString(),
+        name: doctor.name,
+        email: doctor.email,
+        specialization: doctor.specialization,
+      },
+      token,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// ================= Current User/Doctor =================
+router.get("/me", auth, getMe);
 router.put("/me", auth, updateMe);
 
 export default router;
