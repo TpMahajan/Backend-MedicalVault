@@ -82,4 +82,5 @@ sessionSchema.pre("save", function(next) {
   next();
 });
 
-export const Session = mongoose.model("Session", sessionSchema);
+// Explicitly specify collection name as "sessions"
+export const Session = mongoose.model("Session", sessionSchema, "sessions");

@@ -409,6 +409,52 @@ router.get("/debug", auth, async (req, res) => {
   }
 });
 
+// ---------------- Test session creation ----------------
+// POST /api/sessions/test-create
+router.post("/test-create", auth, async (req, res) => {
+  try {
+    console.log('🧪 Test session creation:', {
+      authId: req.auth?.id,
+      authRole: req.auth?.role,
+      body: req.body
+    });
+
+    if (req.auth.role !== "doctor") {
+      return res.status(403).json({
+        success: false,
+        message: "Only doctors can create test sessions"
+      });
+    }
+
+    // Create a simple test session
+    const testSession = new Session({
+      doctorId: req.auth.id,
+      patientId: req.body.patientId || "507f1f77bcf86cd799439011", // dummy ObjectId for testing
+      requestMessage: "Test session creation",
+      status: "pending"
+    });
+
+    console.log('💾 Saving test session...');
+    const savedSession = await testSession.save();
+    console.log('✅ Test session saved:', savedSession._id);
+
+    res.json({
+      success: true,
+      message: "Test session created successfully",
+      sessionId: savedSession._id,
+      session: savedSession
+    });
+
+  } catch (error) {
+    console.error("Test session creation error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Test session creation failed",
+      error: error.message
+    });
+  }
+});
+
 // ---------------- Cleanup expired sessions (Utility endpoint) ----------------
 // DELETE /api/sessions/cleanup
 router.delete("/cleanup", async (req, res) => {
