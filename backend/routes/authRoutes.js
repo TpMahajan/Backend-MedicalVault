@@ -174,6 +174,87 @@ router.post("/doctor/login", async (req, res) => {
 router.get("/me", auth, getMe);
 router.put("/me", auth, updateMe);
 
+// ================= Debug Login Endpoint =================
+router.post("/debug-login", async (req, res) => {
+  try {
+    const { email, password, userType } = req.body;
+    
+    console.log('🔍 Debug login attempt:', {
+      email: email,
+      userType: userType,
+      hasPassword: !!password
+    });
+
+    let user, token, role;
+    
+    if (userType === 'doctor') {
+      user = await DoctorUser.findOne({ email: email.toLowerCase() });
+      role = 'doctor';
+      console.log('👨‍⚕️ Looking for doctor:', user ? 'Found' : 'Not found');
+    } else {
+      user = await User.findOne({ email: email.toLowerCase() });
+      role = 'patient';
+      console.log('👤 Looking for patient:', user ? 'Found' : 'Not found');
+    }
+
+    if (!user) {
+      return res.status(400).json({ 
+        success: false,
+        message: "User not found",
+        debug: { email, userType, role }
+      });
+    }
+
+    const isValid = await user.comparePassword(password);
+    console.log('🔐 Password valid:', isValid);
+    
+    if (!isValid) {
+      return res.status(400).json({ 
+        success: false,
+        message: "Invalid password",
+        debug: { email, userType, role }
+      });
+    }
+
+    token = jwt.sign(
+      { userId: user._id, role: role },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
+    );
+
+    console.log('✅ Login successful:', {
+      userId: user._id,
+      role: role,
+      tokenGenerated: !!token
+    });
+
+    res.json({
+      success: true,
+      message: "Debug login successful",
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        role: role
+      },
+      token,
+      debug: {
+        userType: userType,
+        role: role,
+        tokenPayload: { userId: user._id, role: role }
+      }
+    });
+
+  } catch (error) {
+    console.error('Debug login error:', error);
+    res.status(500).json({ 
+      success: false,
+      message: "Debug login failed",
+      error: error.message 
+    });
+  }
+});
+
 // ================= Test Endpoint for QR Scanner =================
 router.post("/test-patient", async (req, res) => {
   try {
