@@ -281,17 +281,32 @@ router.post("/:id/respond", async (req, res) => {
     }
     
     // Update session status
+    console.log('🔄 Updating session status:', {
+      sessionId: sessionId,
+      oldStatus: session.status,
+      newStatus: status,
+      oldExpiresAt: session.expiresAt
+    });
+    
     session.status = status;
     session.respondedAt = new Date();
     
     // If accepted, extend the session for 20 minutes from now
     if (status === "accepted") {
       session.expiresAt = new Date(Date.now() + 20 * 60 * 1000);
+      console.log('⏰ Session accepted, new expiration:', session.expiresAt);
     }
     
     await session.save();
     
     console.log(`📋 Session ${sessionId} ${status} by patient ${req.auth.id}`);
+    console.log('✅ Session updated successfully:', {
+      _id: session._id,
+      status: session.status,
+      expiresAt: session.expiresAt,
+      doctorId: session.doctorId._id,
+      patientId: session.patientId
+    });
     
     res.json({
       success: true,
@@ -444,6 +459,55 @@ router.get("/debug", auth, async (req, res) => {
           email: req.doctor.email
         } : null,
         timestamp: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ---------------- Debug specific doctor-patient session ----------------
+// GET /api/sessions/debug/:patientId
+router.get("/debug/:patientId", auth, async (req, res) => {
+  try {
+    const patientId = req.params.patientId;
+    
+    // Find all sessions between this doctor and patient
+    const sessions = await Session.find({
+      doctorId: req.auth.id,
+      patientId: patientId
+    }).sort({ createdAt: -1 });
+    
+    // Find active session specifically
+    const activeSession = await Session.findOne({
+      doctorId: req.auth.id,
+      patientId: patientId,
+      status: "accepted",
+      expiresAt: { $gt: new Date() }
+    });
+    
+    res.json({
+      success: true,
+      debug: {
+        doctorId: req.auth.id,
+        patientId: patientId,
+        currentTime: new Date(),
+        allSessions: sessions.map(s => ({
+          _id: s._id,
+          status: s.status,
+          createdAt: s.createdAt,
+          expiresAt: s.expiresAt,
+          isExpired: s.expiresAt <= new Date()
+        })),
+        activeSession: activeSession ? {
+          _id: activeSession._id,
+          status: activeSession.status,
+          expiresAt: activeSession.expiresAt,
+          isActive: activeSession.expiresAt > new Date()
+        } : null
       }
     });
   } catch (error) {
