@@ -81,6 +81,9 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
       uploadedAt: date || new Date(),
     });
 
+    // ✅ Link the document to the user's medicalRecords array
+    await User.findByIdAndUpdate(req.auth.id, { $push: { medicalRecords: doc._id } });
+
     res.json({ success: true, document: doc });
   } catch (err) {
     res.status(500).json({ msg: "Upload failed", error: err.message });
@@ -343,6 +346,9 @@ router.delete("/:id", auth, async (req, res) => {
 
     // Delete from database
     await doc.deleteOne();
+    
+    // ✅ Remove the document reference from user's medicalRecords array
+    await User.findByIdAndUpdate(doc.userId, { $pull: { medicalRecords: req.params.id } });
     
     console.log(`Document ${req.params.id} deleted successfully`);
     res.json({ success: true, msg: "File deleted successfully" });

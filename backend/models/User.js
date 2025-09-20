@@ -53,21 +53,7 @@ const UserSchema = new mongoose.Schema(
       },
     ],
 
-    medicalRecords: [
-      {
-        type: {
-          type: String,
-          enum: ["report", "prescription", "bill", "insurance"],
-          required: true,
-        },
-        title: String,
-        date: Date,
-        status: { type: String, enum: ["reviewed", "pending"] },
-        fileType: String,
-        size: String,
-        fileUrl: String,
-      },
-    ],
+    medicalRecords: [{ type: mongoose.Schema.Types.ObjectId, ref: "Document" }],
 
     // 🔹 System fields
     fcmToken: { type: String, default: null },
