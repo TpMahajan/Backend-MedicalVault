@@ -59,13 +59,26 @@ export const updateFCMToken = async (req, res) => {
   }
 };
 
-// @desc    Get user profile by ID (public info only)
+// @desc    Get user profile by ID (public info only, full info for doctors with active session)
 // @route   GET /api/user/:id
-// @access  Public
+// @access  Public (limited) / Private (full data with session)
 export const getUserProfile = async (req, res) => {
   try {
+    // Check if this is a doctor with an active session (set by checkSession middleware)
+    const hasActiveSession = req.session && req.auth && req.auth.role === "doctor";
+    
+    let selectFields = 'name profilePicture createdAt'; // Default public fields
+    
+    if (hasActiveSession) {
+      // Doctor with active session gets full patient data
+      selectFields = '-password'; // All fields except password
+      console.log('🔐 Returning full patient data for doctor with active session');
+    } else {
+      console.log('👤 Returning limited public profile data');
+    }
+
     const user = await User.findById(req.params.id)
-      .select('name profilePicture createdAt')
+      .select(selectFields)
       .lean();
 
     if (!user) {
@@ -77,9 +90,8 @@ export const getUserProfile = async (req, res) => {
 
     res.json({
       success: true,
-      data: {
-        user
-      }
+      data: hasActiveSession ? user : { user }, // Different structure for compatibility
+      sessionAccess: hasActiveSession
     });
   } catch (error) {
     console.error('Get user profile error:', error);
