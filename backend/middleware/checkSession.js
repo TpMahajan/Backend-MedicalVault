@@ -14,8 +14,15 @@ export const checkSession = async (req, res, next) => {
       method: req.method,
       url: req.url,
       authRole: req.auth?.role,
-      authId: req.auth?.id
+      authId: req.auth?.id,
+      hasAuth: !!req.auth
     });
+
+    // If no authentication info, skip session check (public access)
+    if (!req.auth) {
+      console.log("✅ No authentication info, allowing public access");
+      return next();
+    }
 
     // If the requester is not a doctor, skip session check
     if (req.auth.role !== "doctor") {

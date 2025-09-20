@@ -9,7 +9,7 @@ import {
   updateProfileValidation, 
   fcmTokenValidation 
 } from '../middleware/validation.js';
-import { auth } from '../middleware/auth.js';
+import { auth, optionalAuth } from '../middleware/auth.js';
 import { fcmLimiter } from '../middleware/rateLimit.js';
 import { User } from '../models/User.js';
 import { checkSession } from '../middleware/checkSession.js';
@@ -31,7 +31,7 @@ router.put('/fcm-token', auth, fcmLimiter, fcmTokenValidation, updateFCMToken);
 // @route   GET /api/users/:id
 // @desc    Get user profile by ID (public info)
 // @access  Public (no auth required) - but doctors need active session
-router.get('/:id', checkSession, getUserProfile);
+router.get('/:id', optionalAuth, checkSession, getUserProfile);
 
 // @route   DELETE /api/users/account
 // @desc    Delete user account
