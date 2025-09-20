@@ -12,6 +12,7 @@ import {
 import { auth } from '../middleware/auth.js';
 import { fcmLimiter } from '../middleware/rateLimit.js';
 import { User } from '../models/User.js';
+import { checkSession } from '../middleware/checkSession.js';
 
 const router = express.Router();
 
@@ -29,8 +30,8 @@ router.put('/fcm-token', auth, fcmLimiter, fcmTokenValidation, updateFCMToken);
 
 // @route   GET /api/users/:id
 // @desc    Get user profile by ID (public info)
-// @access  Public (no auth required)
-router.get('/:id', getUserProfile);
+// @access  Public (no auth required) - but doctors need active session
+router.get('/:id', checkSession, getUserProfile);
 
 // @route   DELETE /api/users/account
 // @desc    Delete user account
@@ -39,8 +40,8 @@ router.delete('/account', auth, deleteAccount);
 
 // @route   GET /api/users/:id/records
 // @desc    Get user's medical records grouped by category (for web app)
-// @access  Private
-router.get('/:id/records', auth, async (req, res) => {
+// @access  Private - doctors need active session
+router.get('/:id/records', auth, checkSession, async (req, res) => {
   try {
     const user = await User.findById(req.params.id).populate('medicalRecords');
     if (!user) {
