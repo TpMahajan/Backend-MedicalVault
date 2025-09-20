@@ -13,34 +13,57 @@ router.use(auth);
 // POST /api/sessions/request
 router.post("/request", async (req, res) => {
   try {
+    console.log('📋 Session request received:', {
+      body: req.body,
+      authId: req.auth?.id,
+      authRole: req.auth?.role,
+      headers: req.headers.authorization ? 'Present' : 'Missing'
+    });
+
     const { patientId, requestMessage } = req.body;
     
     // Ensure the requester is a doctor
     if (req.auth.role !== "doctor") {
+      console.log('🚫 Session request denied - not a doctor:', req.auth.role);
       return res.status(403).json({
         success: false,
-        message: "Only doctors can request patient access"
+        message: "Only doctors can request patient access",
+        debug: {
+          providedRole: req.auth.role,
+          requiredRole: "doctor"
+        }
       });
     }
     
     // Validate required fields
     if (!patientId) {
+      console.log('🚫 Session request denied - missing patientId');
       return res.status(400).json({
         success: false,
         message: "Patient ID is required"
       });
     }
     
+    console.log('🔍 Looking for patient:', patientId);
+    
     // Check if patient exists
     const patient = await User.findById(patientId);
     if (!patient) {
+      console.log('🚫 Patient not found:', patientId);
       return res.status(404).json({
         success: false,
-        message: "Patient not found"
+        message: "Patient not found",
+        debug: {
+          patientId: patientId
+        }
       });
     }
     
+    console.log('✅ Patient found:', patient.name, patient.email);
+    
     // Check if there's already a pending or active session
+    console.log('🔍 Checking for existing session between doctor', req.auth.id, 'and patient', patientId);
+    
     const existingSession = await Session.findOne({
       doctorId: req.auth.id,
       patientId: patientId,
@@ -49,13 +72,28 @@ router.post("/request", async (req, res) => {
     });
     
     if (existingSession) {
+      console.log('🚫 Existing session found:', existingSession.status, 'expires:', existingSession.expiresAt);
       return res.status(409).json({
         success: false,
-        message: `You already have a ${existingSession.status} session with this patient`
+        message: `You already have a ${existingSession.status} session with this patient`,
+        debug: {
+          existingSessionId: existingSession._id,
+          status: existingSession.status,
+          expiresAt: existingSession.expiresAt
+        }
       });
     }
     
+    console.log('✅ No existing session found, creating new one');
+    
     // Create new session request
+    console.log('🔄 Creating session with data:', {
+      doctorId: req.auth.id,
+      patientId: patientId,
+      requestMessage: requestMessage || "",
+      status: "pending"
+    });
+    
     const session = new Session({
       doctorId: req.auth.id,
       patientId: patientId,
@@ -64,9 +102,12 @@ router.post("/request", async (req, res) => {
       // expiresAt will be set automatically by pre-save middleware
     });
     
+    console.log('💾 Saving session to database...');
     await session.save();
+    console.log('✅ Session saved with ID:', session._id);
     
     // Populate doctor info for response
+    console.log('🔄 Populating doctor info...');
     await session.populate('doctorId', 'name email profilePicture experience specialization');
     
     console.log(`📋 New session request: Dr. ${session.doctorId.name} → Patient ${patientId}`);
@@ -333,6 +374,36 @@ router.get("/active", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to fetch active sessions",
+      error: error.message
+    });
+  }
+});
+
+// ---------------- Debug endpoint ----------------
+// GET /api/sessions/debug
+router.get("/debug", auth, async (req, res) => {
+  try {
+    res.json({
+      success: true,
+      debug: {
+        authId: req.auth?.id,
+        authRole: req.auth?.role,
+        user: req.user ? {
+          id: req.user._id,
+          name: req.user.name,
+          email: req.user.email
+        } : null,
+        doctor: req.doctor ? {
+          id: req.doctor._id,
+          name: req.doctor.name,
+          email: req.doctor.email
+        } : null,
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
       error: error.message
     });
   }
