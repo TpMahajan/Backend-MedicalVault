@@ -232,6 +232,72 @@ router.post("/:id/respond", async (req, res) => {
   }
 });
 
+// ---------------- Get Session Status (for polling) ----------------
+// GET /api/sessions/:id/status
+router.get("/:id/status", auth, async (req, res) => {
+  try {
+    const sessionId = req.params.id;
+    
+    const session = await Session.findById(sessionId)
+      .populate('doctorId', 'name email profilePicture experience specialization')
+      .populate('patientId', 'name email');
+    
+    if (!session) {
+      return res.status(404).json({
+        success: false,
+        message: "Session not found"
+      });
+    }
+    
+    // Check if requester is authorized to view this session
+    const isDoctor = req.auth.role === "doctor" && session.doctorId._id.toString() === req.auth.id.toString();
+    const isPatient = req.auth.role !== "doctor" && session.patientId._id.toString() === req.auth.id.toString();
+    
+    if (!isDoctor && !isPatient) {
+      return res.status(403).json({
+        success: false,
+        message: "Unauthorized to view this session"
+      });
+    }
+    
+    // Check if session has expired
+    const isExpired = session.expiresAt <= new Date();
+    const actualStatus = isExpired ? "expired" : session.status;
+    
+    res.json({
+      success: true,
+      session: {
+        _id: session._id,
+        status: actualStatus,
+        expiresAt: session.expiresAt,
+        createdAt: session.createdAt,
+        respondedAt: session.respondedAt,
+        isExpired: isExpired,
+        timeRemaining: isExpired ? 0 : Math.max(0, Math.floor((session.expiresAt - new Date()) / 1000)),
+        doctor: {
+          name: session.doctorId.name,
+          email: session.doctorId.email,
+          profilePicture: session.doctorId.profilePicture,
+          experience: session.doctorId.experience,
+          specialization: session.doctorId.specialization
+        },
+        patient: {
+          name: session.patientId.name,
+          email: session.patientId.email
+        }
+      }
+    });
+    
+  } catch (error) {
+    console.error("Session status error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to get session status",
+      error: error.message
+    });
+  }
+});
+
 // ---------------- Get Active Sessions (Optional - for future use) ----------------
 // GET /api/sessions/active
 router.get("/active", async (req, res) => {

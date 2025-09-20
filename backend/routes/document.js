@@ -7,6 +7,7 @@ import axios from "axios";
 import { auth } from "../middleware/auth.js";
 import { Document } from "../models/File.js";
 import { User } from "../models/User.js";
+import { checkSession, checkSessionByEmail } from "../middleware/checkSession.js";
 
 const router = express.Router();
 
@@ -91,7 +92,7 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
 });
 
 // ---------------- List Files ----------------
-router.get("/user/:userId", auth, async (req, res) => {
+router.get("/user/:userId", auth, checkSession, async (req, res) => {
   try {
     const docs = await Document.find({ userId: req.params.userId }).sort({
       createdAt: -1,
@@ -113,7 +114,7 @@ router.get("/user/:userId", auth, async (req, res) => {
 });
 
 // ---------------- Patient Files (alias for user) ----------------
-router.get("/patient/:patientId", auth, async (req, res) => {
+router.get("/patient/:patientId", auth, checkSession, async (req, res) => {
   try {
     const docs = await Document.find({
       userId: req.params.patientId,
@@ -135,7 +136,7 @@ router.get("/patient/:patientId", auth, async (req, res) => {
 });
 
 // ---------------- Grouped Files ----------------
-router.get("/user/:userId/grouped", auth, async (req, res) => {
+router.get("/user/:userId/grouped", auth, checkSession, async (req, res) => {
   try {
     const docs = await Document.find({ userId: req.params.userId });
 
@@ -174,7 +175,7 @@ router.get("/user/:userId/grouped", auth, async (req, res) => {
 });
 
 // ---------------- Grouped by Email ----------------
-router.get("/grouped/:email", auth, async (req, res) => {
+router.get("/grouped/:email", auth, checkSessionByEmail, async (req, res) => {
   try {
     console.log(`🔍 Fetching grouped docs for email: ${req.params.email}`);
     
