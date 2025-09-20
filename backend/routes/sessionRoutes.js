@@ -293,19 +293,42 @@ router.post("/:id/respond", async (req, res) => {
     
     // If accepted, extend the session for 20 minutes from now
     if (status === "accepted") {
-      session.expiresAt = new Date(Date.now() + 20 * 60 * 1000);
-      console.log('⏰ Session accepted, new expiration:', session.expiresAt);
+      const newExpiresAt = new Date(Date.now() + 20 * 60 * 1000);
+      session.expiresAt = newExpiresAt;
+      console.log('⏰ Session accepted, setting expiration:', {
+        now: new Date(),
+        expiresAt: newExpiresAt,
+        minutesFromNow: 20
+      });
     }
     
-    await session.save();
+    console.log('💾 Saving session with data:', {
+      _id: session._id,
+      doctorId: session.doctorId._id,
+      patientId: session.patientId,
+      status: session.status,
+      expiresAt: session.expiresAt
+    });
+    
+    const savedSession = await session.save();
     
     console.log(`📋 Session ${sessionId} ${status} by patient ${req.auth.id}`);
-    console.log('✅ Session updated successfully:', {
-      _id: session._id,
-      status: session.status,
-      expiresAt: session.expiresAt,
-      doctorId: session.doctorId._id,
-      patientId: session.patientId
+    console.log('✅ Session saved to database:', {
+      _id: savedSession._id,
+      status: savedSession.status,
+      expiresAt: savedSession.expiresAt,
+      doctorId: savedSession.doctorId,
+      patientId: savedSession.patientId,
+      isActive: savedSession.expiresAt > new Date()
+    });
+    
+    // Verify the session was saved correctly by re-querying
+    const verifySession = await Session.findById(savedSession._id);
+    console.log('🔍 Verification query result:', {
+      found: !!verifySession,
+      status: verifySession?.status,
+      expiresAt: verifySession?.expiresAt,
+      isStillActive: verifySession?.expiresAt > new Date()
     });
     
     res.json({
