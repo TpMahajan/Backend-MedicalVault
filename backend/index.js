@@ -20,6 +20,7 @@ import documentRoutes from "./routes/document.js";      // file/documents
 import qrRoutes from "./routes/qrRoutes.js";            // QR
 import doctorAuthRoutes from "./routes/doctorAuth.js";  // doctor auth ✅
 import appointmentRoutes from "./routes/appointments.js"; // appointments ✅
+import userRoutes from "./routes/user.js";              // user management
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -54,6 +55,7 @@ app.use("/api/doctors", doctorAuthRoutes);    // doctors ✅
 app.use("/api/files", documentRoutes);        // documents
 app.use("/api/appointments", appointmentRoutes); // appointments ✅
 app.use("/api/qr", qrRoutes);                 // QR
+app.use("/api/users", userRoutes);            // user management
 
 // -------------------- Health Check --------------------
 app.get("/health", (req, res) =>
@@ -67,6 +69,7 @@ app.get("/health", (req, res) =>
       "/api/files",
       "/api/appointments",
       "/api/qr",
+      "/api/users",
     ],
   })
 );
