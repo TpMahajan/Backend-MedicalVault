@@ -27,7 +27,9 @@ const sessionSchema = new mongoose.Schema(
     // When the session expires (20 minutes from creation for pending, or from acceptance for accepted)
     expiresAt: {
       type: Date,
-      required: true,
+      default: function() {
+        return new Date(Date.now() + 20 * 60 * 1000); // 20 minutes from now
+      },
     },
     
     // Additional metadata
@@ -73,12 +75,18 @@ sessionSchema.methods.extendSession = function(minutes = 20) {
   return this.save();
 };
 
-// Pre-save middleware to set expiresAt if not set
+// Pre-save middleware to ensure expiresAt is always set
 sessionSchema.pre("save", function(next) {
-  if (this.isNew && !this.expiresAt) {
-    // Set expiration to 20 minutes from now for new sessions
+  // Always ensure expiresAt is set for new documents
+  if (this.isNew && (!this.expiresAt || this.expiresAt === null)) {
+    console.log('🕒 Setting expiresAt for new session');
     this.expiresAt = new Date(Date.now() + 20 * 60 * 1000);
   }
+  console.log('💾 Session pre-save:', {
+    isNew: this.isNew,
+    expiresAt: this.expiresAt,
+    status: this.status
+  });
   next();
 });
 

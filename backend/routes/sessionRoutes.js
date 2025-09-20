@@ -24,7 +24,8 @@ router.get("/db-test", async (req, res) => {
       doctorId: "507f1f77bcf86cd799439011",
       patientId: "507f1f77bcf86cd799439012", 
       requestMessage: "DB connection test",
-      status: "pending"
+      status: "pending",
+      expiresAt: new Date(Date.now() + 20 * 60 * 1000)
     };
     
     const testSession = new Session(testSessionData);
@@ -142,8 +143,8 @@ router.post("/request", async (req, res) => {
       doctorId: req.auth.id,
       patientId: patientId,
       requestMessage: requestMessage || "",
-      status: "pending"
-      // expiresAt will be set automatically by pre-save middleware
+      status: "pending",
+      expiresAt: new Date(Date.now() + 20 * 60 * 1000) // Explicitly set expiration
     });
     
     console.log('💾 Saving session to database...');
@@ -499,7 +500,8 @@ router.post("/test-create", auth, async (req, res) => {
       doctorId: req.auth.id,
       patientId: patientId,
       requestMessage: "Test session creation",
-      status: "pending"
+      status: "pending",
+      expiresAt: new Date(Date.now() + 20 * 60 * 1000) // Explicitly set expiration
     });
 
     console.log('💾 Saving test session...');
