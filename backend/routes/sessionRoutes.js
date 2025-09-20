@@ -422,6 +422,76 @@ router.get("/:id/status", auth, async (req, res) => {
   }
 });
 
+// ---------------- Get Doctor's Own Sessions/Patients ----------------
+// GET /api/sessions/mine
+router.get("/mine", async (req, res) => {
+  try {
+    // Ensure the requester is a doctor
+    if (req.auth.role !== "doctor") {
+      return res.status(403).json({
+        success: false,
+        message: "Only doctors can access this endpoint"
+      });
+    }
+
+    console.log('👨‍⚕️ Doctor requesting own sessions:', req.auth.id);
+
+    // Clean up expired sessions first
+    await Session.cleanExpiredSessions();
+    
+    // Find all accepted sessions for this doctor that are not expired
+    const doctorSessions = await Session.find({
+      doctorId: req.auth.id,
+      status: "accepted",
+      expiresAt: { $gt: new Date() }
+    })
+    .populate('patientId', 'name email mobile profilePicture age gender bloodType dateOfBirth')
+    .sort({ createdAt: -1 });
+
+    console.log(`📋 Found ${doctorSessions.length} active sessions for doctor ${req.auth.id}`);
+
+    // Transform sessions into patient list format for frontend compatibility
+    const patients = doctorSessions.map(session => {
+      const patient = session.patientId;
+      return {
+        id: patient._id.toString(),
+        name: patient.name,
+        email: patient.email,
+        mobile: patient.mobile,
+        profilePicture: patient.profilePicture,
+        age: patient.age,
+        gender: patient.gender,
+        bloodType: patient.bloodType,
+        dateOfBirth: patient.dateOfBirth,
+        // Session info for reference
+        sessionId: session._id,
+        sessionExpiresAt: session.expiresAt,
+        sessionCreatedAt: session.createdAt,
+        // Add expiry info for frontend
+        expiresAt: session.expiresAt.getTime(), // Convert to timestamp for frontend
+        isExpiringSoon: (session.expiresAt - new Date()) < (5 * 60 * 1000) // Less than 5 minutes left
+      };
+    });
+
+    console.log('✅ Returning patients for doctor:', patients.map(p => ({ id: p.id, name: p.name })));
+
+    res.json({
+      success: true,
+      count: patients.length,
+      patients: patients,
+      activeSessions: doctorSessions.length
+    });
+    
+  } catch (error) {
+    console.error("❌ Doctor sessions error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch doctor's sessions",
+      error: error.message
+    });
+  }
+});
+
 // ---------------- Get Active Sessions (Optional - for future use) ----------------
 // GET /api/sessions/active
 router.get("/active", async (req, res) => {
