@@ -10,8 +10,16 @@ import { Session } from "../models/Session.js";
  */
 export const checkSession = async (req, res, next) => {
   try {
+    console.log('🔐 checkSession middleware called:', {
+      method: req.method,
+      url: req.url,
+      authRole: req.auth?.role,
+      authId: req.auth?.id
+    });
+
     // If the requester is not a doctor, skip session check
     if (req.auth.role !== "doctor") {
+      console.log("✅ Non-doctor user, skipping session check");
       return next();
     }
 
@@ -37,6 +45,8 @@ export const checkSession = async (req, res, next) => {
       patientId = req.body.patientId;
     }
 
+    console.log('🔍 Extracted patientId:', patientId);
+
     // If no patientId found, this might not be a patient-specific request
     if (!patientId) {
       console.log("⚠️ No patientId found in request, allowing access");
@@ -47,6 +57,12 @@ export const checkSession = async (req, res, next) => {
     await Session.cleanExpiredSessions();
 
     // Check if doctor has an active session with this patient
+    console.log('🔍 Looking for active session:', {
+      doctorId: req.auth.id,
+      patientId: patientId,
+      currentTime: new Date()
+    });
+
     const activeSession = await Session.findOne({
       doctorId: req.auth.id,
       patientId: patientId,
@@ -54,13 +70,29 @@ export const checkSession = async (req, res, next) => {
       expiresAt: { $gt: new Date() }
     }).populate('patientId', 'name email');
 
+    console.log('📋 Session query result:', activeSession);
+
     if (!activeSession) {
       console.log(`🚫 Doctor ${req.auth.id} has no active session with patient ${patientId}`);
+      
+      // Check if there are any sessions at all for debugging
+      const allSessions = await Session.find({
+        doctorId: req.auth.id,
+        patientId: patientId
+      });
+      console.log('🔍 All sessions for this doctor-patient pair:', allSessions);
+      
       return res.status(403).json({
         success: false,
         message: "Access denied. No active session with this patient.",
         code: "NO_ACTIVE_SESSION",
-        patientId: patientId
+        patientId: patientId,
+        debug: {
+          doctorId: req.auth.id,
+          patientId: patientId,
+          allSessionsCount: allSessions.length,
+          currentTime: new Date()
+        }
       });
     }
 
