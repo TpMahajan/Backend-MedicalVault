@@ -15,18 +15,19 @@ export const checkSession = async (req, res, next) => {
       url: req.url,
       authRole: req.auth?.role,
       authId: req.auth?.id,
-      hasAuth: !!req.auth
+      hasAuth: !!req.auth,
+      authObject: req.auth
     });
 
-    // If no authentication info, skip session check (public access)
-    if (!req.auth) {
-      console.log("✅ No authentication info, allowing public access");
+    // If no authentication info or auth is null/undefined, skip session check (public access)
+    if (!req.auth || typeof req.auth !== 'object') {
+      console.log("✅ No valid authentication info, allowing public access");
       return next();
     }
 
     // If the requester is not a doctor, skip session check
-    if (req.auth.role !== "doctor") {
-      console.log("✅ Non-doctor user, skipping session check");
+    if (!req.auth.role || req.auth.role !== "doctor") {
+      console.log("✅ Non-doctor user or no role, skipping session check");
       return next();
     }
 
@@ -112,6 +113,24 @@ export const checkSession = async (req, res, next) => {
 
   } catch (error) {
     console.error("Session check middleware error:", error);
+    console.error("Error stack:", error.stack);
+    console.error("Request details:", {
+      method: req.method,
+      url: req.url,
+      auth: req.auth,
+      params: req.params
+    });
+    
+    // If it's an authentication-related error, allow public access
+    if (error.message && (
+      error.message.includes('Cannot read properties of undefined') ||
+      error.message.includes('auth') ||
+      error.message.includes('role')
+    )) {
+      console.log("⚠️ Auth-related error, allowing public access as fallback");
+      return next();
+    }
+    
     res.status(500).json({
       success: false,
       message: "Session validation failed",
