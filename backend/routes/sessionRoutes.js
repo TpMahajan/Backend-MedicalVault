@@ -6,7 +6,51 @@ import { DoctorUser } from "../models/DoctorUser.js";
 
 const router = express.Router();
 
-// All routes require authentication
+// Health check endpoint (no auth required)
+router.get("/health", (req, res) => {
+  res.json({
+    success: true,
+    message: "Session routes are working",
+    timestamp: new Date().toISOString(),
+    sessionModel: Session ? "loaded" : "not loaded"
+  });
+});
+
+// Test database connection (no auth required)
+router.get("/db-test", async (req, res) => {
+  try {
+    // Test if we can create a simple session object (without saving)
+    const testSessionData = {
+      doctorId: "507f1f77bcf86cd799439011",
+      patientId: "507f1f77bcf86cd799439012", 
+      requestMessage: "DB connection test",
+      status: "pending"
+    };
+    
+    const testSession = new Session(testSessionData);
+    console.log('🧪 Test session object created:', testSession);
+    
+    res.json({
+      success: true,
+      message: "Database connection and Session model working",
+      testSession: {
+        doctorId: testSession.doctorId,
+        patientId: testSession.patientId,
+        status: testSession.status,
+        expiresAt: testSession.expiresAt
+      }
+    });
+  } catch (error) {
+    console.error('❌ DB test error:', error);
+    res.status(500).json({
+      success: false,
+      message: "Database test failed",
+      error: error.message
+    });
+  }
+});
+
+// All other routes require authentication
 router.use(auth);
 
 // ---------------- Doctor Requests Access ----------------
@@ -426,10 +470,34 @@ router.post("/test-create", auth, async (req, res) => {
       });
     }
 
+    // First, ensure we have a test patient
+    let testPatient = await User.findOne({ email: "test.patient@example.com" });
+    
+    if (!testPatient) {
+      console.log('🔄 Creating test patient...');
+      testPatient = new User({
+        name: "Test Patient",
+        email: "test.patient@example.com",
+        password: "test123",
+        mobile: "+1234567890",
+        age: 30,
+        gender: "Male",
+        bloodType: "O+"
+      });
+      await testPatient.save();
+      console.log('✅ Test patient created:', testPatient._id);
+    } else {
+      console.log('✅ Test patient found:', testPatient._id);
+    }
+
+    // Use the test patient's ID or the provided one
+    const patientId = req.body.patientId || testPatient._id.toString();
+    console.log('🔄 Using patient ID:', patientId);
+
     // Create a simple test session
     const testSession = new Session({
       doctorId: req.auth.id,
-      patientId: req.body.patientId || "507f1f77bcf86cd799439011", // dummy ObjectId for testing
+      patientId: patientId,
       requestMessage: "Test session creation",
       status: "pending"
     });
@@ -442,7 +510,12 @@ router.post("/test-create", auth, async (req, res) => {
       success: true,
       message: "Test session created successfully",
       sessionId: savedSession._id,
-      session: savedSession
+      session: savedSession,
+      testPatient: {
+        id: testPatient._id,
+        name: testPatient.name,
+        email: testPatient.email
+      }
     });
 
   } catch (error) {
@@ -450,7 +523,8 @@ router.post("/test-create", auth, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Test session creation failed",
-      error: error.message
+      error: error.message,
+      stack: error.stack
     });
   }
 });
