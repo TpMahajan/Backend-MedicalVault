@@ -19,14 +19,20 @@ export const generateSignedUrl = async (s3Key, s3Bucket, expiresIn = 3600) => {
 };
 
 // Generate signed URL for preview (inline)
-export const generatePreviewUrl = async (s3Key, s3Bucket, expiresIn = 3600) => {
+export const generatePreviewUrl = async (s3Key, s3Bucket, mimeType = null, expiresIn = 3600) => {
   try {
-    const command = new GetObjectCommand({
+    const commandParams = {
       Bucket: s3Bucket,
       Key: s3Key,
       ResponseContentDisposition: 'inline'
-    });
+    };
     
+    // Set ResponseContentType for PDFs to ensure proper rendering
+    if (mimeType && mimeType.includes('pdf')) {
+      commandParams.ResponseContentType = 'application/pdf';
+    }
+    
+    const command = new GetObjectCommand(commandParams);
     const signedUrl = await getSignedUrl(s3Client, command, { expiresIn });
     return signedUrl;
   } catch (error) {

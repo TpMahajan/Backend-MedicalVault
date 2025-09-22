@@ -347,8 +347,8 @@ router.get("/:id/preview", auth, checkSession, async (req, res) => {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
-    const previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket);
-    res.json({ success: true, url: previewUrl });
+    const previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket, doc.mimeType);
+    res.json({ success: true, signedUrl: previewUrl });
   } catch (err) {
     res.status(500).json({ msg: "Preview failed", error: err.message });
   }
@@ -400,7 +400,7 @@ router.get("/:id/proxy", auth, checkSession, async (req, res) => {
     }
 
     // Generate a signed URL for preview
-    const previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket);
+    const previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket, doc.mimeType);
 
     const response = await axios.get(previewUrl, { 
       responseType: "arraybuffer",
