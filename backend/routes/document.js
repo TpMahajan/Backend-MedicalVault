@@ -40,7 +40,17 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
 
-    const { title, category, date, notes } = req.body;
+    const { title, category, date, notes, userId } = req.body;
+    
+    console.log('📤 Upload request received:', {
+      title,
+      category,
+      date,
+      notes,
+      userId,
+      authId: req.auth.id,
+      authRole: req.auth?.role
+    });
 
     const validCategories = ["Report", "Prescription", "Bill", "Insurance"];
     let chosenCategory = "Report"; // Default
@@ -61,8 +71,18 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
     const s3Key = req.file.key;
     const s3Bucket = req.file.bucket;
 
+    // ✅ Support both doctor uploads (userId from req.body) and patient uploads (userId from req.auth.id)
+    const targetUserId = req.body.userId || req.auth.id;
+    
+    console.log('🎯 Target userId determined:', {
+      fromBody: req.body.userId,
+      fromAuth: req.auth.id,
+      finalTarget: targetUserId,
+      isDoctorUpload: !!req.body.userId
+    });
+    
     const doc = await Document.create({
-      userId: req.auth.id,
+      userId: targetUserId,
       doctorId: req.auth?.role === "doctor" ? req.auth.id : undefined,
       title: title || req.file.originalname,
       description: notes || "",
@@ -80,8 +100,15 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
       uploadedAt: date || new Date(),
     });
 
-    // ✅ Link the document to the user's medicalRecords array
-    await User.findByIdAndUpdate(req.auth.id, { $push: { medicalRecords: doc._id } });
+    // ✅ Link the document to the target user's medicalRecords array
+    await User.findByIdAndUpdate(targetUserId, { $push: { medicalRecords: doc._id } });
+    
+    console.log('✅ Document created and linked:', {
+      docId: doc._id,
+      targetUserId: targetUserId,
+      category: chosenCategory,
+      title: doc.title
+    });
 
     res.json({ success: true, document: doc });
   } catch (err) {
