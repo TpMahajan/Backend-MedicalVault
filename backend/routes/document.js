@@ -307,13 +307,16 @@ router.get("/grouped/:email", auth, checkSessionByEmail, async (req, res) => {
 });
 
 // ---------------- Preview ----------------
-router.get("/:id/preview", auth, async (req, res) => {
+router.get("/:id/preview", auth, checkSession, async (req, res) => {
   try {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
-    // Check if user owns this document or is authorized to access it
-    if (doc.userId.toString() !== req.auth.id.toString()) {
+    // Check if user owns this document or has session access
+    const isOwner = doc.userId.toString() === req.auth.id.toString();
+    const hasSessionAccess = req.session && req.session.status === 'accepted';
+    
+    if (!isOwner && !hasSessionAccess) {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
@@ -325,13 +328,16 @@ router.get("/:id/preview", auth, async (req, res) => {
 });
 
 // ---------------- Download ----------------
-router.get("/:id/download", auth, async (req, res) => {
+router.get("/:id/download", auth, checkSession, async (req, res) => {
   try {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
-    // Check if user owns this document or is authorized to access it
-    if (doc.userId.toString() !== req.auth.id.toString()) {
+    // Check if user owns this document or has session access
+    const isOwner = doc.userId.toString() === req.auth.id.toString();
+    const hasSessionAccess = req.session && req.session.status === 'accepted';
+    
+    if (!isOwner && !hasSessionAccess) {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
@@ -349,13 +355,16 @@ router.get("/:id/download", auth, async (req, res) => {
 });
 
 // ---------------- Proxy (for inline preview) ----------------
-router.get("/:id/proxy", auth, async (req, res) => {
+router.get("/:id/proxy", auth, checkSession, async (req, res) => {
   try {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
-    // Check if user owns this document or is authorized to access it
-    if (doc.userId.toString() !== req.auth.id.toString()) {
+    // Check if user owns this document or has session access
+    const isOwner = doc.userId.toString() === req.auth.id.toString();
+    const hasSessionAccess = req.session && req.session.status === 'accepted';
+    
+    if (!isOwner && !hasSessionAccess) {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 

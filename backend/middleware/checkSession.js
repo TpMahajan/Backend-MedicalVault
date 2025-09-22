@@ -28,8 +28,22 @@ export const checkSession = async (req, res, next) => {
       return next();
     }
 
-    // Extract patientId from URL parameters
-    const patientId = req.params.id || req.params.userId || req.params.patientId;
+    // Extract patientId from URL parameters or from document
+    let patientId = req.params.id || req.params.userId || req.params.patientId;
+    
+    // For file routes like /files/:id/proxy, we need to get patientId from the document
+    if (!patientId && req.route?.path?.includes('/files/')) {
+      try {
+        const { Document } = await import("../models/File.js");
+        const doc = await Document.findById(req.params.id).select('userId');
+        if (doc) {
+          patientId = doc.userId.toString();
+          console.log('📄 Found patientId from document:', patientId);
+        }
+      } catch (error) {
+        console.error('Error fetching document for session check:', error);
+      }
+    }
     
     console.log('🔍 Doctor session check:', {
       doctorId: req.auth.id,
