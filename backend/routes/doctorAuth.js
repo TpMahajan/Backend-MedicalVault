@@ -1,34 +1,33 @@
 import express from "express";
 import jwt from "jsonwebtoken";
 import multer from "multer";
-import { CloudinaryStorage } from "multer-storage-cloudinary";
-import { v2 as cloudinary } from "cloudinary";
 import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { auth } from "../middleware/auth.js";
 
-// ---------------- Cloudinary Config ----------------
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
-});
+// ---------------- Local Storage Setup ----------------
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Ensure uploads directory exists
+const uploadsDir = path.join(__dirname, "../uploads/doctor-avatars");
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
 
 // ---------------- Storage ----------------
-const storage = new CloudinaryStorage({
-  cloudinary,
-  params: async (req, file) => {
-    const baseName = path.parse(file.originalname).name.replace(/\s+/g, "_");
-    return {
-      folder: "medical-vault/doctor-avatars",
-      public_id: `doctor-${req.doctor._id}-${Date.now()}-${baseName}`,
-      resource_type: "image",
-      transformation: [
-        { width: 300, height: 300, crop: "fill", gravity: "face" },
-        { quality: "auto", fetch_format: "auto" }
-      ],
-    };
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadsDir);
   },
+  filename: (req, file, cb) => {
+    const baseName = path.parse(file.originalname).name.replace(/\s+/g, "_");
+    const ext = path.extname(file.originalname);
+    const fileName = `doctor-${req.doctor?._id || 'unknown'}-${Date.now()}-${baseName}${ext}`;
+    cb(null, fileName);
+  }
 });
 
 const upload = multer({ 
@@ -206,17 +205,22 @@ router.post("/profile/avatar", auth, upload.single("avatar"), async (req, res) =
     // Delete old avatar if exists
     if (req.doctor.avatar) {
       try {
-        const publicId = req.doctor.avatar.split('/').pop().split('.')[0];
-        await cloudinary.uploader.destroy(`medical-vault/doctor-avatars/${publicId}`);
+        const oldFilePath = path.join(__dirname, "../uploads/doctor-avatars", path.basename(req.doctor.avatar));
+        if (fs.existsSync(oldFilePath)) {
+          fs.unlinkSync(oldFilePath);
+        }
       } catch (deleteError) {
         console.warn("Could not delete old avatar:", deleteError.message);
       }
     }
 
+    // Create the public URL for the avatar
+    const avatarUrl = `/uploads/doctor-avatars/${req.file.filename}`;
+
     // Update doctor with new avatar URL
     const updatedDoctor = await DoctorUser.findByIdAndUpdate(
       req.doctor._id,
-      { avatar: req.file.path },
+      { avatar: avatarUrl },
       { new: true, runValidators: true }
     ).select("-password");
 
@@ -224,7 +228,7 @@ router.post("/profile/avatar", auth, upload.single("avatar"), async (req, res) =
       success: true,
       message: "Avatar uploaded successfully.",
       doctor: updatedDoctor,
-      avatarUrl: req.file.path,
+      avatarUrl: avatarUrl,
     });
   } catch (error) {
     console.error("Avatar upload error:", error);

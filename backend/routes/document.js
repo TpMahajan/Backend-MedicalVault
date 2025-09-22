@@ -1,37 +1,36 @@
 import express from "express";
 import multer from "multer";
+import multerS3 from "multer-s3";
 import path from "path";
-import { CloudinaryStorage } from "multer-storage-cloudinary";
-import { v2 as cloudinary } from "cloudinary";
+import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import axios from "axios";
 import { auth } from "../middleware/auth.js";
 import { Document } from "../models/File.js";
 import { User } from "../models/User.js";
 import { checkSession, checkSessionByEmail } from "../middleware/checkSession.js";
+import s3Client, { BUCKET_NAME, REGION } from "../config/s3.js";
+import { generateSignedUrl, generatePreviewUrl, generateDownloadUrl } from "../utils/s3Utils.js";
 
 const router = express.Router();
 
-// ---------------- Cloudinary Config ----------------
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
-});
-
-// ---------------- Storage ----------------
-const storage = new CloudinaryStorage({
-  cloudinary,
-  params: async (req, file) => {
+// ---------------- AWS S3 Storage ----------------
+const storage = multerS3({
+  s3: s3Client,
+  bucket: BUCKET_NAME,
+  key: (req, file, cb) => {
     const baseName = path.parse(file.originalname).name.replace(/\s+/g, "_");
     const ext = path.extname(file.originalname).toLowerCase();
-
-    return {
-      folder: "medical-vault",
-      public_id: `${Date.now()}-${baseName}`,
-      resource_type: "auto",
-      format: ext === ".pdf" ? "pdf" : undefined,
-    };
+    const fileName = `medical-vault/${Date.now()}-${baseName}${ext}`;
+    cb(null, fileName);
   },
+  contentType: multerS3.AUTO_CONTENT_TYPE,
+  metadata: (req, file, cb) => {
+    cb(null, {
+      fieldName: file.fieldname,
+      originalName: file.originalname,
+      uploadedBy: req.auth?.id || 'unknown'
+    });
+  }
 });
 
 const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
@@ -58,11 +57,9 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
       chosenCategory = "Insurance";
     }
 
-    // ✅ Ensure correct Cloudinary public_id is stored
-    const publicId =
-      req.file.public_id ||
-      req.file.filename ||
-      (req.file.path ? req.file.path.split("/").slice(-2).join("/") : null);
+    // ✅ Store S3 information
+    const s3Key = req.file.key;
+    const s3Bucket = req.file.bucket;
 
     const doc = await Document.create({
       userId: req.auth.id,
@@ -76,9 +73,10 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
       fileType: req.file.mimetype,
       size: req.file.size,
       fileSize: req.file.size,
-      cloudinaryUrl: req.file.path,
-      cloudinaryPublicId: publicId,
-      url: req.file.path,
+      s3Key: s3Key,
+      s3Bucket: s3Bucket,
+      s3Region: REGION,
+      url: req.file.location, // S3 public URL (if bucket is public) or will be replaced with signed URL
       uploadedAt: date || new Date(),
     });
 
@@ -97,10 +95,27 @@ router.get("/user/:userId", auth, checkSession, async (req, res) => {
     const docs = await Document.find({ userId: req.params.userId }).sort({
       createdAt: -1,
     });
-    const docsWithUrl = docs.map((doc) => ({
-      ...doc.toObject(),
-      url: doc.cloudinaryUrl,
-    }));
+    
+    // Generate signed URLs for each document
+    const docsWithUrl = await Promise.all(
+      docs.map(async (doc) => {
+        try {
+          const signedUrl = await generateSignedUrl(doc.s3Key, doc.s3Bucket);
+          return {
+            ...doc.toObject(),
+            url: signedUrl,
+          };
+        } catch (error) {
+          console.error(`Error generating URL for doc ${doc._id}:`, error);
+          return {
+            ...doc.toObject(),
+            url: null,
+            error: "Failed to generate access URL"
+          };
+        }
+      })
+    );
+    
     res.json({
       success: true,
       count: docsWithUrl.length,
@@ -119,10 +134,27 @@ router.get("/patient/:patientId", auth, checkSession, async (req, res) => {
     const docs = await Document.find({
       userId: req.params.patientId,
     }).sort({ createdAt: -1 });
-    const docsWithUrl = docs.map((doc) => ({
-      ...doc.toObject(),
-      url: doc.cloudinaryUrl,
-    }));
+    
+    // Generate signed URLs for each document
+    const docsWithUrl = await Promise.all(
+      docs.map(async (doc) => {
+        try {
+          const signedUrl = await generateSignedUrl(doc.s3Key, doc.s3Bucket);
+          return {
+            ...doc.toObject(),
+            url: signedUrl,
+          };
+        } catch (error) {
+          console.error(`Error generating URL for doc ${doc._id}:`, error);
+          return {
+            ...doc.toObject(),
+            url: null,
+            error: "Failed to generate access URL"
+          };
+        }
+      })
+    );
+    
     res.json({
       success: true,
       count: docsWithUrl.length,
@@ -149,14 +181,31 @@ router.get("/user/:userId/grouped", auth, checkSession, async (req, res) => {
       insurance: docs.filter((d) => d.category?.toLowerCase() === "insurance"),
     };
 
+    // Generate signed URLs for each group
     const groupedWithUrl = Object.fromEntries(
-      Object.entries(grouped).map(([key, docs]) => [
-        key,
-        docs.map((doc) => ({
-          ...doc.toObject(),
-          url: doc.cloudinaryUrl,
-        })),
-      ])
+      await Promise.all(
+        Object.entries(grouped).map(async ([key, docs]) => [
+          key,
+          await Promise.all(
+            docs.map(async (doc) => {
+              try {
+                const signedUrl = await generateSignedUrl(doc.s3Key, doc.s3Bucket);
+                return {
+                  ...doc.toObject(),
+                  url: signedUrl,
+                };
+              } catch (error) {
+                console.error(`Error generating URL for doc ${doc._id}:`, error);
+                return {
+                  ...doc.toObject(),
+                  url: null,
+                  error: "Failed to generate access URL"
+                };
+              }
+            })
+          ),
+        ])
+      )
     );
 
     res.json({
@@ -211,14 +260,31 @@ router.get("/grouped/:email", auth, checkSessionByEmail, async (req, res) => {
 
     console.log(`📊 Grouped counts: Reports: ${grouped.reports.length}, Prescriptions: ${grouped.prescriptions.length}, Bills: ${grouped.bills.length}, Insurance: ${grouped.insurance.length}`);
 
+    // Generate signed URLs for each group
     const groupedWithUrl = Object.fromEntries(
-      Object.entries(grouped).map(([key, docs]) => [
-        key,
-        docs.map((doc) => ({
-          ...doc.toObject(),
-          url: doc.cloudinaryUrl,
-        })),
-      ])
+      await Promise.all(
+        Object.entries(grouped).map(async ([key, docs]) => [
+          key,
+          await Promise.all(
+            docs.map(async (doc) => {
+              try {
+                const signedUrl = await generateSignedUrl(doc.s3Key, doc.s3Bucket);
+                return {
+                  ...doc.toObject(),
+                  url: signedUrl,
+                };
+              } catch (error) {
+                console.error(`Error generating URL for doc ${doc._id}:`, error);
+                return {
+                  ...doc.toObject(),
+                  url: null,
+                  error: "Failed to generate access URL"
+                };
+              }
+            })
+          ),
+        ])
+      )
     );
 
     const response = {
@@ -246,7 +312,13 @@ router.get("/:id/preview", auth, async (req, res) => {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
-    res.json({ success: true, url: doc.cloudinaryUrl });
+    // Check if user owns this document or is authorized to access it
+    if (doc.userId.toString() !== req.auth.id.toString()) {
+      return res.status(403).json({ msg: "Unauthorized access" });
+    }
+
+    const previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket);
+    res.json({ success: true, url: previewUrl });
   } catch (err) {
     res.status(500).json({ msg: "Preview failed", error: err.message });
   }
@@ -263,19 +335,12 @@ router.get("/:id/download", auth, async (req, res) => {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
-    if (!doc.cloudinaryPublicId) {
-      return res.status(400).json({ msg: "Missing Cloudinary publicId" });
+    if (!doc.s3Key) {
+      return res.status(400).json({ msg: "Missing S3 key" });
     }
 
     // Generate a signed URL for download with attachment flag
-    const downloadUrl = cloudinary.url(doc.cloudinaryPublicId, {
-      resource_type: "auto",
-      secure: true,
-      flags: "attachment",
-      sign_url: true,
-      expires_at: Math.floor(Date.now() / 1000) + 3600, // 1 hour expiry
-    });
-
+    const downloadUrl = await generateDownloadUrl(doc.s3Key, doc.s3Bucket);
     res.redirect(downloadUrl);
   } catch (err) {
     console.error("Download error:", err);
@@ -294,18 +359,12 @@ router.get("/:id/proxy", auth, async (req, res) => {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
-    if (!doc.cloudinaryPublicId) {
-      return res.status(400).json({ msg: "Missing Cloudinary publicId" });
+    if (!doc.s3Key) {
+      return res.status(400).json({ msg: "Missing S3 key" });
     }
 
     // Generate a signed URL for preview
-    const previewUrl = cloudinary.url(doc.cloudinaryPublicId, {
-      resource_type: "auto",
-      secure: true,
-      sign_url: true,
-      expires_at: Math.floor(Date.now() / 1000) + 3600, // 1 hour expiry
-      format: doc.fileType?.includes("pdf") ? "pdf" : undefined,
-    });
+    const previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket);
 
     const response = await axios.get(previewUrl, { 
       responseType: "arraybuffer",
@@ -332,16 +391,19 @@ router.delete("/:id", auth, async (req, res) => {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
-    // Delete from Cloudinary if public ID exists
-    if (doc.cloudinaryPublicId) {
+    // Delete from S3 if key exists
+    if (doc.s3Key) {
       try {
-        const cloudinaryResult = await cloudinary.uploader.destroy(doc.cloudinaryPublicId, {
-          resource_type: "auto",
+        const deleteCommand = new DeleteObjectCommand({
+          Bucket: doc.s3Bucket,
+          Key: doc.s3Key,
         });
-        console.log("Cloudinary deletion result:", cloudinaryResult);
-      } catch (cloudinaryErr) {
-        console.error("Cloudinary deletion error:", cloudinaryErr);
-        // Continue with database deletion even if Cloudinary fails
+        
+        await s3Client.send(deleteCommand);
+        console.log("S3 deletion successful for key:", doc.s3Key);
+      } catch (s3Err) {
+        console.error("S3 deletion error:", s3Err);
+        // Continue with database deletion even if S3 fails
       }
     }
 

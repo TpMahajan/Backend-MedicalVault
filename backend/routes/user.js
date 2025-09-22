@@ -58,15 +58,32 @@ router.get('/:id/records', auth, checkSession, async (req, res) => {
       insurance: records.filter((record) => record.category?.toLowerCase() === "insurance"),
     };
 
-    // Add URL field for frontend compatibility
+    // Add URL field for frontend compatibility (using S3 signed URLs)
+    const { generateSignedUrl } = await import("../utils/s3Utils.js");
     const groupedWithUrl = Object.fromEntries(
-      Object.entries(grouped).map(([key, docs]) => [
-        key,
-        docs.map((doc) => ({
-          ...doc.toObject(),
-          url: doc.cloudinaryUrl,
-        })),
-      ])
+      await Promise.all(
+        Object.entries(grouped).map(async ([key, docs]) => [
+          key,
+          await Promise.all(
+            docs.map(async (doc) => {
+              try {
+                const signedUrl = await generateSignedUrl(doc.s3Key, doc.s3Bucket);
+                return {
+                  ...doc.toObject(),
+                  url: signedUrl,
+                };
+              } catch (error) {
+                console.error(`Error generating URL for doc ${doc._id}:`, error);
+                return {
+                  ...doc.toObject(),
+                  url: null,
+                  error: "Failed to generate access URL"
+                };
+              }
+            })
+          ),
+        ])
+      )
     );
 
     const response = {

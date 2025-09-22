@@ -30,11 +30,12 @@ const fileSchema = new mongoose.Schema(
     size: { type: Number },
     fileSize: { type: Number },
 
-    // Cloudinary storage
-    cloudinaryUrl: { type: String, required: true },
-    cloudinaryPublicId: { type: String, required: true },
-    // ✅ Add url field for frontend compatibility (virtual field)
-    url: { type: String }, // This will be set to cloudinaryUrl in responses
+    // AWS S3 storage
+    s3Key: { type: String, required: true },
+    s3Bucket: { type: String, required: true, default: "medical-vault-storage" },
+    s3Region: { type: String, required: true, default: "ap-south-1" },
+    // ✅ Add url field for frontend compatibility (will be signed URL)
+    url: { type: String }, // This will be set to signed URL in responses
 
     // Dates
     date: { type: String },
