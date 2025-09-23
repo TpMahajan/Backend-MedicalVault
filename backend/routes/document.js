@@ -8,6 +8,7 @@ import { auth } from "../middleware/auth.js";
 import { Document } from "../models/File.js";
 import { User } from "../models/User.js";
 import { checkSession, checkSessionByEmail } from "../middleware/checkSession.js";
+import { Session } from "../models/Session.js";
 import s3Client, { BUCKET_NAME, REGION } from "../config/s3.js";
 import { generateSignedUrl, generatePreviewUrl, generateDownloadUrl } from "../utils/s3Utils.js";
 
@@ -339,9 +340,20 @@ router.get("/:id/preview", auth, checkSession, async (req, res) => {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
-    // Check if user owns this document or has session access
+    // Check if user owns this document or has active doctor-patient session
     const isOwner = doc.userId.toString() === req.auth.id.toString();
-    const hasSessionAccess = req.session && req.session.status === 'accepted';
+    let hasSessionAccess = false;
+    if (!isOwner && req.auth?.role === "doctor") {
+      // Validate active session explicitly in case middleware didn't populate req.session
+      await Session.cleanExpiredSessions();
+      const activeSession = await Session.findOne({
+        doctorId: req.auth.id,
+        patientId: doc.userId.toString(),
+        status: "accepted",
+        expiresAt: { $gt: new Date() },
+      });
+      hasSessionAccess = !!activeSession;
+    }
     
     if (!isOwner && !hasSessionAccess) {
       return res.status(403).json({ msg: "Unauthorized access" });
@@ -360,9 +372,19 @@ router.get("/:id/download", auth, checkSession, async (req, res) => {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
-    // Check if user owns this document or has session access
+    // Check if user owns this document or has active doctor-patient session
     const isOwner = doc.userId.toString() === req.auth.id.toString();
-    const hasSessionAccess = req.session && req.session.status === 'accepted';
+    let hasSessionAccess = false;
+    if (!isOwner && req.auth?.role === "doctor") {
+      await Session.cleanExpiredSessions();
+      const activeSession = await Session.findOne({
+        doctorId: req.auth.id,
+        patientId: doc.userId.toString(),
+        status: "accepted",
+        expiresAt: { $gt: new Date() },
+      });
+      hasSessionAccess = !!activeSession;
+    }
     
     if (!isOwner && !hasSessionAccess) {
       return res.status(403).json({ msg: "Unauthorized access" });
