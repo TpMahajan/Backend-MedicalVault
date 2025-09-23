@@ -396,6 +396,14 @@ router.get("/:id/download", auth, checkSession, async (req, res) => {
 
     // Generate a signed URL for download with attachment flag
     const downloadUrl = await generateDownloadUrl(doc.s3Key, doc.s3Bucket);
+
+    // If client prefers JSON (e.g., web app), return the URL instead of redirecting
+    const acceptHeader = String(req.headers["accept"] || "").toLowerCase();
+    if (acceptHeader.includes("application/json") || req.query.json === "true") {
+      return res.json({ success: true, signedUrl: downloadUrl });
+    }
+
+    // Default behavior: redirect (good for mobile clients following redirects)
     res.redirect(downloadUrl);
   } catch (err) {
     console.error("Download error:", err);
