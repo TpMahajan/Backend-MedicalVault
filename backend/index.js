@@ -22,6 +22,7 @@ import doctorAuthRoutes from "./routes/doctorAuth.js";  // doctor auth ✅
 import appointmentRoutes from "./routes/appointments.js"; // appointments ✅
 import userRoutes from "./routes/user.js";              // user management
 import sessionRoutes from "./routes/sessionRoutes.js";  // session requests
+import notificationRoutes from "./routes/notifications.js"; // notifications
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -58,6 +59,7 @@ app.use("/api/appointments", appointmentRoutes); // appointments ✅
 app.use("/api/qr", qrRoutes);                 // QR
 app.use("/api/users", userRoutes);            // user management
 app.use("/api/sessions", sessionRoutes);      // session requests
+app.use("/api/notifications", notificationRoutes); // notifications
 
 // -------------------- Health Check --------------------
 app.get("/health", (req, res) =>
@@ -73,6 +75,7 @@ app.get("/health", (req, res) =>
       "/api/qr",
       "/api/users",
       "/api/sessions",
+      "/api/notifications",
     ],
   })
 );

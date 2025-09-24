@@ -1,5 +1,6 @@
 import express from 'express';
 import { 
+  saveFCMToken,
   sendNotification, 
   sendBulkNotification, 
   sendNotificationToAll 
@@ -8,7 +9,12 @@ import { auth } from '../middleware/auth.js';
 
 const router = express.Router();
 
-// All routes require authentication
+// @route   POST /api/notifications/save-token
+// @desc    Save FCM token for user or doctor
+// @access  Private
+router.post('/save-token', auth, saveFCMToken);
+
+// All other routes require authentication
 router.use(auth);
 
 // @route   POST /api/notifications/send

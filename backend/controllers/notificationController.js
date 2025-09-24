@@ -1,5 +1,64 @@
 import { sendPushNotification } from '../config/firebase.js';
 import { User } from "../models/User.js";
+import { DoctorUser } from "../models/DoctorUser.js";
+
+// @desc    Save FCM token for user or doctor
+// @route   POST /api/notifications/save-token
+// @access  Private
+export const saveFCMToken = async (req, res) => {
+  try {
+    const { fcmToken, userId, role } = req.body;
+
+    if (!fcmToken) {
+      return res.status(400).json({
+        success: false,
+        message: 'FCM token is required'
+      });
+    }
+
+    // Determine which model to use based on role or userId
+    let targetId = userId || req.auth.id;
+    let isDoctor = role === 'doctor' || req.auth.role === 'doctor';
+
+    let user;
+    if (isDoctor) {
+      user = await DoctorUser.findByIdAndUpdate(
+        targetId,
+        { fcmToken },
+        { new: true, runValidators: true }
+      ).select('-password');
+    } else {
+      user = await User.findByIdAndUpdate(
+        targetId,
+        { fcmToken },
+        { new: true, runValidators: true }
+      ).select('-password');
+    }
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'FCM token saved successfully',
+      data: {
+        userId: user._id,
+        role: isDoctor ? 'doctor' : 'patient',
+        name: user.name
+      }
+    });
+  } catch (error) {
+    console.error('Save FCM token error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+};
 
 // @desc    Send push notification to a specific user
 // @route   POST /api/notifications/send
