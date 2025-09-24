@@ -49,6 +49,9 @@ const doctorUserSchema = new mongoose.Schema({
     loginNotifications: { type: Boolean, default: true },
   },
 
+  // FCM token for push notifications
+  fcmToken: { type: String, default: null },
+
   // Password tracking
   passwordChangedAt: { type: Date, default: Date.now },
   lastLoginAt: { type: Date, default: Date.now },

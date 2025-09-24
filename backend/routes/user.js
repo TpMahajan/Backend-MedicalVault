@@ -33,6 +33,24 @@ router.put('/fcm-token', auth, fcmLimiter, fcmTokenValidation, updateFCMToken);
 // @access  Public (no auth required) - but doctors need active session
 router.get('/:id', optionalAuth, checkSession, getUserProfile);
 
+// @route   POST /api/users/:id/fcm-token
+// @desc    Save FCM token for a specific user
+// @access  Private
+router.post('/:id/fcm-token', auth, fcmLimiter, fcmTokenValidation, async (req, res) => {
+  try {
+    const { token } = req.body;
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
+
+    user.fcmToken = token;
+    await user.save();
+
+    res.json({ success: true, message: "FCM token saved" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // @route   DELETE /api/users/account
 // @desc    Delete user account
 // @access  Private

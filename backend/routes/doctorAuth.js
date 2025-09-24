@@ -191,6 +191,42 @@ router.put("/profile", auth, async (req, res) => {
   }
 });
 
+// ================= Update FCM Token =================
+router.put("/fcm-token", auth, async (req, res) => {
+  try {
+    const { fcmToken } = req.body;
+
+    if (!fcmToken) {
+      return res.status(400).json({
+        success: false,
+        message: "FCM token is required."
+      });
+    }
+
+    if (!req.doctor) {
+      return res.status(404).json({ success: false, message: "Doctor not found." });
+    }
+
+    const updatedDoctor = await DoctorUser.findByIdAndUpdate(
+      req.doctor._id,
+      { fcmToken },
+      { new: true, runValidators: true }
+    ).select("-password");
+
+    res.json({
+      success: true,
+      message: "FCM token updated successfully.",
+      doctor: updatedDoctor,
+    });
+  } catch (error) {
+    console.error("FCM token update error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error while updating FCM token.",
+    });
+  }
+});
+
 // ================= Upload Doctor Avatar =================
 router.post("/profile/avatar", auth, upload.single("avatar"), async (req, res) => {
   try {

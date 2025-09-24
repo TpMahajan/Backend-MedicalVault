@@ -3,6 +3,7 @@ import { auth } from "../middleware/auth.js";
 import { Session } from "../models/Session.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
+import { sendNotification, sendNotificationToDoctor } from "../utils/notifications.js";
 
 const router = express.Router();
 
@@ -156,6 +157,24 @@ router.post("/request", async (req, res) => {
     await session.populate('doctorId', 'name email profilePicture experience specialization');
     
     console.log(`📋 New session request: Dr. ${session.doctorId.name} → Patient ${patientId}`);
+    
+    // Send notification to patient about the new session request
+    try {
+      await sendNotification(
+        patientId,
+        "New Session Request",
+        `Dr. ${session.doctorId.name} is requesting access to your medical records`,
+        {
+          type: "SESSION_REQUEST",
+          sessionId: session._id.toString(),
+          doctorId: session.doctorId._id.toString(),
+          doctorName: session.doctorId.name
+        }
+      );
+    } catch (notificationError) {
+      console.error("❌ Failed to send session request notification:", notificationError);
+      // Don't fail the request if notification fails
+    }
     
     res.status(201).json({
       success: true,
@@ -321,6 +340,25 @@ router.post("/:id/respond", async (req, res) => {
       patientId: savedSession.patientId,
       isActive: savedSession.expiresAt > new Date()
     });
+    
+    // Send notification to doctor about the patient's response
+    try {
+      await sendNotificationToDoctor(
+        session.doctorId._id.toString(),
+        `Session Request ${status === 'accepted' ? 'Accepted' : 'Declined'}`,
+        `Patient ${req.auth.role === 'patient' ? 'you' : 'has'} ${status} your access request`,
+        {
+          type: "SESSION_RESPONSE",
+          sessionId: session._id.toString(),
+          status: status,
+          patientId: session.patientId.toString(),
+          expiresAt: session.expiresAt.toISOString()
+        }
+      );
+    } catch (notificationError) {
+      console.error("❌ Failed to send session response notification:", notificationError);
+      // Don't fail the request if notification fails
+    }
     
     // Verify the session was saved correctly by re-querying
     const verifySession = await Session.findById(savedSession._id);

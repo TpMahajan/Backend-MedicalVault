@@ -7,10 +7,12 @@ import axios from "axios";
 import { auth } from "../middleware/auth.js";
 import { Document } from "../models/File.js";
 import { User } from "../models/User.js";
+import { DoctorUser } from "../models/DoctorUser.js";
 import { checkSession, checkSessionByEmail } from "../middleware/checkSession.js";
 import { Session } from "../models/Session.js";
 import s3Client, { BUCKET_NAME, REGION } from "../config/s3.js";
 import { generateSignedUrl, generatePreviewUrl, generateDownloadUrl } from "../utils/s3Utils.js";
+import { sendNotification } from "../utils/notifications.js";
 
 const router = express.Router();
 
@@ -110,6 +112,32 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
       category: chosenCategory,
       title: doc.title
     });
+
+    // Send notification to patient if doctor uploaded the document
+    if (req.auth?.role === "doctor" && req.body.userId) {
+      try {
+        // Get doctor info for the notification
+        const doctor = await DoctorUser.findById(req.auth.id);
+        if (doctor) {
+          await sendNotification(
+            targetUserId,
+            "New Document Uploaded",
+            `Dr. ${doctor.name} uploaded a new ${chosenCategory.toLowerCase()} to your medical records`,
+            {
+              type: "FILE_UPLOAD",
+              documentId: doc._id.toString(),
+              category: chosenCategory,
+              doctorId: doctor._id.toString(),
+              doctorName: doctor.name,
+              title: doc.title
+            }
+          );
+        }
+      } catch (notificationError) {
+        console.error("❌ Failed to send file upload notification:", notificationError);
+        // Don't fail the upload if notification fails
+      }
+    }
 
     res.json({ success: true, document: doc });
   } catch (err) {
