@@ -60,6 +60,9 @@ const UserSchema = new mongoose.Schema(
     isActive: { type: Boolean, default: true },
     lastLogin: { type: Date, default: null },
     profilePicture: { type: String, default: null },
+    
+    // 🔹 Profile Switching fields
+    linkedProfiles: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
   },
   {
     timestamps: true,

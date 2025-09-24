@@ -23,6 +23,7 @@ import appointmentRoutes from "./routes/appointments.js"; // appointments ✅
 import userRoutes from "./routes/user.js";              // user management
 import sessionRoutes from "./routes/sessionRoutes.js";  // session requests
 import notificationRoutes from "./routes/notifications.js"; // notifications
+import profileRoutes from "./routes/profiles.js";       // profile switching
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -60,6 +61,7 @@ app.use("/api/qr", qrRoutes);                 // QR
 app.use("/api/users", userRoutes);            // user management
 app.use("/api/sessions", sessionRoutes);      // session requests
 app.use("/api/notifications", notificationRoutes); // notifications
+app.use("/api/profiles", profileRoutes);      // profile switching
 
 // -------------------- Health Check --------------------
 app.get("/health", (req, res) =>
@@ -76,6 +78,7 @@ app.get("/health", (req, res) =>
       "/api/users",
       "/api/sessions",
       "/api/notifications",
+      "/api/profiles",
     ],
   })
 );
