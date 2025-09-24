@@ -251,7 +251,8 @@ router.post("/profile/avatar", auth, upload.single("avatar"), async (req, res) =
     }
 
     // Create the public URL for the avatar
-    const avatarUrl = `/uploads/doctor-avatars/${req.file.filename}`;
+    const baseUrl = process.env.BASE_URL || 'https://backend-medicalvault.onrender.com';
+    const avatarUrl = `${baseUrl}/uploads/doctor-avatars/${req.file.filename}`;
 
     // Update doctor with new avatar URL
     const updatedDoctor = await DoctorUser.findByIdAndUpdate(
