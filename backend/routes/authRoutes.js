@@ -62,7 +62,11 @@ router.post("/login", async (req, res) => {
     const user = await User.findOne({ email: email.toLowerCase() });
     if (!user) return res.status(400).json({ message: "Invalid credentials" });
 
+    console.log("Login attempt:", { userId: user._id, email: user.email, hasStoredPassword: !!user.password });
+    
     const isValid = await user.comparePassword(password);
+    console.log("Password validation result:", { userId: user._id, isValid });
+    
     if (!isValid) return res.status(400).json({ message: "Invalid credentials" });
 
     const token = jwt.sign(
@@ -400,11 +404,15 @@ router.post("/reset-password", async (req, res) => {
       return res.status(400).json({ success: false, message: "Token expired" });
     }
 
-    const salt = await bcrypt.genSalt(12);
-    user.password = await bcrypt.hash(newPassword, salt);
+    console.log("Password reset - before hash:", { userId: user._id, newPasswordLength: newPassword.length });
+    
+    // Set the new password - the pre-save hook will hash it automatically
+    user.password = newPassword;
     user.resetToken = null;
     user.resetTokenExpiry = null;
     await user.save();
+    
+    console.log("Password reset - after save:", { userId: user._id, passwordHashed: true });
 
     res.json({ success: true, message: "Password has been reset successfully" });
   } catch (error) {
@@ -431,9 +439,13 @@ router.post("/change-password", auth, async (req, res) => {
     const matches = await user.comparePassword(oldPassword);
     if (!matches) return res.status(400).json({ success: false, message: "Old password is incorrect" });
 
-    const salt = await bcrypt.genSalt(12);
-    user.password = await bcrypt.hash(newPassword, salt);
+    console.log("Password change - before hash:", { userId: user._id, newPasswordLength: newPassword.length });
+    
+    // Set the new password - the pre-save hook will hash it automatically
+    user.password = newPassword;
     await user.save();
+    
+    console.log("Password change - after save:", { userId: user._id, passwordHashed: true });
 
     res.json({ success: true, message: "Password changed successfully" });
   } catch (error) {
