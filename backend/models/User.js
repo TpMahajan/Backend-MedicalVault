@@ -63,6 +63,10 @@ const UserSchema = new mongoose.Schema(
     
     // 🔹 Profile Switching fields
     linkedProfiles: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+
+    // 🔹 Password reset fields
+    resetToken: { type: String, default: null },
+    resetTokenExpiry: { type: Date, default: null },
   },
   {
     timestamps: true,

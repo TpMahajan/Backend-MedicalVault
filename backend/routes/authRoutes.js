@@ -4,6 +4,8 @@ import { User } from "../models/User.js";
 import { auth } from "../middleware/auth.js";
 import { getMe, updateMe } from "../controllers/authController.js";
 import { DoctorUser } from "../models/DoctorUser.js";  // doctor model
+import bcrypt from "bcryptjs";
+import nodemailer from "nodemailer";
 
 const router = express.Router();
 
@@ -308,3 +310,136 @@ router.post("/test-patient", async (req, res) => {
 });
 
 export default router;
+
+// ================= Password Reset (Patient) =================
+// Create email transporter (dummy SMTP; replace with real creds in env)
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || "smtp.ethereal.email",
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: false,
+  auth: process.env.SMTP_USER && process.env.SMTP_PASS ? {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  } : undefined,
+});
+
+// POST /auth/forgot-password
+router.post("/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ success: false, message: "Email is required" });
+
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) {
+      // Respond generically to avoid user enumeration
+      return res.json({ success: true, message: "If your email exists, a reset link has been sent." });
+    }
+
+    const expiresInMinutes = Number(process.env.RESET_TOKEN_EXPIRES_MIN || 20);
+    const resetToken = jwt.sign(
+      { userId: user._id, purpose: "password_reset" },
+      process.env.JWT_SECRET,
+      { expiresIn: `${expiresInMinutes}m` }
+    );
+
+    const expiryDate = new Date(Date.now() + expiresInMinutes * 60 * 1000);
+    user.resetToken = resetToken;
+    user.resetTokenExpiry = expiryDate;
+    await user.save();
+
+    const appBaseUrl = process.env.APP_BASE_URL || "https://example.com";
+    const resetLink = `${appBaseUrl}/reset-password?token=${encodeURIComponent(resetToken)}`;
+
+    // Send email (if transporter configured)
+    try {
+      if (transporter.options.auth) {
+        await transporter.sendMail({
+          from: process.env.MAIL_FROM || "no-reply@medicalvault.app",
+          to: user.email,
+          subject: "Reset your password",
+          html: `<p>You requested a password reset.</p>
+                 <p>Click the link below to set a new password (valid for ${expiresInMinutes} minutes):</p>
+                 <p><a href="${resetLink}">Reset Password</a></p>
+                 <p>If you didn't request this, you can safely ignore this email.</p>`
+        });
+      }
+    } catch (mailErr) {
+      console.warn("Email send failed (continuing):", mailErr.message);
+    }
+
+    res.json({ success: true, message: "If your email exists, a reset link has been sent." });
+  } catch (error) {
+    console.error("Forgot password error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+// POST /auth/reset-password
+router.post("/reset-password", async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword) {
+      return res.status(400).json({ success: false, message: "Token and new password are required" });
+    }
+
+    let payload;
+    try {
+      payload = jwt.verify(token, process.env.JWT_SECRET);
+    } catch (err) {
+      return res.status(400).json({ success: false, message: "Invalid or expired token" });
+    }
+
+    if (payload.purpose !== "password_reset") {
+      return res.status(400).json({ success: false, message: "Invalid token purpose" });
+    }
+
+    const user = await User.findById(payload.userId);
+    if (!user || user.resetToken !== token) {
+      return res.status(400).json({ success: false, message: "Invalid token" });
+    }
+
+    if (!user.resetTokenExpiry || user.resetTokenExpiry.getTime() < Date.now()) {
+      return res.status(400).json({ success: false, message: "Token expired" });
+    }
+
+    const salt = await bcrypt.genSalt(12);
+    user.password = await bcrypt.hash(newPassword, salt);
+    user.resetToken = null;
+    user.resetTokenExpiry = null;
+    await user.save();
+
+    res.json({ success: true, message: "Password has been reset successfully" });
+  } catch (error) {
+    console.error("Reset password error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+// POST /auth/change-password (requires auth)
+router.post("/change-password", auth, async (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body;
+    if (!oldPassword || !newPassword) {
+      return res.status(400).json({ success: false, message: "Old and new password are required" });
+    }
+
+    // patient by default
+    const userId = req.user?._id || req.auth?.id;
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized" });
+
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
+
+    const matches = await user.comparePassword(oldPassword);
+    if (!matches) return res.status(400).json({ success: false, message: "Old password is incorrect" });
+
+    const salt = await bcrypt.genSalt(12);
+    user.password = await bcrypt.hash(newPassword, salt);
+    await user.save();
+
+    res.json({ success: true, message: "Password changed successfully" });
+  } catch (error) {
+    console.error("Change password error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
