@@ -337,9 +337,9 @@ router.post("/forgot-password", async (req, res) => {
 
     const expiresInMinutes = Number(process.env.RESET_TOKEN_EXPIRES_MIN || 20);
     const resetToken = jwt.sign(
-      { userId: user._id, purpose: "password_reset" },
+      { userId: user._id },
       process.env.JWT_SECRET,
-      { expiresIn: `${expiresInMinutes}m` }
+      { expiresIn: '30m' }
     );
 
     const expiryDate = new Date(Date.now() + expiresInMinutes * 60 * 1000);
@@ -389,9 +389,7 @@ router.post("/reset-password", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid or expired token" });
     }
 
-    if (payload.purpose !== "password_reset") {
-      return res.status(400).json({ success: false, message: "Invalid token purpose" });
-    }
+    // Token is valid, proceed with reset
 
     const user = await User.findById(payload.userId);
     if (!user || user.resetToken !== token) {
