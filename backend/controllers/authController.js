@@ -135,7 +135,17 @@ export const login = async (req, res) => {
 // @access  Private
 export const getMe = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).select('-password');
+    // If role is anonymous, return minimal context instead of 403
+    if (req.auth?.role === 'anonymous') {
+      return res.json({
+        success: true,
+        role: 'anonymous',
+        userId: req.auth.id,
+        message: 'Anonymous access active'
+      });
+    }
+
+    const user = await User.findById((req.user?._id || req.user?.id)).select('-password');
 
     res.json({
       success: true,

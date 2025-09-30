@@ -64,6 +64,8 @@ export const auth = async (req, res, next) => {
       const path = req.path || "";
 
       const allow = (
+        // Allow auth/me to return anonymous context
+        (method === "GET" && /^\/api\/auth\/me$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
         // GET /users/:id
         (method === "GET" && /^\/api\/users\/[a-f\d]{24}$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
         // GET /users/:id/records
