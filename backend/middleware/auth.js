@@ -7,8 +7,10 @@ export const auth = async (req, res, next) => {
   try {
     // Check for token in Authorization header first, then query parameter
     let token = req.header("Authorization")?.replace("Bearer ", "");
+    let tokenSource = "header";
     if (!token) {
       token = req.query.token;
+      tokenSource = token ? "query" : "none";
     }
     
     if (!token) {
@@ -33,6 +35,8 @@ export const auth = async (req, res, next) => {
     } else {
       return res.status(401).json({ success: false, message: "Invalid token format." });
     }
+
+    console.log("[auth] tokenSource=", tokenSource, "role=", role, "userId=", userId, "path=", req.originalUrl);
 
     let account;
     if (role === "doctor") {
@@ -70,6 +74,9 @@ export const auth = async (req, res, next) => {
         (method === "GET" && /^\/api\/files\/[a-f\d]{24}\/download$/i.test(req.originalUrl.replace(/\?.*$/, "")))
       );
 
+      if (!allow) {
+        console.log("[auth] anonymous blocked path:", req.originalUrl);
+      }
       if (!allow) {
         return res.status(403).json({ success: false, message: "Anonymous access not permitted for this endpoint" });
       }
