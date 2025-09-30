@@ -64,17 +64,23 @@ export const updateFCMToken = async (req, res) => {
 // @access  Public (limited) / Private (full data with session)
 export const getUserProfile = async (req, res) => {
   try {
-    // Check if this is a doctor with an active session (set by checkSession middleware)
-    const hasActiveSession = req.session && req.auth && req.auth.role === "doctor";
+    // Determine access mode
+    const authRole = req.auth?.role;
+    const authId = req.auth?.id?.toString();
+    const isDoctor = authRole === "doctor";
+    const isAnonymous = authRole === "anonymous";
+    const isSelf = authRole === "patient" && authId === req.params.id;
+    const hasActiveSession = isDoctor && !!req.session;
+    const mode = isAnonymous ? "anonymous" : isSelf ? "patient" : isDoctor ? "doctor" : "anonymous";
     
-    let selectFields = 'name profilePicture createdAt'; // Default public fields
+    let selectFields = 'name profilePicture createdAt'; // Default limited fields
     
-    if (hasActiveSession) {
-      // Doctor with active session gets full patient data
+    if (hasActiveSession || isSelf) {
+      // Doctor with active session or patient viewing own profile => full data
       selectFields = '-password'; // All fields except password
-      console.log('🔐 Returning full patient data for doctor with active session');
+      console.log('🔐 Returning full patient data (mode:', mode, 'isSelf:', isSelf, 'hasActiveSession:', hasActiveSession, ')');
     } else {
-      console.log('👤 Returning limited public profile data');
+      console.log('👤 Returning limited public profile data (mode:', mode, ')');
     }
 
     const user = await User.findById(req.params.id)
@@ -90,8 +96,9 @@ export const getUserProfile = async (req, res) => {
 
     res.json({
       success: true,
-      data: hasActiveSession ? user : { user }, // Different structure for compatibility
-      sessionAccess: hasActiveSession
+      data: hasActiveSession || isSelf ? { user } : { user },
+      sessionAccess: hasActiveSession,
+      mode
     });
   } catch (error) {
     console.error('Get user profile error:', error);

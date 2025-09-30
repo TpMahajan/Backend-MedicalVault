@@ -388,7 +388,8 @@ router.get("/:id/preview", auth, checkSession, async (req, res) => {
     }
 
     const previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket, doc.mimeType);
-    res.json({ success: true, signedUrl: previewUrl });
+    const mode = req.auth?.role === 'anonymous' ? 'anonymous' : (req.auth?.role === 'doctor' ? 'doctor' : (isOwner ? 'patient' : 'unknown'));
+    res.json({ success: true, signedUrl: previewUrl, mode });
   } catch (err) {
     res.status(500).json({ msg: "Preview failed", error: err.message });
   }
@@ -428,7 +429,8 @@ router.get("/:id/download", auth, checkSession, async (req, res) => {
     // If client prefers JSON (e.g., web app), return the URL instead of redirecting
     const acceptHeader = String(req.headers["accept"] || "").toLowerCase();
     if (acceptHeader.includes("application/json") || req.query.json === "true") {
-      return res.json({ success: true, signedUrl: downloadUrl });
+      const mode = req.auth?.role === 'anonymous' ? 'anonymous' : (req.auth?.role === 'doctor' ? 'doctor' : (isOwner ? 'patient' : 'unknown'));
+      return res.json({ success: true, signedUrl: downloadUrl, mode });
     }
 
     // Default behavior: redirect (good for mobile clients following redirects)

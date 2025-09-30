@@ -104,12 +104,14 @@ router.get('/:id/records', auth, checkSession, async (req, res) => {
       )
     );
 
+    const mode = req.auth?.role === 'anonymous' ? 'anonymous' : (req.auth?.role === 'doctor' ? 'doctor' : (req.auth?.id?.toString() === req.params.id ? 'patient' : 'unknown'));
     const response = {
       success: true,
       counts: Object.fromEntries(
         Object.entries(groupedWithUrl).map(([k, v]) => [k, v.length])
       ),
       records: groupedWithUrl,
+      mode,
     };
 
     res.json(response);
