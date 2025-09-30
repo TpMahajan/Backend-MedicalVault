@@ -31,27 +31,26 @@ router.post("/generate", auth, async (req, res) => {
       { status: "expired" }
     );
 
+    // Generate short-lived anonymous-access JWT (15 minutes)
     const payload = {
-      typ: "vault_share",
-      uid: req.user._id.toString(),
-      email: me.email,
+      userId: req.user._id.toString(),
+      role: "anonymous",
     };
 
     const token = jwt.sign(payload, process.env.JWT_SECRET, {
-      expiresIn: "10m",
+      expiresIn: "15m",
     });
 
     // Store new QR in DB
     const qrDoc = await QRCode.create({
       patientId: req.user._id,
       token,
-      expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 min
+      expiresAt: new Date(Date.now() + 15 * 60 * 1000), // 15 min
       status: "active",
     });
 
-    // Build URL to embed in QR
-    const base = (process.env.BASE_URL || "").replace(/\/$/, "");
-    const qrUrl = `${base}/portal/access?token=${encodeURIComponent(token)}`;
+    // Build Web URL for anonymous access via Vercel-hosted web app
+    const qrUrl = `https://health-vault-web.vercel.app/patient/${req.user._id.toString()}?token=${encodeURIComponent(token)}`;
 
     return res.json({
       ok: true,

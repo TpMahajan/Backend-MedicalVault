@@ -23,11 +23,11 @@ export const auth = async (req, res, next) => {
     // Handle different token formats
     let userId, role;
     if (decoded.userId && decoded.role) {
-      // Standard format: { userId, role }
+      // Standard/anon format: { userId, role }
       userId = decoded.userId;
       role = decoded.role;
     } else if (decoded.uid && decoded.typ) {
-      // Vault share format: { uid, typ }
+      // Legacy vault_share format: { uid, typ }
       userId = decoded.uid;
       role = decoded.typ === "vault_share" ? "patient" : decoded.typ;
     } else {
@@ -53,6 +53,27 @@ export const auth = async (req, res, next) => {
     }
 
     req.auth = { id: userId, role: role };
+
+    // If anonymous role, enforce allowlist at middleware level
+    if (role === "anonymous") {
+      const method = req.method.toUpperCase();
+      const path = req.path || "";
+
+      const allow = (
+        // GET /users/:id
+        (method === "GET" && /^\/api\/users\/[a-f\d]{24}$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
+        // GET /users/:id/records
+        (method === "GET" && /^\/api\/users\/[a-f\d]{24}\/records$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
+        // GET /files/:id/preview
+        (method === "GET" && /^\/api\/files\/[a-f\d]{24}\/preview$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
+        // GET /files/:id/download
+        (method === "GET" && /^\/api\/files\/[a-f\d]{24}\/download$/i.test(req.originalUrl.replace(/\?.*$/, "")))
+      );
+
+      if (!allow) {
+        return res.status(403).json({ success: false, message: "Anonymous access not permitted for this endpoint" });
+      }
+    }
     next();
   } catch (error) {
     if (error.name === "JsonWebTokenError") {
@@ -69,7 +90,10 @@ export const auth = async (req, res, next) => {
 // Middleware for optional authentication
 export const optionalAuth = async (req, res, next) => {
   try {
-    const token = req.header("Authorization")?.replace("Bearer ", "");
+    let token = req.header("Authorization")?.replace("Bearer ", "");
+    if (!token) {
+      token = req.query.token;
+    }
     if (token) {
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
       

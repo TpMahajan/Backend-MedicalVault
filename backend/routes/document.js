@@ -383,7 +383,7 @@ router.get("/:id/preview", auth, checkSession, async (req, res) => {
       hasSessionAccess = !!activeSession;
     }
     
-    if (!isOwner && !hasSessionAccess) {
+    if (!isOwner && !hasSessionAccess && req.auth?.role !== 'anonymous') {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
@@ -414,7 +414,7 @@ router.get("/:id/download", auth, checkSession, async (req, res) => {
       hasSessionAccess = !!activeSession;
     }
     
-    if (!isOwner && !hasSessionAccess) {
+    if (!isOwner && !hasSessionAccess && req.auth?.role !== 'anonymous') {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
