@@ -70,6 +70,10 @@ export const auth = async (req, res, next) => {
         (method === "GET" && /^\/api\/users\/[a-f\d]{24}$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
         // GET /users/:id/records
         (method === "GET" && /^\/api\/users\/[a-f\d]{24}\/records$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
+        // GET /files/user/:userId (list user's files)
+        (method === "GET" && /^\/api\/files\/user\/[a-f\d]{24}$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
+        // GET /files/patient/:patientId (alias)
+        (method === "GET" && /^\/api\/files\/patient\/[a-f\d]{24}$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
         // GET /files/:id/preview
         (method === "GET" && /^\/api\/files\/[a-f\d]{24}\/preview$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
         // GET /files/:id/download

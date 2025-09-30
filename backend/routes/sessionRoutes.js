@@ -68,15 +68,15 @@ router.post("/request", async (req, res) => {
 
     const { patientId, requestMessage } = req.body;
     
-    // Ensure the requester is a doctor
-    if (req.auth.role !== "doctor") {
-      console.log('🚫 Session request denied - not a doctor:', req.auth.role);
+    // Allow logged-in doctor; anonymous may initiate placeholder request label (no doctorId)
+    if (req.auth.role !== "doctor" && req.auth.role !== "anonymous") {
+      console.log('🚫 Session request denied - invalid role:', req.auth.role);
       return res.status(403).json({
         success: false,
-        message: "Only doctors can request patient access",
+        message: "Only doctors or anonymous QR can request access",
         debug: {
           providedRole: req.auth.role,
-          requiredRole: "doctor"
+          requiredRole: "doctor|anonymous"
         }
       });
     }
@@ -107,15 +107,17 @@ router.post("/request", async (req, res) => {
     
     console.log('✅ Patient found:', patient.name, patient.email);
     
-    // Check if there's already a pending or active session
-    console.log('🔍 Checking for existing session between doctor', req.auth.id, 'and patient', patientId);
-    
-    const existingSession = await Session.findOne({
-      doctorId: req.auth.id,
-      patientId: patientId,
-      status: { $in: ["pending", "accepted"] },
-      expiresAt: { $gt: new Date() }
-    });
+    // For anonymous, skip duplicate check bound to doctorId
+    let existingSession = null;
+    if (req.auth.role === 'doctor') {
+      console.log('🔍 Checking for existing session between doctor', req.auth.id, 'and patient', patientId);
+      existingSession = await Session.findOne({
+        doctorId: req.auth.id,
+        patientId: patientId,
+        status: { $in: ["pending", "accepted"] },
+        expiresAt: { $gt: new Date() }
+      });
+    }
     
     if (existingSession) {
       console.log('🚫 Existing session found:', existingSession.status, 'expires:', existingSession.expiresAt);
@@ -132,18 +134,22 @@ router.post("/request", async (req, res) => {
     
     console.log('✅ No existing session found, creating new one');
     
-    // Create new session request
+    // Create new session request (anonymous doctor has null doctorId and a label)
+    const isAnon = req.auth.role === 'anonymous';
+    const doctorIdToSave = isAnon ? undefined : req.auth.id;
+    const requestLabel = isAnon ? (requestMessage || "Anonymous Doctor is requesting access") : (requestMessage || "");
+
     console.log('🔄 Creating session with data:', {
-      doctorId: req.auth.id,
+      doctorId: doctorIdToSave || null,
       patientId: patientId,
-      requestMessage: requestMessage || "",
+      requestMessage: requestLabel,
       status: "pending"
     });
     
     const session = new Session({
-      doctorId: req.auth.id,
+      ...(doctorIdToSave ? { doctorId: doctorIdToSave } : {}),
       patientId: patientId,
-      requestMessage: requestMessage || "",
+      requestMessage: requestLabel,
       status: "pending",
       expiresAt: new Date(Date.now() + 20 * 60 * 1000) // Explicitly set expiration
     });
@@ -152,23 +158,28 @@ router.post("/request", async (req, res) => {
     await session.save();
     console.log('✅ Session saved with ID:', session._id);
     
-    // Populate doctor info for response
-    console.log('🔄 Populating doctor info...');
-    await session.populate('doctorId', 'name email profilePicture experience specialization');
-    
-    console.log(`📋 New session request: Dr. ${session.doctorId.name} → Patient ${patientId}`);
+    // Populate doctor info for response if exists
+    if (session.doctorId) {
+      console.log('🔄 Populating doctor info...');
+      await session.populate('doctorId', 'name email profilePicture experience specialization');
+      console.log(`📋 New session request: Dr. ${session.doctorId.name} → Patient ${patientId}`);
+    } else {
+      console.log(`📋 New session request: Anonymous Doctor → Patient ${patientId}`);
+    }
     
     // Send notification to patient about the new session request
     try {
+      const doctorName = session.doctorId ? session.doctorId.name : 'Anonymous Doctor';
+      const doctorIdForNotif = session.doctorId ? session.doctorId._id.toString() : null;
       await sendNotification(
         patientId,
         "New Session Request",
-        `Dr. ${session.doctorId.name} is requesting access to your medical records`,
+        `${doctorName} is requesting access to your medical records`,
         {
           type: "SESSION_REQUEST",
           sessionId: session._id.toString(),
-          doctorId: session.doctorId._id.toString(),
-          doctorName: session.doctorId.name
+          doctorId: doctorIdForNotif,
+          doctorName: doctorName
         }
       );
     } catch (notificationError) {
@@ -179,7 +190,8 @@ router.post("/request", async (req, res) => {
     res.status(201).json({
       success: true,
       message: "Access request sent successfully",
-      session: session
+      session: session,
+      doctorLabel: session.doctorId ? `Dr. ${session.doctorId.name}` : 'Anonymous Doctor'
     });
     
   } catch (error) {
