@@ -45,6 +45,10 @@ export const auth = async (req, res, next) => {
         return res.status(401).json({ success: false, message: "Doctor not found" });
       }
       req.doctor = account;
+    } else if (role === "anonymous") {
+      // For anonymous users, we don't need to fetch account data
+      // Just set the auth info and continue
+      req.auth = { id: userId, role: role };
     } else {
       account = await User.findById(userId).select("-password");
       if (!account) {
@@ -56,7 +60,9 @@ export const auth = async (req, res, next) => {
       req.user = account;
     }
 
-    req.auth = { id: userId, role: role };
+    if (role !== "anonymous") {
+      req.auth = { id: userId, role: role };
+    }
 
     // If anonymous role, enforce allowlist at middleware level
     if (role === "anonymous") {
