@@ -50,7 +50,7 @@ router.post("/generate", auth, async (req, res) => {
     });
 
     // Build Web URL for anonymous access via Vercel-hosted web app
-    const qrUrl = `https://health-vault-web.vercel.app/patient/${req.user._id.toString()}?token=${encodeURIComponent(token)}`;
+    const qrUrl = `https://health-vault-web.vercel.app/patient-details/${req.user._id.toString()}?token=${encodeURIComponent(token)}`;
 
     return res.json({
       ok: true,
