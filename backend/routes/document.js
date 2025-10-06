@@ -54,6 +54,13 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
       authId: req.auth.id,
       authRole: req.auth?.role
     });
+    
+    console.log('📅 Date processing:', {
+      originalDate: date,
+      dateType: typeof date,
+      isEmpty: !date || date.trim() === '',
+      currentTime: new Date().toISOString()
+    });
 
     const validCategories = ["Report", "Prescription", "Bill", "Insurance"];
     let chosenCategory = "Report"; // Default
@@ -84,6 +91,24 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
       isDoctorUpload: !!req.body.userId
     });
     
+    // ✅ Properly handle date conversion
+    let uploadDate = new Date(); // Default to current time
+    if (date && date.trim() !== '') {
+      try {
+        const parsedDate = new Date(date);
+        if (!isNaN(parsedDate.getTime())) {
+          uploadDate = parsedDate;
+        }
+      } catch (error) {
+        console.log('⚠️ Invalid date provided, using current time:', error.message);
+      }
+    }
+    
+    console.log('📅 Final upload date:', {
+      uploadDate: uploadDate.toISOString(),
+      uploadTimestamp: uploadDate.getTime()
+    });
+
     const doc = await Document.create({
       userId: targetUserId,
       doctorId: req.auth?.role === "doctor" ? req.auth.id : undefined,
@@ -100,7 +125,7 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
       s3Bucket: s3Bucket,
       s3Region: REGION,
       url: req.file.location, // S3 public URL (if bucket is public) or will be replaced with signed URL
-      uploadedAt: date || new Date(),
+      uploadedAt: uploadDate,
     });
 
     // ✅ Link the document to the target user's medicalRecords array
