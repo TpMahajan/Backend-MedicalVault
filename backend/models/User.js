@@ -16,8 +16,9 @@ const UserSchema = new mongoose.Schema(
         "Please enter a valid email",
       ],
     },
-    password: { type: String, required: true, minlength: 6 },
-    mobile: { type: String, required: true, trim: true },
+    password: { type: String, required: function() { return !this.googleId; }, minlength: 6 },
+    mobile: { type: String, required: function() { return !this.googleId; }, trim: true },
+    googleId: { type: String, default: null, unique: true, sparse: true },
     aadhaar: { type: String, default: null },
 
     // 🔹 Profile update fields

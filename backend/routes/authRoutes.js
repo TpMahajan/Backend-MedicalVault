@@ -6,8 +6,10 @@ import { getMe, updateMe } from "../controllers/authController.js";
 import { DoctorUser } from "../models/DoctorUser.js";  // doctor model
 import bcrypt from "bcryptjs";
 import nodemailer from "nodemailer";
+import { OAuth2Client } from 'google-auth-library';
 
 const router = express.Router();
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // ================= Patient Signup =================
 router.post("/signup", async (req, res) => {
@@ -51,6 +53,93 @@ router.post("/signup", async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+});
+
+// ================= Google OAuth =================
+router.post("/google", async (req, res) => {
+  try {
+    const { idToken, id_token } = req.body;
+    const token = idToken || id_token;
+
+    if (!token) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Google ID token is required" 
+      });
+    }
+
+    // Verify Google ID token
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken: token,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      });
+      payload = ticket.getPayload();
+    } catch (error) {
+      console.error("Google token verification failed:", error);
+      return res.status(401).json({ 
+        success: false, 
+        message: "Invalid Google token" 
+      });
+    }
+
+    const { email, name, picture, sub: googleId } = payload;
+
+    // Check if user exists
+    let user = await User.findOne({ email: email.toLowerCase() });
+
+    if (!user) {
+      // Create new user with Google auth
+      user = new User({
+        name,
+        email: email.toLowerCase(),
+        profilePicture: picture,
+        googleId,
+        // No password needed for Google auth users
+      });
+      await user.save();
+      console.log("✅ New user created via Google:", email);
+    } else {
+      // Update existing user's Google info if not set
+      if (!user.googleId) {
+        user.googleId = googleId;
+      }
+      if (!user.profilePicture && picture) {
+        user.profilePicture = picture;
+      }
+      user.lastLogin = new Date();
+      await user.save();
+      console.log("✅ Existing user logged in via Google:", email);
+    }
+
+    // Generate JWT
+    const jwtToken = jwt.sign(
+      { userId: user._id, role: "patient" },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: user.googleId === googleId ? "Login successful" : "Account created successfully",
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        mobile: user.mobile || "",
+        profilePicture: user.profilePicture,
+      },
+      token: jwtToken,
+    });
+
+  } catch (error) {
+    console.error("Google auth error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Google authentication failed" 
+    });
   }
 });
 
