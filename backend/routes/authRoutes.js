@@ -412,16 +412,34 @@ router.post("/test-patient", async (req, res) => {
 export default router;
 
 // ================= Password Reset (Patient) =================
-// Create email transporter (dummy SMTP; replace with real creds in env)
+// Create email transporter with improved configuration
 const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || "smtp.ethereal.email",
+  host: process.env.SMTP_HOST || "smtp.gmail.com",
   port: Number(process.env.SMTP_PORT || 587),
-  secure: false,
+  secure: false, // true for 465, false for other ports
   auth: process.env.SMTP_USER && process.env.SMTP_PASS ? {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
   } : undefined,
+  tls: {
+    rejectUnauthorized: false // Allow self-signed certificates in dev
+  }
 });
+
+// Verify transporter configuration on startup
+if (process.env.SMTP_USER && process.env.SMTP_PASS) {
+  transporter.verify(function(error, success) {
+    if (error) {
+      console.error("❌ SMTP Configuration Error:", error);
+      console.error("Please check your SMTP credentials in db.env");
+    } else {
+      console.log("✅ SMTP Server is ready to send emails");
+    }
+  });
+} else {
+  console.warn("⚠️  SMTP credentials not configured. Password reset emails will not be sent.");
+  console.warn("Please add SMTP_USER and SMTP_PASS to your db.env file.");
+}
 
 // POST /auth/forgot-password
 router.post("/forgot-password", async (req, res) => {
@@ -435,11 +453,11 @@ router.post("/forgot-password", async (req, res) => {
       return res.json({ success: true, message: "If your email exists, a reset link has been sent." });
     }
 
-    const expiresInMinutes = Number(process.env.RESET_TOKEN_EXPIRES_MIN || 20);
+    const expiresInMinutes = Number(process.env.RESET_TOKEN_EXPIRES_MIN || 30);
     const resetToken = jwt.sign(
       { userId: user._id },
       process.env.JWT_SECRET,
-      { expiresIn: '30m' }
+      { expiresIn: `${expiresInMinutes}m` }
     );
 
     const expiryDate = new Date(Date.now() + expiresInMinutes * 60 * 1000);
@@ -447,27 +465,68 @@ router.post("/forgot-password", async (req, res) => {
     user.resetTokenExpiry = expiryDate;
     await user.save();
 
-    const appBaseUrl = process.env.APP_BASE_URL || "https://example.com";
+    const appBaseUrl = process.env.APP_BASE_URL || "https://backend-medicalvault.onrender.com";
     const resetLink = `${appBaseUrl}/reset-password?token=${encodeURIComponent(resetToken)}`;
 
-    // Send email (if transporter configured)
+    // Send email
+    let emailSent = false;
     try {
       if (transporter.options.auth) {
         await transporter.sendMail({
-          from: process.env.MAIL_FROM || "no-reply@medicalvault.app",
+          from: process.env.MAIL_FROM || process.env.SMTP_USER || "no-reply@medicalvault.app",
           to: user.email,
-          subject: "Reset your password",
-          html: `<p>You requested a password reset.</p>
-                 <p>Click the link below to set a new password (valid for ${expiresInMinutes} minutes):</p>
-                 <p><a href="${resetLink}">Reset Password</a></p>
-                 <p>If you didn't request this, you can safely ignore this email.</p>`
+          subject: "🔐 Reset Your HealthVault Password",
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <h2 style="color: #4A90E2;">Password Reset Request</h2>
+              <p>Hello ${user.name},</p>
+              <p>You requested a password reset for your HealthVault account.</p>
+              <p>Click the button below to set a new password (valid for ${expiresInMinutes} minutes):</p>
+              <div style="text-align: center; margin: 30px 0;">
+                <a href="${resetLink}" 
+                   style="background-color: #4A90E2; color: white; padding: 12px 30px; 
+                          text-decoration: none; border-radius: 5px; display: inline-block;">
+                  Reset Password
+                </a>
+              </div>
+              <p style="color: #666; font-size: 14px;">
+                Or copy and paste this link into your browser:<br>
+                <a href="${resetLink}" style="color: #4A90E2;">${resetLink}</a>
+              </p>
+              <hr style="border: none; border-top: 1px solid #ddd; margin: 30px 0;">
+              <p style="color: #999; font-size: 12px;">
+                If you didn't request this password reset, you can safely ignore this email. 
+                Your password will remain unchanged.
+              </p>
+            </div>
+          `
         });
+        emailSent = true;
+        console.log(`✅ Password reset email sent to: ${user.email}`);
+      } else {
+        console.error("❌ SMTP not configured - cannot send password reset email");
       }
     } catch (mailErr) {
-      console.warn("Email send failed (continuing):", mailErr.message);
+      console.error("❌ Email send failed:", mailErr.message);
+      console.error("Full error:", mailErr);
+      // Return error to user if email fails
+      return res.status(500).json({ 
+        success: false, 
+        message: "Failed to send password reset email. Please contact support or try again later." 
+      });
     }
 
-    res.json({ success: true, message: "If your email exists, a reset link has been sent." });
+    if (!emailSent) {
+      return res.status(500).json({ 
+        success: false, 
+        message: "Email service not configured. Please contact support." 
+      });
+    }
+
+    res.json({ 
+      success: true, 
+      message: "Password reset link has been sent to your email. Please check your inbox." 
+    });
   } catch (error) {
     console.error("Forgot password error:", error);
     res.status(500).json({ success: false, message: "Internal server error" });
