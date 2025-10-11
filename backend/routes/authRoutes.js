@@ -72,9 +72,16 @@ router.post("/google", async (req, res) => {
     // Verify Google ID token
     let payload;
     try {
+      // Accept both Android and Web client IDs
+      const allowedAudiences = [
+        process.env.GOOGLE_CLIENT_ID,
+        "17869523090-bkk7sg3pei58pgq9h8mh5he85i6khg8r.apps.googleusercontent.com", // Android client
+        "17869523090-4eritfoe3a8it2nkef2a0lllofs8862n.apps.googleusercontent.com"  // Web client
+      ].filter(Boolean); // Remove any undefined values
+
       const ticket = await googleClient.verifyIdToken({
         idToken: token,
-        audience: process.env.GOOGLE_CLIENT_ID,
+        audience: allowedAudiences,
       });
       payload = ticket.getPayload();
     } catch (error) {
