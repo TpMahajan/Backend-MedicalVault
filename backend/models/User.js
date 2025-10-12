@@ -18,7 +18,7 @@ const UserSchema = new mongoose.Schema(
     },
     password: { type: String, required: function() { return !this.googleId; }, minlength: 6 },
     mobile: { type: String, required: function() { return !this.googleId; }, trim: true },
-    googleId: { type: String, default: null, unique: true, sparse: true },
+    googleId: { type: String, unique: true, sparse: true }, // No default - will be undefined for regular users
     aadhaar: { type: String, default: null },
 
     // 🔹 Profile update fields
