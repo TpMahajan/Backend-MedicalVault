@@ -76,6 +76,10 @@ export const auth = async (req, res, next) => {
         (method === "GET" && /^\/api\/users\/[a-f\d]{24}$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
         // GET /users/:id/records
         (method === "GET" && /^\/api\/users\/[a-f\d]{24}\/records$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
+        // POST /sessions/request (anonymous doctor can request access)
+        (method === "POST" && /^\/api\/sessions\/request$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
+        // GET /sessions/:id/status (allow polling)
+        (method === "GET" && /^\/api\/sessions\/[a-f\d]{24}\/status$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
         // GET /files/user/:userId (list user's files)
         (method === "GET" && /^\/api\/files\/user\/[a-f\d]{24}$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
         // GET /files/patient/:patientId (alias)
