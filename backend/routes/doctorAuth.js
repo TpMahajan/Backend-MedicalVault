@@ -1,44 +1,40 @@
 import express from "express";
 import jwt from "jsonwebtoken";
 import multer from "multer";
+import multerS3 from "multer-s3";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { auth } from "../middleware/auth.js";
+import s3Client, { BUCKET_NAME, REGION } from "../config/s3.js";
+import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 
-// ---------------- Local Storage Setup ----------------
+// ---------------- Storage (S3) ----------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Ensure uploads directory exists
-const uploadsDir = path.join(__dirname, "../uploads/doctor-avatars");
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-// ---------------- Storage ----------------
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadsDir);
-  },
-  filename: (req, file, cb) => {
-    const baseName = path.parse(file.originalname).name.replace(/\s+/g, "_");
-    const ext = path.extname(file.originalname);
-    const fileName = `doctor-${req.doctor?._id || 'unknown'}-${Date.now()}-${baseName}${ext}`;
-    cb(null, fileName);
-  }
-});
-
-const upload = multer({ 
-  storage, 
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith('image/')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only image files are allowed'), false);
+const upload = multer({
+  storage: multerS3({
+    s3: s3Client,
+    bucket: BUCKET_NAME,
+    contentType: multerS3.AUTO_CONTENT_TYPE,
+    acl: "public-read",
+    key: (req, file, cb) => {
+      const baseName = path.parse(file.originalname).name.replace(/\s+/g, "_");
+      const ext = path.extname(file.originalname).toLowerCase();
+      const doctorId = req.doctor?._id?.toString() || "unknown";
+      const fileName = `doctor-avatars/${doctorId}/${Date.now()}-${baseName}${ext}`;
+      cb(null, fileName);
+    },
+    metadata: (req, file, cb) => {
+      cb(null, { fieldName: file.fieldname, uploadedBy: req.doctor?._id?.toString() || "unknown" });
     }
+  }),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype?.startsWith("image/")) cb(null, true);
+    else cb(new Error("Only image files are allowed"), false);
   }
 });
 
@@ -238,21 +234,29 @@ router.post("/profile/avatar", auth, upload.single("avatar"), async (req, res) =
       return res.status(400).json({ success: false, message: "No image file uploaded." });
     }
 
-    // Delete old avatar if exists
+    // Delete old avatar if exists (supports prior local URLs and S3 URLs)
     if (req.doctor.avatar) {
       try {
-        const oldFilePath = path.join(__dirname, "../uploads/doctor-avatars", path.basename(req.doctor.avatar));
-        if (fs.existsSync(oldFilePath)) {
-          fs.unlinkSync(oldFilePath);
+        const url = req.doctor.avatar;
+        const s3Host = `.s3.${REGION}.amazonaws.com/`;
+        if (url.includes(s3Host)) {
+          const key = url.split(s3Host)[1];
+          if (key) {
+            await s3Client.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+          }
+        } else if (url.includes("/uploads/doctor-avatars/")) {
+          const oldFilePath = path.join(__dirname, "../uploads/doctor-avatars", path.basename(url));
+          if (fs.existsSync(oldFilePath)) {
+            fs.unlinkSync(oldFilePath);
+          }
         }
       } catch (deleteError) {
         console.warn("Could not delete old avatar:", deleteError.message);
       }
     }
 
-    // Create the public URL for the avatar
-    const baseUrl = process.env.BASE_URL || 'https://backend-medicalvault.onrender.com';
-    const avatarUrl = `${baseUrl}/uploads/doctor-avatars/${req.file.filename}`;
+    // Build public S3 URL
+    const avatarUrl = `https://${BUCKET_NAME}.s3.${REGION}.amazonaws.com/${req.file.key}`;
 
     // Update doctor with new avatar URL
     const updatedDoctor = await DoctorUser.findByIdAndUpdate(
