@@ -60,19 +60,26 @@ router.post("/request", optionalAuth, async (req, res) => {
       body: req.body,
       authId: req.auth?.id,
       authRole: req.auth?.role,
-      headers: req.headers.authorization ? 'Present' : 'Missing'
+      hasAuth: !!req.auth,
+      headers: req.headers.authorization ? 'Present' : 'Missing',
+      token: req.headers.authorization ? req.headers.authorization.substring(0, 20) + '...' : 'None'
     });
 
     const { patientId, requestMessage } = req.body;
     
     // Allow logged-in doctor; anonymous may initiate placeholder request label (no doctorId)
-    if (req.auth.role !== "doctor" && req.auth.role !== "anonymous") {
-      console.log('🚫 Session request denied - invalid role:', req.auth.role);
+    if (!req.auth || (req.auth.role !== "doctor" && req.auth.role !== "anonymous")) {
+      console.log('🚫 Session request denied - invalid role or no auth:', {
+        hasAuth: !!req.auth,
+        role: req.auth?.role,
+        authId: req.auth?.id
+      });
       return res.status(403).json({
         success: false,
         message: "Only doctors or anonymous QR can request access",
         debug: {
-          providedRole: req.auth.role,
+          hasAuth: !!req.auth,
+          providedRole: req.auth?.role,
           requiredRole: "doctor|anonymous"
         }
       });

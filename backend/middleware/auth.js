@@ -139,6 +139,9 @@ export const optionalAuth = async (req, res, next) => {
         return;
       }
       
+      // Always set req.auth for valid tokens, regardless of database lookup
+      req.auth = { id: userId, role: role };
+      
       if (role === "doctor") {
         const doctor = await DoctorUser.findById(userId).select("-password");
         if (doctor) req.doctor = doctor;
@@ -148,7 +151,6 @@ export const optionalAuth = async (req, res, next) => {
         const user = await User.findById(userId).select("-password");
         if (user && user.isActive !== false) req.user = user;
       }
-      req.auth = { id: userId, role: role };
     }
     next();
   } catch (err) {
