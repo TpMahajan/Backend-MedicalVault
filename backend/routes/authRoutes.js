@@ -139,6 +139,9 @@ router.post("/google", async (req, res) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
     );
 
+    // Infer loginType if not present in user document
+    const loginType = user.loginType || (user.googleId ? 'google' : 'email');
+    
     res.status(200).json({
       success: true,
       message: user.googleId === googleId ? "Login successful" : "Account created successfully",
@@ -148,6 +151,8 @@ router.post("/google", async (req, res) => {
         email: user.email,
         mobile: user.mobile || "",
         profilePicture: user.profilePicture,
+        loginType: loginType, // Always include loginType
+        googleId: user.googleId, // Include googleId for frontend inference
       },
       token: jwtToken,
     });
