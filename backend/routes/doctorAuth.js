@@ -224,7 +224,18 @@ router.put("/fcm-token", auth, async (req, res) => {
 });
 
 // ================= Upload Doctor Avatar =================
-router.post("/profile/avatar", auth, upload.single("avatar"), async (req, res) => {
+// Multer error-safe wrapper so we always return JSON (not HTML) on errors
+const avatarUploader = (req, res, next) => {
+  upload.single("avatar")(req, res, (err) => {
+    if (err) {
+      const status = err.message?.includes("image") ? 400 : 500;
+      return res.status(status).json({ success: false, message: err.message || "Upload failed" });
+    }
+    next();
+  });
+};
+
+router.post("/profile/avatar", auth, avatarUploader, async (req, res) => {
   try {
     if (!req.doctor) {
       return res.status(404).json({ success: false, message: "Doctor not found." });
