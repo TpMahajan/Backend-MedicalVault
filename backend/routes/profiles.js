@@ -2,14 +2,18 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import { User } from "../models/User.js";
 import { auth } from "../middleware/auth.js";
+import { OAuth2Client } from 'google-auth-library';
+import crypto from "crypto";
 
 const router = express.Router();
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // ================= GET LINKED PROFILES =================
 router.get("/", auth, async (req, res) => {
   try {
-    const user = await User.findById(req.user._id || req.user.id)
-      .populate('linkedProfiles', 'name email profilePicture')
+    const currentUserId = req.user._id || req.user.id;
+    const user = await User.findById(currentUserId)
+      .populate('linkedProfiles', 'name email profilePicture loginType googleId')
       .select('linkedProfiles');
 
     if (!user) {
@@ -19,11 +23,16 @@ router.get("/", auth, async (req, res) => {
       });
     }
 
+    // Filter out current user from linked profiles (prevent cloning)
+    const filteredProfiles = (user.linkedProfiles || []).filter(
+      profile => profile._id.toString() !== currentUserId.toString()
+    );
+
     res.json({
       success: true,
       message: "Linked profiles fetched successfully",
       data: {
-        linkedProfiles: user.linkedProfiles || []
+        linkedProfiles: filteredProfiles
       }
     });
   } catch (error) {
@@ -89,14 +98,19 @@ router.post("/add-self", auth, async (req, res) => {
 
     // Fetch updated linked profiles
     const updatedUser = await User.findById(currentUserId)
-      .populate('linkedProfiles', 'name email profilePicture')
+      .populate('linkedProfiles', 'name email profilePicture loginType googleId')
       .select('linkedProfiles');
+
+    // Filter out current user
+    const filteredProfiles = (updatedUser.linkedProfiles || []).filter(
+      profile => profile._id.toString() !== currentUserId.toString()
+    );
 
     res.json({
       success: true,
       message: "Profile linked successfully",
       data: {
-        linkedProfiles: updatedUser.linkedProfiles
+        linkedProfiles: filteredProfiles
       }
     });
   } catch (error) {
@@ -147,14 +161,19 @@ router.post("/add-other", auth, async (req, res) => {
 
     // Fetch updated linked profiles
     const updatedUser = await User.findById(currentUserId)
-      .populate('linkedProfiles', 'name email profilePicture')
+      .populate('linkedProfiles', 'name email profilePicture loginType googleId')
       .select('linkedProfiles');
+
+    // Filter out current user
+    const filteredProfiles = (updatedUser.linkedProfiles || []).filter(
+      profile => profile._id.toString() !== currentUserId.toString()
+    );
 
     res.status(201).json({
       success: true,
       message: "New profile created and linked successfully",
       data: {
-        linkedProfiles: updatedUser.linkedProfiles,
+        linkedProfiles: filteredProfiles,
         newProfile: {
           id: newUser._id,
           name: newUser.name,
@@ -165,6 +184,212 @@ router.post("/add-other", auth, async (req, res) => {
     });
   } catch (error) {
     console.error("Add other profile error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Internal server error" 
+    });
+  }
+});
+
+// ================= LINK GOOGLE PROFILE =================
+router.post("/link-google", auth, async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    const currentUserId = req.user._id || req.user.id;
+
+    if (!idToken) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Google ID token is required" 
+      });
+    }
+
+    // Verify Google ID token
+    let payload;
+    try {
+      const allowedAudiences = [
+        process.env.GOOGLE_CLIENT_ID,
+        "17869523090-bkk7sg3pei58pgq9h8mh5he85i6khg8r.apps.googleusercontent.com",
+        "17869523090-4eritfoe3a8it2nkef2a0lllofs8862n.apps.googleusercontent.com"
+      ].filter(Boolean);
+
+      const ticket = await googleClient.verifyIdToken({
+        idToken: idToken,
+        audience: allowedAudiences,
+      });
+      payload = ticket.getPayload();
+    } catch (error) {
+      console.error("Google token verification failed:", error);
+      return res.status(401).json({ 
+        success: false, 
+        message: "Invalid Google token" 
+      });
+    }
+
+    const { email, sub: googleId } = payload;
+
+    // Find existing user with this Google account
+    const existingUser = await User.findOne({ 
+      $or: [
+        { email: email.toLowerCase() },
+        { googleId: googleId }
+      ]
+    });
+
+    if (!existingUser) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "No existing account found with this Google email. Please create a new profile instead." 
+      });
+    }
+
+    // Check if trying to link own profile
+    if (existingUser._id.toString() === currentUserId.toString()) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Cannot link your own profile" 
+      });
+    }
+
+    // Check if already linked
+    const currentUser = await User.findById(currentUserId);
+    if (currentUser.linkedProfiles.includes(existingUser._id)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Profile already linked" 
+      });
+    }
+
+    // Link the profile
+    currentUser.linkedProfiles.push(existingUser._id);
+    await currentUser.save();
+
+    // Fetch updated linked profiles
+    const updatedUser = await User.findById(currentUserId)
+      .populate('linkedProfiles', 'name email profilePicture loginType googleId')
+      .select('linkedProfiles');
+
+    // Filter out current user
+    const filteredProfiles = (updatedUser.linkedProfiles || []).filter(
+      profile => profile._id.toString() !== currentUserId.toString()
+    );
+
+    res.json({
+      success: true,
+      message: "Google profile linked successfully",
+      data: {
+        linkedProfiles: filteredProfiles
+      }
+    });
+  } catch (error) {
+    console.error("Link Google profile error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Internal server error" 
+    });
+  }
+});
+
+// ================= CREATE GOOGLE PROFILE =================
+router.post("/create-google", auth, async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    const currentUserId = req.user._id || req.user.id;
+
+    if (!idToken) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Google ID token is required" 
+      });
+    }
+
+    // Verify Google ID token
+    let payload;
+    try {
+      const allowedAudiences = [
+        process.env.GOOGLE_CLIENT_ID,
+        "17869523090-bkk7sg3pei58pgq9h8mh5he85i6khg8r.apps.googleusercontent.com",
+        "17869523090-4eritfoe3a8it2nkef2a0lllofs8862n.apps.googleusercontent.com"
+      ].filter(Boolean);
+
+      const ticket = await googleClient.verifyIdToken({
+        idToken: idToken,
+        audience: allowedAudiences,
+      });
+      payload = ticket.getPayload();
+    } catch (error) {
+      console.error("Google token verification failed:", error);
+      return res.status(401).json({ 
+        success: false, 
+        message: "Invalid Google token" 
+      });
+    }
+
+    const { email, name, picture, sub: googleId } = payload;
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ 
+      $or: [
+        { email: email.toLowerCase() },
+        { googleId: googleId }
+      ]
+    });
+
+    if (existingUser) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "A profile with this Google account already exists. Please use 'Link with Google' instead." 
+      });
+    }
+
+    // Generate random password for Google user
+    const randomPassword = crypto.randomBytes(16).toString('hex');
+
+    // Create new Google user
+    const newUser = new User({
+      name,
+      email: email.toLowerCase(),
+      profilePicture: picture,
+      googleId,
+      password: randomPassword,
+      loginType: "google",
+      mobile: "",
+    });
+
+    await newUser.save();
+    console.log("✅ New Google profile created:", email);
+
+    // Link to current user
+    const currentUser = await User.findById(currentUserId);
+    currentUser.linkedProfiles.push(newUser._id);
+    await currentUser.save();
+
+    // Fetch updated linked profiles
+    const updatedUser = await User.findById(currentUserId)
+      .populate('linkedProfiles', 'name email profilePicture loginType googleId')
+      .select('linkedProfiles');
+
+    // Filter out current user
+    const filteredProfiles = (updatedUser.linkedProfiles || []).filter(
+      profile => profile._id.toString() !== currentUserId.toString()
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Google profile created and linked successfully",
+      data: {
+        linkedProfiles: filteredProfiles,
+        newProfile: {
+          id: newUser._id,
+          name: newUser.name,
+          email: newUser.email,
+          profilePicture: newUser.profilePicture,
+          loginType: "google"
+        }
+      }
+    });
+  } catch (error) {
+    console.error("Create Google profile error:", error);
     res.status(500).json({ 
       success: false, 
       message: "Internal server error" 
@@ -194,14 +419,19 @@ router.delete("/remove/:profileId", auth, async (req, res) => {
 
     // Fetch updated linked profiles
     const updatedUser = await User.findById(currentUserId)
-      .populate('linkedProfiles', 'name email profilePicture')
+      .populate('linkedProfiles', 'name email profilePicture loginType googleId')
       .select('linkedProfiles');
+
+    // Filter out current user
+    const filteredProfiles = (updatedUser.linkedProfiles || []).filter(
+      profile => profile._id.toString() !== currentUserId.toString()
+    );
 
     res.json({
       success: true,
       message: "Profile removed successfully",
       data: {
-        linkedProfiles: updatedUser.linkedProfiles
+        linkedProfiles: filteredProfiles
       }
     });
   } catch (error) {
