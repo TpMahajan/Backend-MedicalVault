@@ -7,6 +7,7 @@ import { DoctorUser } from "../models/DoctorUser.js";  // doctor model
 import bcrypt from "bcryptjs";
 import nodemailer from "nodemailer";
 import { OAuth2Client } from 'google-auth-library';
+import crypto from "crypto";
 
 const router = express.Router();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -30,6 +31,7 @@ router.post("/signup", async (req, res) => {
       email: email.toLowerCase(),
       password,
       mobile,
+      loginType: "email",
     });
 
     await newUser.save();
@@ -98,13 +100,18 @@ router.post("/google", async (req, res) => {
     let user = await User.findOne({ email: email.toLowerCase() });
 
     if (!user) {
+      // Generate a random password for new Google users (16-byte hex string)
+      const randomPassword = crypto.randomBytes(16).toString('hex');
+      
       // Create new user with Google auth
       user = new User({
         name,
         email: email.toLowerCase(),
         profilePicture: picture,
         googleId,
-        // No password needed for Google auth users
+        password: randomPassword, // Will be hashed by pre-save hook
+        loginType: "google",
+        mobile: "", // Set empty mobile for Google users
       });
       await user.save();
       console.log("✅ New user created via Google:", email);
@@ -115,6 +122,10 @@ router.post("/google", async (req, res) => {
       }
       if (!user.profilePicture && picture) {
         user.profilePicture = picture;
+      }
+      // Update loginType to google if not already set
+      if (user.loginType !== "google") {
+        user.loginType = "google";
       }
       user.lastLogin = new Date();
       await user.save();
@@ -606,5 +617,71 @@ router.post("/change-password", auth, async (req, res) => {
   } catch (error) {
     console.error("Change password error:", error);
     res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+// ================= Set Password for Google Users =================
+router.post("/user/set-password", auth, async (req, res) => {
+  try {
+    const { password } = req.body;
+    
+    if (!password) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Password is required" 
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Password must be at least 6 characters long" 
+      });
+    }
+
+    // Get user ID from auth middleware
+    const userId = req.user?._id || req.auth?.id;
+    if (!userId) {
+      return res.status(401).json({ 
+        success: false, 
+        message: "Unauthorized" 
+      });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "User not found" 
+      });
+    }
+
+    console.log("Setting password for user:", { 
+      userId: user._id, 
+      email: user.email,
+      loginType: user.loginType,
+      passwordLength: password.length 
+    });
+
+    // Set the new password - the pre-save hook will hash it automatically
+    user.password = password;
+    await user.save();
+
+    console.log("Password set successfully:", { 
+      userId: user._id, 
+      passwordHashed: true 
+    });
+
+    res.json({ 
+      success: true, 
+      message: "Password updated successfully" 
+    });
+
+  } catch (error) {
+    console.error("Set password error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to update password. Please try again." 
+    });
   }
 });
