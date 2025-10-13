@@ -58,8 +58,8 @@ router.delete('/account', auth, deleteAccount);
 
 // @route   GET /api/users/:id/records
 // @desc    Get user's medical records grouped by category (for web app)
-// @access  Private - doctors need active session
-router.get('/:id/records', auth, checkSession, async (req, res) => {
+// @access  Private - doctors need active session, Anonymous allowed
+router.get('/:id/records', optionalAuth, checkSession, async (req, res) => {
   try {
     const user = await User.findById(req.params.id).populate('medicalRecords');
     if (!user) {

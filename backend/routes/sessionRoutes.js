@@ -1,5 +1,5 @@
 import express from "express";
-import { auth } from "../middleware/auth.js";
+import { auth, optionalAuth } from "../middleware/auth.js";
 import { Session } from "../models/Session.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
@@ -52,12 +52,9 @@ router.get("/db-test", async (req, res) => {
   }
 });
 
-// All other routes require authentication
-router.use(auth);
-
 // ---------------- Doctor Requests Access ----------------
-// POST /api/sessions/request
-router.post("/request", async (req, res) => {
+// POST /api/sessions/request (allows anonymous access)
+router.post("/request", optionalAuth, async (req, res) => {
   try {
     console.log('📋 Session request received:', {
       body: req.body,
@@ -203,6 +200,76 @@ router.post("/request", async (req, res) => {
     });
   }
 });
+
+// ---------------- Get Session Status (for polling) ----------------
+// GET /api/sessions/:id/status (allows anonymous polling)
+router.get("/:id/status", optionalAuth, async (req, res) => {
+  try {
+    const sessionId = req.params.id;
+    
+    const session = await Session.findById(sessionId)
+      .populate('doctorId', 'name email profilePicture experience specialization')
+      .populate('patientId', 'name email');
+    
+    if (!session) {
+      return res.status(404).json({
+        success: false,
+        message: "Session not found"
+      });
+    }
+    
+    // Check if requester is authorized to view this session
+    const isDoctor = req.auth?.role === "doctor" && session.doctorId && session.doctorId._id.toString() === req.auth.id.toString();
+    const isPatient = req.auth?.role !== "doctor" && session.patientId._id.toString() === req.auth.id.toString();
+    const isAnonymous = req.auth?.role === "anonymous" && session.doctorId === null; // Anonymous sessions have no doctorId
+    
+    if (!isDoctor && !isPatient && !isAnonymous) {
+      return res.status(403).json({
+        success: false,
+        message: "Unauthorized to view this session"
+      });
+    }
+    
+    // Check if session has expired
+    const isExpired = session.expiresAt <= new Date();
+    const actualStatus = isExpired ? "expired" : session.status;
+    
+    res.json({
+      success: true,
+      session: {
+        _id: session._id,
+        status: actualStatus,
+        expiresAt: session.expiresAt,
+        createdAt: session.createdAt,
+        respondedAt: session.respondedAt,
+        isExpired: isExpired,
+        timeRemaining: isExpired ? 0 : Math.max(0, Math.floor((session.expiresAt - new Date()) / 1000)),
+        doctor: session.doctorId ? {
+          name: session.doctorId.name,
+          email: session.doctorId.email,
+          profilePicture: session.doctorId.profilePicture,
+          experience: session.doctorId.experience,
+          specialization: session.doctorId.specialization
+        } : null,
+        patient: {
+          name: session.patientId.name,
+          email: session.patientId.email
+        }
+      }
+    });
+    
+  } catch (error) {
+    console.error("Session status error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to get session status",
+      error: error.message
+    });
+  }
+});
+
+// All other routes require authentication
+router.use(auth);
 
 // ---------------- Patient Fetches Pending Requests ----------------
 // GET /api/sessions/requests
@@ -401,72 +468,6 @@ router.post("/:id/respond", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to respond to session request",
-      error: error.message
-    });
-  }
-});
-
-// ---------------- Get Session Status (for polling) ----------------
-// GET /api/sessions/:id/status
-router.get("/:id/status", auth, async (req, res) => {
-  try {
-    const sessionId = req.params.id;
-    
-    const session = await Session.findById(sessionId)
-      .populate('doctorId', 'name email profilePicture experience specialization')
-      .populate('patientId', 'name email');
-    
-    if (!session) {
-      return res.status(404).json({
-        success: false,
-        message: "Session not found"
-      });
-    }
-    
-    // Check if requester is authorized to view this session
-    const isDoctor = req.auth.role === "doctor" && session.doctorId._id.toString() === req.auth.id.toString();
-    const isPatient = req.auth.role !== "doctor" && session.patientId._id.toString() === req.auth.id.toString();
-    
-    if (!isDoctor && !isPatient) {
-      return res.status(403).json({
-        success: false,
-        message: "Unauthorized to view this session"
-      });
-    }
-    
-    // Check if session has expired
-    const isExpired = session.expiresAt <= new Date();
-    const actualStatus = isExpired ? "expired" : session.status;
-    
-    res.json({
-      success: true,
-      session: {
-        _id: session._id,
-        status: actualStatus,
-        expiresAt: session.expiresAt,
-        createdAt: session.createdAt,
-        respondedAt: session.respondedAt,
-        isExpired: isExpired,
-        timeRemaining: isExpired ? 0 : Math.max(0, Math.floor((session.expiresAt - new Date()) / 1000)),
-        doctor: {
-          name: session.doctorId.name,
-          email: session.doctorId.email,
-          profilePicture: session.doctorId.profilePicture,
-          experience: session.doctorId.experience,
-          specialization: session.doctorId.specialization
-        },
-        patient: {
-          name: session.patientId.name,
-          email: session.patientId.email
-        }
-      }
-    });
-    
-  } catch (error) {
-    console.error("Session status error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to get session status",
       error: error.message
     });
   }
