@@ -29,19 +29,25 @@ const formatDocumentsForAI = (documents, category) => {
     type: doc.type || doc.category,
     description: doc.description,
     size: doc.size || doc.fileSize,
-    status: doc.status
+    status: doc.status,
+    id: doc._id,
+    s3Key: doc.s3Key
+  }));
+};
+
+// Helper function to generate preview URLs
+const generatePreviewUrls = (documents) => {
+  return documents.map(doc => ({
+    ...doc,
+    previewUrl: `${process.env.BASE_URL || 'http://localhost:5000'}/api/files/${doc.id}/preview`
   }));
 };
 
 // Helper function to generate system prompt with user context
-const generateSystemPrompt = (user, documents) => {
+const generateSystemPrompt = (user, documents, isDocumentQuery = false) => {
   const userName = user.name || "User";
-  const userAge = user.age ? ` (Age: ${user.age})` : "";
-  const userGender = user.gender ? `, Gender: ${user.gender}` : "";
-  const bloodType = user.bloodType ? `, Blood Type: ${user.bloodType}` : "";
   
-  let documentContext = "";
-  if (documents && documents.length > 0) {
+  if (isDocumentQuery && documents && documents.length > 0) {
     const groupedDocs = documents.reduce((acc, doc) => {
       const type = doc.type || doc.category;
       if (!acc[type]) acc[type] = [];
@@ -49,31 +55,38 @@ const generateSystemPrompt = (user, documents) => {
       return acc;
     }, {});
     
-    documentContext = "\n\nAvailable Documents:\n";
+    let documentList = "";
     Object.entries(groupedDocs).forEach(([type, docs]) => {
-      documentContext += `${type}s: ${docs.length} documents\n`;
-      docs.slice(0, 3).forEach(doc => {
-        documentContext += `- ${doc.title || doc.originalName} (${doc.date || doc.uploadedAt})\n`;
+      documentList += `\n${type}s (${docs.length}):\n`;
+      docs.forEach(doc => {
+        documentList += `• ${doc.title || doc.originalName} (${doc.date || doc.uploadedAt})\n`;
       });
-      if (docs.length > 3) {
-        documentContext += `... and ${docs.length - 3} more\n`;
-      }
     });
+    
+    return `You are AI Ally Assistant. User: ${userName}.
+
+TASK: List user's medical documents clearly and concisely.
+
+DOCUMENTS AVAILABLE:${documentList}
+
+RESPONSE FORMAT:
+- Start with "Hello ${userName}!"
+- List documents by category with clear numbering
+- Mention document count per category
+- Keep response under 200 words
+- Be friendly and helpful
+
+Do NOT analyze document content - just list what's available.`;
   }
   
-  return `You are AI Ally Assistant, a helpful medical AI assistant. You are talking to ${userName}${userAge}${userGender}${bloodType}.
+  return `You are AI Ally Assistant. User: ${userName}.
 
-Your role is to help with:
-1. Medical document queries (reports, prescriptions, bills, insurance)
-2. Health information analysis
-3. General health advice and guidance
-4. Document organization and summaries
+Provide brief, helpful responses about:
+- Medical document queries
+- Health information
+- General medical guidance
 
-Always respond in a friendly, professional manner. When discussing medical documents, be clear and informative.
-
-${documentContext}
-
-Respond concisely but helpfully. If the user asks about specific documents, provide relevant information from the available data.`;
+Keep responses concise (under 150 words). Be friendly and professional.`;
 };
 
 // POST /api/ai/ask - Main AI Assistant endpoint
@@ -145,12 +158,12 @@ router.post("/ask", auth, async (req, res) => {
         }).sort({ uploadedAt: -1 });
       }
 
-      // Format documents for response
-      documentData = formatDocumentsForAI(documents, "general");
+      // Format documents for response with preview URLs
+      documentData = generatePreviewUrls(formatDocumentsForAI(documents, "general"));
     }
 
     // Generate system prompt with user context and documents
-    const systemPrompt = generateSystemPrompt(user, documents);
+    const systemPrompt = generateSystemPrompt(user, documents, isDocumentRequest);
 
     // Prepare messages for Together AI API
     const messages = [
@@ -164,22 +177,23 @@ router.post("/ask", auth, async (req, res) => {
       }
     ];
 
-    // Call Together AI API
+    // Call Together AI API with optimized settings for speed
     const togetherResponse = await axios.post(
       "https://api.together.xyz/v1/chat/completions",
       {
         model: "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         messages: messages,
-        max_tokens: 1000,
-        temperature: 0.7,
-        top_p: 0.9
+        max_tokens: isDocumentRequest ? 300 : 500, // Shorter responses for document queries
+        temperature: 0.3, // Lower temperature for more focused responses
+        top_p: 0.8,
+        stream: false // Ensure no streaming for faster response
       },
       {
         headers: {
           "Authorization": `Bearer ${process.env.TOGETHER_API_KEY}`,
           "Content-Type": "application/json"
         },
-        timeout: 30000 // 30 second timeout
+        timeout: 15000 // Reduced timeout to 15 seconds for faster failure handling
       }
     );
 
@@ -194,15 +208,18 @@ router.post("/ask", auth, async (req, res) => {
       data: documentData.length > 0 ? documentData : null
     };
 
-    // If it's a document query, add structured response
+    // If it's a document query, add structured response with preview URLs
     if (isDocumentRequest && documentData.length > 0) {
       const category = documents[0]?.type || "documents";
       response.type = category.toLowerCase();
       response.title = `${category}s found`;
       response.items = documentData.map(doc => ({
+        id: doc.id,
         name: doc.name,
         date: doc.date,
-        previewUrl: null // Could be enhanced with actual preview URLs
+        type: doc.type,
+        previewUrl: doc.previewUrl,
+        description: doc.description
       }));
     }
 
