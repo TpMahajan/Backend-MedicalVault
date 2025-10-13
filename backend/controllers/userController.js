@@ -80,8 +80,8 @@ export const getUserProfile = async (req, res) => {
       selectFields = '-password'; // All fields except password
       console.log('🔐 Returning full patient data (mode:', mode, 'isSelf:', isSelf, 'hasActiveSession:', hasActiveSession, ')');
     } else if (isAnonymous) {
-      // Anonymous users get more data than just basic profile
-      selectFields = 'name profilePicture age gender dateOfBirth bloodType height weight email mobile createdAt';
+      // Anonymous users can see essential demographics plus meds/history for read-only review
+      selectFields = 'name profilePicture age gender dateOfBirth bloodType height weight email mobile createdAt medications medicalHistory';
       console.log('👻 Returning anonymous patient data (mode:', mode, ')');
     } else {
       console.log('👤 Returning limited public profile data (mode:', mode, ')');
