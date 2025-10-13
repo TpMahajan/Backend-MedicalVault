@@ -11,6 +11,20 @@ import s3Client, { BUCKET_NAME, REGION } from "../config/s3.js";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { generateSignedUrl } from "../utils/s3Utils.js";
 
+// Helper: build signed avatar URL if we have an S3 key
+const buildSignedAvatarUrl = async (avatarValue) => {
+  try {
+    if (!avatarValue) return null;
+    const looksLikeUrl = /^https?:\/\//i.test(avatarValue);
+    if (looksLikeUrl) return avatarValue; // already a URL (legacy)
+    // otherwise it is an S3 key
+    const signed = await generateSignedUrl(avatarValue, BUCKET_NAME);
+    return signed;
+  } catch (e) {
+    return null;
+  }
+};
+
 // ---------------- Storage (S3) ----------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -84,7 +98,8 @@ router.post("/signup", async (req, res) => {
         name: doctor.name,
         email: doctor.email,
         mobile: doctor.mobile,
-        avatar: doctor.avatar,
+        avatar: null,
+        avatarUrl: null,
         specialty: doctor.specialty,
       },
       token,
@@ -126,6 +141,9 @@ router.post("/login", async (req, res) => {
       { expiresIn: "7d" }
     );
 
+    // Build signed avatar URL for convenience
+    const avatarUrl = await buildSignedAvatarUrl(doctor.avatar);
+
     res.json({
       success: true,
       message: "Login successful.",
@@ -135,7 +153,9 @@ router.post("/login", async (req, res) => {
         name: doctor.name,
         email: doctor.email,
         mobile: doctor.mobile,
-        avatar: doctor.avatar,
+        // Prefer a display-ready URL; also include avatarUrl explicitly
+        avatar: avatarUrl,
+        avatarUrl: avatarUrl,
         specialty: doctor.specialty,
         createdAt: doctor.createdAt,
       },
@@ -154,10 +174,11 @@ router.get("/profile", auth, async (req, res) => {
   if (!req.doctor) {
     return res.status(404).json({ success: false, message: "Doctor not found." });
   }
+  const avatarUrl = await buildSignedAvatarUrl(req.doctor.avatar);
   res.json({
     success: true,
     message: "Profile retrieved successfully.",
-    doctor: req.doctor,
+    doctor: { ...req.doctor.toObject(), avatarUrl },
   });
 });
 
@@ -278,13 +299,8 @@ router.post("/profile/avatar", auth, avatarUploader, async (req, res) => {
     ).select("-password");
 
     // Return a signed URL for immediate use by the client
-    let signedUrl = null;
-    try {
-      signedUrl = await generateSignedUrl(avatarKey, BUCKET_CNAME || BUCKET_NAME);
-    } catch (e) {
-      // fallback to virtual-hosted style URL (may require auth)
-      signedUrl = `https://${BUCKET_NAME}.s3.${REGION}.amazonaws.com/${avatarKey}`;
-    }
+    let signedUrl = await buildSignedAvatarUrl(avatarKey);
+    if (!signedUrl) signedUrl = `https://${BUCKET_NAME}.s3.${REGION}.amazonaws.com/${avatarKey}`;
 
     res.json({
       success: true,
