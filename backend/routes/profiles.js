@@ -447,15 +447,8 @@ router.delete("/remove/:profileId", auth, async (req, res) => {
 router.post("/switch/:profileId", auth, async (req, res) => {
   try {
     const { profileId } = req.params;
-    const { password } = req.body;
+    const { password, idToken } = req.body;
     const currentUserId = req.user._id || req.user.id;
-
-    if (!password) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Password is required to switch profiles" 
-      });
-    }
 
     // Find the target profile
     const targetProfile = await User.findById(profileId);
@@ -481,13 +474,66 @@ router.post("/switch/:profileId", auth, async (req, res) => {
       });
     }
 
-    // Verify password for the target profile
-    const isValidPassword = await targetProfile.comparePassword(password);
-    if (!isValidPassword) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Invalid password for this profile" 
-      });
+    // Determine login type
+    const loginType = targetProfile.loginType || (targetProfile.googleId ? 'google' : 'email');
+
+    // Handle Google profiles
+    if (loginType === 'google') {
+      if (!idToken) {
+        return res.status(400).json({ 
+          success: false, 
+          message: "Google ID token is required for Google profiles" 
+        });
+      }
+
+      // Verify Google ID token
+      let payload;
+      try {
+        const allowedAudiences = [
+          process.env.GOOGLE_CLIENT_ID,
+          "17869523090-bkk7sg3pei58pgq9h8mh5he85i6khg8r.apps.googleusercontent.com",
+          "17869523090-4eritfoe3a8it2nkef2a0lllofs8862n.apps.googleusercontent.com"
+        ].filter(Boolean);
+
+        const ticket = await googleClient.verifyIdToken({
+          idToken: idToken,
+          audience: allowedAudiences,
+        });
+        payload = ticket.getPayload();
+      } catch (error) {
+        console.error("Google token verification failed:", error);
+        return res.status(401).json({ 
+          success: false, 
+          message: "Invalid Google token" 
+        });
+      }
+
+      const { email: googleEmail } = payload;
+
+      // Verify that the Google account matches the profile
+      if (googleEmail.toLowerCase() !== targetProfile.email.toLowerCase()) {
+        return res.status(400).json({ 
+          success: false, 
+          message: "Google account email doesn't match profile email" 
+        });
+      }
+    } else {
+      // Handle email/password profiles
+      if (!password) {
+        return res.status(400).json({ 
+          success: false, 
+          message: "Password is required for email/password profiles" 
+        });
+      }
+
+      // Verify password for the target profile
+      const isValidPassword = await targetProfile.comparePassword(password);
+      if (!isValidPassword) {
+        return res.status(400).json({ 
+          success: false, 
+          message: "Invalid password for this profile" 
+        });
+      }
     }
 
     // Generate new token for the target profile
@@ -511,6 +557,8 @@ router.post("/switch/:profileId", auth, async (req, res) => {
           email: targetProfile.email,
           mobile: targetProfile.mobile,
           profilePicture: targetProfile.profilePicture,
+          loginType: loginType,
+          googleId: targetProfile.googleId,
         },
         token
       }
