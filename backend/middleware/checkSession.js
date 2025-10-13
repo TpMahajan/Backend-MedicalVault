@@ -22,9 +22,9 @@ export const checkSession = async (req, res, next) => {
       return next();
     }
 
-    // Skip session check if not a doctor
+    // Skip session check if not a doctor (including anonymous users)
     if (req.auth.role !== "doctor") {
-      console.log("✅ Non-doctor user, skipping session check");
+      console.log("✅ Non-doctor user, skipping session check (role:", req.auth.role, ")");
       return next();
     }
 

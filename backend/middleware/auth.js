@@ -114,9 +114,12 @@ export const auth = async (req, res, next) => {
 export const optionalAuth = async (req, res, next) => {
   try {
     let token = req.header("Authorization")?.replace("Bearer ", "");
+    let tokenSource = "header";
     if (!token) {
       token = req.query.token;
+      tokenSource = token ? "query" : "none";
     }
+    
     if (token) {
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
       
@@ -139,6 +142,8 @@ export const optionalAuth = async (req, res, next) => {
       if (role === "doctor") {
         const doctor = await DoctorUser.findById(userId).select("-password");
         if (doctor) req.doctor = doctor;
+      } else if (role === "anonymous") {
+        // For anonymous users, we don't need to fetch user data
       } else {
         const user = await User.findById(userId).select("-password");
         if (user && user.isActive !== false) req.user = user;
@@ -147,7 +152,7 @@ export const optionalAuth = async (req, res, next) => {
     }
     next();
   } catch (err) {
-    console.warn("Optional auth failed:", err.message);
+    console.warn("❌ Optional auth failed:", err.message);
     next(); // continue without authentication
   }
 };
