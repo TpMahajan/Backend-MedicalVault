@@ -9,6 +9,7 @@ import { DoctorUser } from "../models/DoctorUser.js";
 import { auth } from "../middleware/auth.js";
 import s3Client, { BUCKET_NAME, REGION } from "../config/s3.js";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { generateSignedUrl } from "../utils/s3Utils.js";
 
 // ---------------- Storage (S3) ----------------
 const __filename = fileURLToPath(import.meta.url);
@@ -19,7 +20,7 @@ const upload = multer({
     s3: s3Client,
     bucket: BUCKET_NAME,
     contentType: multerS3.AUTO_CONTENT_TYPE,
-    acl: "public-read",
+    // Do NOT set ACLs; many buckets disable ACLs. Use signed URLs for access.
     key: (req, file, cb) => {
       const baseName = path.parse(file.originalname).name.replace(/\s+/g, "_");
       const ext = path.extname(file.originalname).toLowerCase();
@@ -266,21 +267,30 @@ router.post("/profile/avatar", auth, avatarUploader, async (req, res) => {
       }
     }
 
-    // Build public S3 URL
-    const avatarUrl = `https://${BUCKET_NAME}.s3.${REGION}.amazonaws.com/${req.file.key}`;
+    // Store the S3 key in DB (not a public URL)
+    const avatarKey = req.file.key;
 
     // Update doctor with new avatar URL
     const updatedDoctor = await DoctorUser.findByIdAndUpdate(
       req.doctor._id,
-      { avatar: avatarUrl },
+      { avatar: avatarKey },
       { new: true, runValidators: true }
     ).select("-password");
+
+    // Return a signed URL for immediate use by the client
+    let signedUrl = null;
+    try {
+      signedUrl = await generateSignedUrl(avatarKey, BUCKET_CNAME || BUCKET_NAME);
+    } catch (e) {
+      // fallback to virtual-hosted style URL (may require auth)
+      signedUrl = `https://${BUCKET_NAME}.s3.${REGION}.amazonaws.com/${avatarKey}`;
+    }
 
     res.json({
       success: true,
       message: "Avatar uploaded successfully.",
       doctor: updatedDoctor,
-      avatarUrl: avatarUrl,
+      avatarUrl: signedUrl,
     });
   } catch (error) {
     console.error("Avatar upload error:", error);
