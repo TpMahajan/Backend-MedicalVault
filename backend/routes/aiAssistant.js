@@ -193,19 +193,57 @@ router.post("/ask", auth, async (req, res) => {
     // If specific document ID is provided, analyze that document
     if (documentId) {
       try {
+        console.log(`📄 Analyzing document ID: ${documentId}`);
+        
         const document = await Document.findById(documentId);
-        if (!document || document.userId !== user._id.toString()) {
+        if (!document) {
+          console.log(`❌ Document not found: ${documentId}`);
           return res.status(404).json({
             success: false,
-            message: "Document not found or access denied"
+            message: "Document not found"
           });
         }
 
+        if (document.userId !== user._id.toString()) {
+          console.log(`❌ Access denied for user: ${user._id} to document: ${documentId}`);
+          return res.status(403).json({
+            success: false,
+            message: "Access denied to this document"
+          });
+        }
+
+        console.log(`📋 Document details:`, {
+          id: document._id,
+          title: document.title,
+          type: document.type,
+          s3Key: document.s3Key,
+          s3Bucket: document.s3Bucket
+        });
+
+        // Check if document has S3 information
+        if (!document.s3Key) {
+          console.log(`❌ Document missing S3 key: ${documentId}`);
+          return res.status(400).json({
+            success: false,
+            message: "Document file not found in storage"
+          });
+        }
+
+        const bucketName = document.s3Bucket || process.env.AWS_S3_BUCKET_NAME;
+        console.log(`🪣 Using bucket: ${bucketName}`);
+
         // Extract text from the document
+        console.log(`🔍 Starting text extraction for: ${document.s3Key}`);
         const extractionResult = await documentReader.extractTextFromS3(
           document.s3Key, 
-          document.s3Bucket || process.env.AWS_S3_BUCKET_NAME
+          bucketName
         );
+
+        console.log(`📝 Extraction result:`, {
+          success: extractionResult.success,
+          textLength: extractionResult.text?.length || 0,
+          error: extractionResult.error
+        });
 
         if (extractionResult.success) {
           documentContent = extractionResult.text;
@@ -220,16 +258,18 @@ router.post("/ask", auth, async (req, res) => {
           documents = [document];
           documentData = generatePreviewUrls(formatDocumentsForAI([document], document.type));
         } else {
+          console.error(`❌ Text extraction failed: ${extractionResult.error}`);
           return res.status(500).json({
             success: false,
             message: `Failed to extract text from document: ${extractionResult.error}`
           });
         }
       } catch (error) {
-        console.error("Document analysis error:", error);
+        console.error("❌ Document analysis error:", error);
+        console.error("Error stack:", error.stack);
         return res.status(500).json({
           success: false,
-          message: "Failed to analyze document"
+          message: `Failed to analyze document: ${error.message}`
         });
       }
     } else if (isDocumentRequest) {
@@ -433,6 +473,72 @@ router.get("/documents", auth, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to fetch documents"
+    });
+  }
+});
+
+// GET /api/ai/test-document/:documentId - Test document processing
+router.get("/test-document/:documentId", auth, async (req, res) => {
+  try {
+    const { documentId } = req.params;
+    const user = await User.findById(req.user._id).select("-password");
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+    }
+
+    console.log(`🧪 Testing document processing for ID: ${documentId}`);
+    
+    const document = await Document.findById(documentId);
+    if (!document) {
+      return res.status(404).json({
+        success: false,
+        message: "Document not found"
+      });
+    }
+
+    if (document.userId !== user._id.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied"
+      });
+    }
+
+    console.log(`📋 Document details:`, {
+      id: document._id,
+      title: document.title,
+      type: document.type,
+      s3Key: document.s3Key,
+      s3Bucket: document.s3Bucket
+    });
+
+    // Test document extraction
+    const extractionResult = await documentReader.extractTextFromS3(
+      document.s3Key, 
+      document.s3Bucket || process.env.AWS_S3_BUCKET_NAME
+    );
+
+    res.json({
+      success: true,
+      document: {
+        id: document._id,
+        title: document.title,
+        type: document.type,
+        s3Key: document.s3Key,
+        s3Bucket: document.s3Bucket
+      },
+      extraction: extractionResult
+    });
+
+  } catch (error) {
+    console.error("❌ Test document error:", error);
+    res.status(500).json({
+      success: false,
+      message: `Test failed: ${error.message}`,
+      error: error.stack
     });
   }
 });

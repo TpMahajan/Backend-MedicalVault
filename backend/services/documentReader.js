@@ -27,12 +27,18 @@ class DocumentReader {
    * @returns {Promise<Object>} - Extracted text and metadata
    */
   async extractTextFromS3(s3Key, bucketName) {
+    let tempFilePath = null;
+    
     try {
+      console.log(`📥 Downloading file from S3: ${s3Key} from bucket: ${bucketName}`);
+      
       // Download file from S3 to temporary location
-      const tempFilePath = await this.downloadFromS3(s3Key, bucketName);
+      tempFilePath = await this.downloadFromS3(s3Key, bucketName);
+      console.log(`✅ File downloaded to: ${tempFilePath}`);
       
       // Get file extension
       const fileExtension = path.extname(s3Key).toLowerCase().substring(1);
+      console.log(`📄 File extension: ${fileExtension}`);
       
       // Extract text based on file type
       let extractedText = '';
@@ -44,23 +50,42 @@ class DocumentReader {
       };
 
       if (this.supportedTypes.pdf.includes(fileExtension)) {
-        const result = await this.extractFromPDF(tempFilePath);
-        extractedText = result.text;
-        metadata = { ...metadata, ...result.metadata };
+        console.log(`📖 Extracting text from PDF...`);
+        try {
+          const result = await this.extractFromPDF(tempFilePath);
+          extractedText = result.text;
+          metadata = { ...metadata, ...result.metadata };
+          console.log(`✅ PDF extraction completed. Text length: ${extractedText.length}`);
+        } catch (pdfError) {
+          console.warn(`⚠️ PDF extraction failed, trying fallback: ${pdfError.message}`);
+          // Fallback: return basic metadata without text extraction
+          extractedText = `[PDF Document - Text extraction failed: ${pdfError.message}]`;
+          metadata = { 
+            ...metadata, 
+            extractionError: pdfError.message,
+            fallbackUsed: true
+          };
+          console.log(`🔄 Using fallback for PDF extraction`);
+        }
       } else if (this.supportedTypes.image.includes(fileExtension)) {
+        console.log(`🖼️ Extracting text from image using OCR...`);
         const result = await this.extractFromImage(tempFilePath);
         extractedText = result.text;
         metadata = { ...metadata, ...result.metadata };
+        console.log(`✅ Image OCR completed. Text length: ${extractedText.length}`);
       } else if (this.supportedTypes.text.includes(fileExtension)) {
+        console.log(`📝 Extracting text from text file...`);
         const result = await this.extractFromText(tempFilePath);
         extractedText = result.text;
         metadata = { ...metadata, ...result.metadata };
+        console.log(`✅ Text extraction completed. Text length: ${extractedText.length}`);
       } else {
-        throw new Error(`Unsupported file type: ${fileExtension}`);
+        throw new Error(`Unsupported file type: ${fileExtension}. Supported types: ${Object.values(this.supportedTypes).flat().join(', ')}`);
       }
 
       // Clean up temporary file
       await this.cleanupTempFile(tempFilePath);
+      tempFilePath = null;
 
       return {
         success: true,
@@ -71,7 +96,20 @@ class DocumentReader {
       };
 
     } catch (error) {
-      console.error('Document extraction error:', error);
+      console.error('❌ Document extraction error:', error);
+      console.error('Error details:', {
+        s3Key,
+        bucketName,
+        tempFilePath,
+        errorMessage: error.message,
+        errorStack: error.stack
+      });
+      
+      // Clean up temporary file if it exists
+      if (tempFilePath) {
+        await this.cleanupTempFile(tempFilePath);
+      }
+      
       return {
         success: false,
         error: error.message,
@@ -87,24 +125,57 @@ class DocumentReader {
   async downloadFromS3(s3Key, bucketName) {
     const tempDir = path.join(process.cwd(), 'temp');
     
-    // Ensure temp directory exists
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir, { recursive: true });
+    try {
+      console.log(`📁 Creating temp directory: ${tempDir}`);
+      
+      // Ensure temp directory exists
+      if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+        console.log(`✅ Temp directory created: ${tempDir}`);
+      }
+
+      const tempFilePath = path.join(tempDir, `temp_${Date.now()}_${path.basename(s3Key)}`);
+      console.log(`📄 Temp file path: ${tempFilePath}`);
+      
+      const command = new GetObjectCommand({
+        Bucket: bucketName,
+        Key: s3Key
+      });
+
+      console.log(`🔍 Sending S3 GetObject command for: ${s3Key}`);
+      const response = await s3Client.send(command);
+      
+      if (!response.Body) {
+        throw new Error('S3 response body is null');
+      }
+
+      console.log(`📥 Starting file download...`);
+      const writeStream = createWriteStream(tempFilePath);
+      
+      await pipelineAsync(response.Body, writeStream);
+      console.log(`✅ File download completed: ${tempFilePath}`);
+      
+      // Verify file was created and has content
+      const stats = fs.statSync(tempFilePath);
+      console.log(`📊 File stats: size=${stats.size} bytes`);
+      
+      if (stats.size === 0) {
+        throw new Error('Downloaded file is empty');
+      }
+      
+      return tempFilePath;
+    } catch (error) {
+      console.error(`❌ S3 download error:`, error);
+      console.error(`S3 download details:`, {
+        s3Key,
+        bucketName,
+        tempDir,
+        errorMessage: error.message,
+        errorCode: error.$metadata?.httpStatusCode,
+        errorName: error.name
+      });
+      throw error;
     }
-
-    const tempFilePath = path.join(tempDir, `temp_${Date.now()}_${path.basename(s3Key)}`);
-    
-    const command = new GetObjectCommand({
-      Bucket: bucketName,
-      Key: s3Key
-    });
-
-    const response = await s3Client.send(command);
-    const writeStream = createWriteStream(tempFilePath);
-    
-    await pipelineAsync(response.Body, writeStream);
-    
-    return tempFilePath;
   }
 
   /**
@@ -112,13 +183,39 @@ class DocumentReader {
    */
   async extractFromPDF(filePath) {
     try {
+      console.log(`📖 Starting PDF extraction for: ${filePath}`);
+      
+      // Check if file exists
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`PDF file not found: ${filePath}`);
+      }
+      
+      // Check file size
+      const stats = fs.statSync(filePath);
+      console.log(`📊 PDF file size: ${stats.size} bytes`);
+      
+      if (stats.size === 0) {
+        throw new Error('PDF file is empty');
+      }
+      
       // Dynamic import to handle ES module compatibility
+      console.log(`📦 Importing pdf-parse module...`);
       const pdfParse = await import('pdf-parse');
+      
+      console.log(`📄 Reading PDF file...`);
       const dataBuffer = fs.readFileSync(filePath);
+      
+      console.log(`🔍 Parsing PDF content...`);
       const data = await pdfParse.default(dataBuffer);
       
+      console.log(`✅ PDF parsing completed:`, {
+        pages: data.numpages,
+        textLength: data.text?.length || 0,
+        hasInfo: !!data.info
+      });
+      
       return {
-        text: data.text,
+        text: data.text || '',
         metadata: {
           pages: data.numpages,
           info: data.info,
@@ -126,6 +223,12 @@ class DocumentReader {
         }
       };
     } catch (error) {
+      console.error(`❌ PDF extraction error:`, error);
+      console.error(`PDF extraction details:`, {
+        filePath,
+        errorMessage: error.message,
+        errorStack: error.stack
+      });
       throw new Error(`PDF extraction failed: ${error.message}`);
     }
   }
