@@ -201,32 +201,46 @@ class DocumentReader {
       // Dynamic import to handle ES module compatibility
       console.log(`📦 Importing pdf-parse module...`);
       const pdfParseModule = await import('pdf-parse');
+      console.log(`📦 PDF parse module loaded. Available exports:`, Object.keys(pdfParseModule));
       
       console.log(`📄 Reading PDF file...`);
       const dataBuffer = fs.readFileSync(filePath);
+      console.log(`📄 PDF buffer size: ${dataBuffer.length} bytes`);
       
       console.log(`🔍 Parsing PDF content...`);
-      // Handle both CommonJS and ES module exports
-      const pdfParse = pdfParseModule.default || pdfParseModule;
+      // Handle different export formats - pdf-parse exports PDFParse as a class
+      const PDFParse = pdfParseModule.default || pdfParseModule.PDFParse || pdfParseModule;
+      console.log(`🔍 PDFParse type: ${typeof PDFParse}`);
       
-      if (typeof pdfParse !== 'function') {
-        throw new Error('PDF parse function not found in module');
+      if (typeof PDFParse !== 'function') {
+        console.error('PDF parse module structure:', Object.keys(pdfParseModule));
+        throw new Error(`PDF parse constructor not found in module. Available exports: ${Object.keys(pdfParseModule).join(', ')}`);
       }
       
-      const data = await pdfParse(dataBuffer);
+      console.log(`🔍 Creating PDFParse instance and parsing...`);
+      // PDFParse is a class, so we need to instantiate it with data
+      const pdfParser = new PDFParse({ data: dataBuffer });
+      
+      // Extract text from the document
+      const result = await pdfParser.getText();
+      
+      // Clean up the parser
+      await pdfParser.destroy();
+      
+      console.log(`🔍 PDF parsing completed successfully`);
       
       console.log(`✅ PDF parsing completed:`, {
-        pages: data.numpages,
-        textLength: data.text?.length || 0,
-        hasInfo: !!data.info
+        pages: result.pages,
+        textLength: result.text?.length || 0,
+        hasInfo: !!result.info
       });
       
       return {
-        text: data.text || '',
+        text: result.text || '',
         metadata: {
-          pages: data.numpages,
-          info: data.info,
-          version: data.version
+          pages: result.pages,
+          info: result.info,
+          version: result.version
         }
       };
     } catch (error) {
