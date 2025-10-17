@@ -229,18 +229,22 @@ class DocumentReader {
       
       console.log(`🔍 PDF parsing completed successfully`);
       
+      // Format the text for better readability
+      const formattedText = this.formatPDFText(result);
+      
       console.log(`✅ PDF parsing completed:`, {
-        pages: result.pages,
-        textLength: result.text?.length || 0,
+        pages: result.pages?.length || 0,
+        textLength: formattedText.length,
         hasInfo: !!result.info
       });
       
       return {
-        text: result.text || '',
+        text: formattedText,
         metadata: {
-          pages: result.pages,
+          pages: result.pages?.length || 0,
           info: result.info,
-          version: result.version
+          version: result.version,
+          originalText: result.text || ''
         }
       };
     } catch (error) {
@@ -345,6 +349,154 @@ class DocumentReader {
   isSupported(fileExtension) {
     const extension = fileExtension.toLowerCase();
     return Object.values(this.supportedTypes).flat().includes(extension);
+  }
+
+  /**
+   * Format PDF text for better readability
+   */
+  formatPDFText(result) {
+    if (!result || !result.pages || result.pages.length === 0) {
+      return result?.text || 'No text content found in PDF.';
+    }
+
+    let formattedText = '';
+    
+    // Process each page
+    result.pages.forEach((page, index) => {
+      if (page.text && page.text.trim()) {
+        // Add page header
+        formattedText += `\n📄 **Page ${page.num || (index + 1)}**\n`;
+        formattedText += '─'.repeat(30) + '\n\n';
+        
+        // Format the page content
+        const pageContent = this.formatPageContent(page.text);
+        formattedText += pageContent;
+        
+        // Add spacing between pages
+        if (index < result.pages.length - 1) {
+          formattedText += '\n\n';
+        }
+      }
+    });
+
+    // If no pages were processed, fall back to original text
+    if (!formattedText.trim()) {
+      formattedText = result.text || 'No readable content found in PDF.';
+    }
+
+    return formattedText.trim();
+  }
+
+  /**
+   * Format individual page content with bullet points and structure
+   */
+  formatPageContent(text) {
+    if (!text || !text.trim()) {
+      return '';
+    }
+
+    let formatted = text.trim();
+    
+    // Split into lines and process each line
+    let lines = formatted.split('\n').map(line => line.trim()).filter(line => line);
+    
+    // Process each line for better formatting
+    lines = lines.map(line => {
+      // Skip page separators and headers
+      if (line.match(/^[-─=]+$/) || line.match(/^-- \d+ of \d+ --$/)) {
+        return '';
+      }
+      
+      // Format numbered lists
+      if (line.match(/^\d+\.\s+/)) {
+        return line.replace(/^(\d+\.)\s+/, '• ');
+      }
+      
+      // Format bullet points
+      if (line.match(/^[-*•]\s+/)) {
+        return line.replace(/^[-*•]\s+/, '• ');
+      }
+      
+      // Format section headers (lines ending with colon or in caps)
+      if (line.match(/[A-Z\s]{5,}$/) || line.match(/:$/)) {
+        return `\n**${line}**\n`;
+      }
+      
+      // Format URLs
+      line = line.replace(/(https?:\/\/[^\s]+)/g, '[Link]($1)');
+      
+      // Format email addresses
+      line = line.replace(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g, '[$1](mailto:$1)');
+      
+      return line;
+    });
+    
+    // Join lines and clean up
+    formatted = lines.filter(line => line.trim()).join('\n');
+    
+    // Clean up extra whitespace
+    formatted = formatted
+      .replace(/\n\s*\n\s*\n/g, '\n\n') // Remove multiple empty lines
+      .replace(/^\s+|\s+$/gm, '') // Trim each line
+      .split('\n')
+      .filter(line => line.trim()) // Remove empty lines
+      .join('\n');
+
+    return formatted;
+  }
+
+  /**
+   * Add document structure based on content patterns
+   */
+  addDocumentStructure(text) {
+    let structured = text;
+
+    // Add medical section headers at the beginning of relevant sections
+    const sectionMappings = [
+      { 
+        keywords: ['patient information', 'patient info', 'patient name', 'name:', 'age:', 'gender:'],
+        header: '👤 **Patient Information:**\n'
+      },
+      { 
+        keywords: ['symptoms:', 'complaint:', 'chief complaint'],
+        header: '🤒 **Symptoms:**\n'
+      },
+      { 
+        keywords: ['diagnosis:', 'dx:', 'condition:', 'disease:'],
+        header: '🏥 **Diagnosis:**\n'
+      },
+      { 
+        keywords: ['medications:', 'prescription:', 'drug:', 'medicine:', 'tablet:', 'capsule:'],
+        header: '💊 **Medications:**\n'
+      },
+      { 
+        keywords: ['test results:', 'lab results:', 'blood test:', 'urine test:', 'x-ray:', 'scan:'],
+        header: '🧪 **Test Results:**\n'
+      },
+      { 
+        keywords: ['treatment:', 'therapy:', 'procedure:', 'surgery:', 'operation:'],
+        header: '⚕️ **Treatment:**\n'
+      },
+      { 
+        keywords: ['follow-up:', 'follow up:', 'next visit:', 'appointment:', 'review:'],
+        header: '📅 **Follow-up:**\n'
+      }
+    ];
+
+    // Apply section headers
+    sectionMappings.forEach(section => {
+      section.keywords.forEach(keyword => {
+        if (structured.toLowerCase().includes(keyword.toLowerCase())) {
+          // Replace the keyword with the formatted header
+          const regex = new RegExp(`(${keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+          if (!structured.includes(section.header)) {
+            structured = structured.replace(regex, section.header + '$1');
+          }
+        }
+      });
+    });
+
+    return structured;
   }
 }
 
