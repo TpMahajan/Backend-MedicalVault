@@ -234,10 +234,21 @@ router.post("/ask", auth, async (req, res) => {
 
         // Extract text from the document
         console.log(`🔍 Starting text extraction for: ${document.s3Key}`);
-        const extractionResult = await documentReader.extractTextFromS3(
-          document.s3Key, 
-          bucketName
-        );
+        let extractionResult;
+        try {
+          extractionResult = await documentReader.extractTextFromS3(
+            document.s3Key, 
+            bucketName
+          );
+          console.log(`✅ Text extraction completed:`, {
+            success: extractionResult.success,
+            textLength: extractionResult.text?.length || 0,
+            error: extractionResult.error
+          });
+        } catch (extractionError) {
+          console.error(`❌ Text extraction failed:`, extractionError);
+          throw new Error(`Document extraction failed: ${extractionError.message}`);
+        }
 
         console.log(`📝 Extraction result:`, {
           success: extractionResult.success,
@@ -342,24 +353,37 @@ router.post("/ask", auth, async (req, res) => {
     ];
 
     // Call OpenAI API with optimized settings for speed
-    const openaiResponse = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        messages: messages,
-        max_tokens: documentContent ? 800 : (isDocumentRequest ? 300 : 500),
-        temperature: 0.3,
-        top_p: 0.8,
-        stream: false
-      },
-      {
-        headers: {
-          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json"
+    console.log(`🤖 Calling OpenAI API...`);
+    let openaiResponse;
+    try {
+      openaiResponse = await axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          model: "gpt-4o-mini",
+          messages: messages,
+          max_tokens: documentContent ? 800 : (isDocumentRequest ? 300 : 500),
+          temperature: 0.3,
+          top_p: 0.8,
+          stream: false
         },
-        timeout: 30000 // Increased timeout for document analysis
-      }
-    );
+        {
+          headers: {
+            "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+            "Content-Type": "application/json"
+          },
+          timeout: 30000 // Increased timeout for document analysis
+        }
+      );
+      console.log(`✅ OpenAI API call successful`);
+    } catch (openaiError) {
+      console.error(`❌ OpenAI API call failed:`, {
+        status: openaiError.response?.status,
+        statusText: openaiError.response?.statusText,
+        data: openaiError.response?.data,
+        message: openaiError.message
+      });
+      throw openaiError;
+    }
 
     const aiReply = openaiResponse.data.choices[0].message.content;
 
