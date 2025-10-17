@@ -329,7 +329,7 @@ router.post("/ask", auth, async (req, res) => {
       wantsStructured
     );
 
-    // Prepare messages for Together AI API
+    // Prepare messages for OpenAI API
     const messages = [
       {
         role: "system",
@@ -341,11 +341,11 @@ router.post("/ask", auth, async (req, res) => {
       }
     ];
 
-    // Call Together AI API with optimized settings for speed
-    const togetherResponse = await axios.post(
-      "https://api.together.xyz/v1/chat/completions",
+    // Call OpenAI API with optimized settings for speed
+    const openaiResponse = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
       {
-        model: "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        model: "gpt-4o-mini",
         messages: messages,
         max_tokens: documentContent ? 800 : (isDocumentRequest ? 300 : 500),
         temperature: 0.3,
@@ -354,14 +354,14 @@ router.post("/ask", auth, async (req, res) => {
       },
       {
         headers: {
-          "Authorization": `Bearer ${process.env.TOGETHER_API_KEY}`,
+          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
           "Content-Type": "application/json"
         },
         timeout: 30000 // Increased timeout for document analysis
       }
     );
 
-    const aiReply = togetherResponse.data.choices[0].message.content;
+    const aiReply = openaiResponse.data.choices[0].message.content;
 
     // Parse response for structured data
     let responseType = "text";
@@ -418,21 +418,21 @@ router.post("/ask", auth, async (req, res) => {
     if (error.response?.status === 401) {
       return res.status(500).json({
         success: false,
-        message: "AI service authentication failed. Please check API key."
+        message: "OpenAI API authentication failed. Please check API key."
       });
     }
     
     if (error.code === "ECONNABORTED") {
       return res.status(500).json({
         success: false,
-        message: "AI service timeout. Please try again."
+        message: "OpenAI API timeout. Please try again."
       });
     }
     
     if (error.response?.data?.error) {
       return res.status(500).json({
         success: false,
-        message: `AI service error: ${error.response.data.error.message}`
+        message: `OpenAI API error: ${error.response.data.error.message}`
       });
     }
 
@@ -550,7 +550,7 @@ router.get("/status", auth, async (req, res) => {
     res.json({
       success: true,
       message: "AI Assistant is available",
-      model: "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+      model: "gpt-4o-mini",
       user: req.user.name
     });
   } catch (error) {
