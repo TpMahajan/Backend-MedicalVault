@@ -200,13 +200,20 @@ class DocumentReader {
       
       // Dynamic import to handle ES module compatibility
       console.log(`📦 Importing pdf-parse module...`);
-      const pdfParse = await import('pdf-parse');
+      const pdfParseModule = await import('pdf-parse');
       
       console.log(`📄 Reading PDF file...`);
       const dataBuffer = fs.readFileSync(filePath);
       
       console.log(`🔍 Parsing PDF content...`);
-      const data = await pdfParse.default(dataBuffer);
+      // Handle both CommonJS and ES module exports
+      const pdfParse = pdfParseModule.default || pdfParseModule;
+      
+      if (typeof pdfParse !== 'function') {
+        throw new Error('PDF parse function not found in module');
+      }
+      
+      const data = await pdfParse(dataBuffer);
       
       console.log(`✅ PDF parsing completed:`, {
         pages: data.numpages,
