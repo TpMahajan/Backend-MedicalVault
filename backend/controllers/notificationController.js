@@ -425,18 +425,42 @@ export const sendNotificationToAll = async (req, res) => {
 // @access  Private
 export const getNotificationStream = async (req, res) => {
   try {
+    console.log('📡 SSE stream request received:', {
+      hasToken: !!req.query.token,
+      hasAuth: !!req.auth,
+      authId: req.auth?.id,
+      queryToken: req.query.token ? 'present' : 'missing'
+    });
+
     // Handle token from query parameter for SSE
     let userId, userRole;
     
     if (req.query.token) {
-      // Verify token from query parameter
-      const decoded = jwt.verify(req.query.token, process.env.JWT_SECRET);
-      userId = decoded.id;
-      userRole = decoded.role;
-    } else {
-      // Fallback to auth middleware
+      try {
+        // Verify token from query parameter
+        const decoded = jwt.verify(req.query.token, process.env.JWT_SECRET);
+        userId = decoded.id;
+        userRole = decoded.role;
+        console.log('✅ Token verified successfully:', { userId, userRole });
+      } catch (jwtError) {
+        console.error('❌ JWT verification failed:', jwtError.message);
+        return res.status(401).json({
+          success: false,
+          message: 'Invalid or expired token. Please login again.'
+        });
+      }
+    } else if (req.auth && req.auth.id) {
+      // Fallback to auth middleware if available
       userId = req.auth.id;
       userRole = req.auth.role;
+      console.log('✅ Using auth middleware:', { userId, userRole });
+    } else {
+      // No authentication provided
+      console.log('❌ No authentication provided');
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required. Please provide a valid token.'
+      });
     }
 
     // Set SSE headers
