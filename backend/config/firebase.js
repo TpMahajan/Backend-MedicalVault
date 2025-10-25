@@ -62,13 +62,21 @@ const sendPushNotification = async (token, notification, data = {}) => {
       throw new Error('Firebase not initialized');
     }
 
+    // Convert all data values to strings (FCM requirement)
+    const stringData = {};
+    for (const [key, value] of Object.entries(data)) {
+      if (value !== null && value !== undefined) {
+        stringData[key] = typeof value === 'string' ? value : JSON.stringify(value);
+      }
+    }
+
     const message = {
       token,
       notification: {
         title: notification.title,
         body: notification.body,
       },
-      data,
+      data: stringData,
       android: {
         priority: 'high',
         notification: {
