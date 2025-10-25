@@ -81,8 +81,9 @@ const generatePreviewUrls = (documents) => {
 };
 
 // Helper function to generate system prompt with user context
-const generateSystemPrompt = (user, documents, isDocumentQuery = false, language = 'english', documentContent = null, wantsStructured = false) => {
+const generateSystemPrompt = (user, documents, isDocumentQuery = false, language = 'english', documentContent = null, wantsStructured = false, userRole = 'doctor', patientId = null, conversationContext = null) => {
   const userName = user.name || "User";
+  const userRoleContext = userRole === 'doctor' ? 'medical professional' : 'patient';
   
   const basePrompt = `You are an intelligent multilingual AI Assistant integrated into a medical vault mobile app. 
 You can understand and respond fluently in English, Hindi, Marathi, and Hinglish.
@@ -91,8 +92,43 @@ When asked for data insights, you can output structured data as JSON for tables 
 Your responses must be accurate, concise, and contextually relevant.
 Do not hallucinate — only answer from provided document content.
 
-User: ${userName}
-Response Language: ${language}`;
+User Context:
+- Name: ${userName}
+- Role: ${userRoleContext}
+- User ID: ${user._id}
+- Response Language: ${language}
+${patientId ? `- Current Patient ID: ${patientId}` : ''}
+
+Role-Specific Capabilities:
+${userRole === 'doctor' ? `
+As a Doctor's AI Assistant, you can:
+- Analyze patient medical records and reports
+- Provide clinical insights and recommendations
+- Help with diagnosis support and treatment planning
+- Generate patient summaries and health reports
+- Assist with appointment management and patient care
+- Provide medical terminology explanations
+- Help with documentation and record keeping
+` : `
+As a Patient's AI Assistant, you can:
+- Explain medical reports in simple terms
+- Provide health information and education
+- Help understand medications and treatments
+- Assist with appointment scheduling and reminders
+- Provide general health tips and wellness advice
+- Help organize personal health records
+- Answer questions about medical procedures
+`}
+
+Remember: Always maintain medical accuracy and suggest consulting healthcare professionals for serious medical decisions.
+
+${conversationContext ? `
+Conversation Context:
+- Session started: ${conversationContext.sessionStart ? new Date(conversationContext.sessionStart).toLocaleString() : 'Unknown'}
+- Previous topics: ${conversationContext.topics ? conversationContext.topics.join(', ') : 'None'}
+- Last interaction: ${conversationContext.lastInteraction ? new Date(conversationContext.lastInteraction).toLocaleString() : 'Now'}
+- User preferences: ${conversationContext.preferences ? JSON.stringify(conversationContext.preferences) : 'None'}
+` : ''}`;
 
   if (isDocumentQuery && documents && documents.length > 0) {
     if (documentContent) {
@@ -162,7 +198,7 @@ Keep responses concise (under 150 words). Be friendly and professional.`;
 // POST /api/ai/ask - Main AI Assistant endpoint
 router.post("/ask", auth, async (req, res) => {
   try {
-    const { prompt, documentId } = req.body;
+    const { prompt, documentId, userRole = 'doctor', patientId, conversationContext } = req.body;
     
     if (!prompt || typeof prompt !== "string" || prompt.trim().length === 0) {
       return res.status(400).json({
@@ -337,7 +373,10 @@ router.post("/ask", auth, async (req, res) => {
       isDocumentRequest, 
       language, 
       documentContent, 
-      wantsStructured
+      wantsStructured,
+      userRole,
+      patientId,
+      conversationContext
     );
 
     // Prepare messages for OpenAI API
@@ -406,7 +445,7 @@ router.post("/ask", auth, async (req, res) => {
       }
     }
 
-    // Prepare response
+    // Prepare response with enhanced context
     const response = {
       success: true,
       user: user.name,
@@ -416,7 +455,13 @@ router.post("/ask", auth, async (req, res) => {
       responseType,
       structuredData,
       documentMetadata,
-      data: documentData.length > 0 ? documentData : null
+      data: documentData.length > 0 ? documentData : null,
+      context: {
+        userRole,
+        patientId,
+        sessionId: Date.now(),
+        timestamp: new Date().toISOString()
+      }
     };
 
     // If it's a document query, add structured response with preview URLs

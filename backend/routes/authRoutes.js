@@ -5,7 +5,7 @@ import { auth } from "../middleware/auth.js";
 import { getMe, updateMe } from "../controllers/authController.js";
 import { DoctorUser } from "../models/DoctorUser.js";  // doctor model
 import bcrypt from "bcryptjs";
-import { sendMail } from "../utils/mailer.js";
+import nodemailer from "nodemailer";
 import { OAuth2Client } from 'google-auth-library';
 import crypto from "crypto";
 
@@ -428,6 +428,34 @@ router.post("/test-patient", async (req, res) => {
 export default router;
 
 // ================= Password Reset (Patient) =================
+// Create email transporter with improved configuration
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || "smtp.gmail.com",
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: false, // true for 465, false for other ports
+  auth: process.env.SMTP_USER && process.env.SMTP_PASS ? {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  } : undefined,
+  tls: {
+    rejectUnauthorized: false // Allow self-signed certificates in dev
+  }
+});
+
+// Verify transporter configuration on startup
+if (process.env.SMTP_USER && process.env.SMTP_PASS) {
+  transporter.verify(function(error, success) {
+    if (error) {
+      console.error("❌ SMTP Configuration Error:", error);
+      console.error("Please check your SMTP credentials in db.env");
+    } else {
+      console.log("✅ SMTP Server is ready to send emails");
+    }
+  });
+} else {
+  console.warn("⚠️  SMTP credentials not configured. Password reset emails will not be sent.");
+  console.warn("Please add SMTP_USER and SMTP_PASS to your db.env file.");
+}
 
 // POST /auth/forgot-password
 router.post("/forgot-password", async (req, res) => {
@@ -456,62 +484,58 @@ router.post("/forgot-password", async (req, res) => {
     const appBaseUrl = process.env.APP_BASE_URL || "https://backend-medicalvault.onrender.com";
     const resetLink = `${appBaseUrl}/reset-password?token=${encodeURIComponent(resetToken)}`;
 
-    // Send email using the new robust mailer
+    // Send email
+    let emailSent = false;
     try {
-      console.log(`📧 Sending password reset email to: ${user.email}`);
-      console.log(`🔗 Reset link: ${resetLink}`);
-      
-      await sendMail({
-        to: user.email,
-        subject: "🔐 Reset Your HealthVault Password",
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-            <h2 style="color: #4A90E2;">Password Reset Request</h2>
-            <p>Hello ${user.name},</p>
-            <p>You requested a password reset for your HealthVault account.</p>
-            <p>Click the button below to set a new password (valid for ${expiresInMinutes} minutes):</p>
-            <div style="text-align: center; margin: 30px 0;">
-              <a href="${resetLink}" 
-                 style="background-color: #4A90E2; color: white; padding: 12px 30px; 
-                        text-decoration: none; border-radius: 5px; display: inline-block;">
-                Reset Password
-              </a>
+      if (transporter.options.auth) {
+        await transporter.sendMail({
+          from: process.env.MAIL_FROM || process.env.SMTP_USER || "no-reply@medicalvault.app",
+          to: user.email,
+          subject: "🔐 Reset Your HealthVault Password",
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <h2 style="color: #4A90E2;">Password Reset Request</h2>
+              <p>Hello ${user.name},</p>
+              <p>You requested a password reset for your HealthVault account.</p>
+              <p>Click the button below to set a new password (valid for ${expiresInMinutes} minutes):</p>
+              <div style="text-align: center; margin: 30px 0;">
+                <a href="${resetLink}" 
+                   style="background-color: #4A90E2; color: white; padding: 12px 30px; 
+                          text-decoration: none; border-radius: 5px; display: inline-block;">
+                  Reset Password
+                </a>
+              </div>
+              <p style="color: #666; font-size: 14px;">
+                Or copy and paste this link into your browser:<br>
+                <a href="${resetLink}" style="color: #4A90E2;">${resetLink}</a>
+              </p>
+              <hr style="border: none; border-top: 1px solid #ddd; margin: 30px 0;">
+              <p style="color: #999; font-size: 12px;">
+                If you didn't request this password reset, you can safely ignore this email. 
+                Your password will remain unchanged.
+              </p>
             </div>
-            <p style="color: #666; font-size: 14px;">
-              Or copy and paste this link into your browser:<br>
-              <a href="${resetLink}" style="color: #4A90E2;">${resetLink}</a>
-            </p>
-            <hr style="border: none; border-top: 1px solid #ddd; margin: 30px 0;">
-            <p style="color: #999; font-size: 12px;">
-              If you didn't request this password reset, you can safely ignore this email. 
-              Your password will remain unchanged.
-            </p>
-          </div>
-        `,
-        text: `Password Reset Request\n\nHello ${user.name},\n\nYou requested a password reset for your HealthVault account.\n\nClick the link below to set a new password (valid for ${expiresInMinutes} minutes):\n\n${resetLink}\n\nIf you didn't request this password reset, you can safely ignore this email. Your password will remain unchanged.`
-      });
-      
-      console.log(`✅ Password reset email sent successfully to: ${user.email}`);
-      
-    } catch (mailErr) {
-      console.error("❌ Password reset email failed:", {
-        error: mailErr.message,
-        code: mailErr.code,
-        to: user.email,
-        provider: process.env.SMTP_HOST,
-        port: process.env.SMTP_PORT,
-        secure: process.env.SMTP_SECURE
-      });
-      
-      // Provide helpful error message for ETIMEDOUT
-      let errorMessage = "Failed to send password reset email. Please contact support or try again later.";
-      if (mailErr.message.includes('ETIMEDOUT')) {
-        errorMessage += " (Connection timeout - try switching to port 465 or 587)";
+          `
+        });
+        emailSent = true;
+        console.log(`✅ Password reset email sent to: ${user.email}`);
+      } else {
+        console.error("❌ SMTP not configured - cannot send password reset email");
       }
-      
+    } catch (mailErr) {
+      console.error("❌ Email send failed:", mailErr.message);
+      console.error("Full error:", mailErr);
+      // Return error to user if email fails
       return res.status(500).json({ 
         success: false, 
-        message: errorMessage
+        message: "Failed to send password reset email. Please contact support or try again later." 
+      });
+    }
+
+    if (!emailSent) {
+      return res.status(500).json({ 
+        success: false, 
+        message: "Email service not configured. Please contact support." 
       });
     }
 
