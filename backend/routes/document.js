@@ -144,6 +144,27 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
         // Get doctor info for the notification
         const doctor = await DoctorUser.findById(req.auth.id);
         if (doctor) {
+          // Create notification record in database
+          const { Notification } = await import('../models/Notification.js');
+          const notification = new Notification({
+            title: "New Document Uploaded",
+            body: `Dr. ${doctor.name} uploaded a new ${chosenCategory.toLowerCase()} to your medical records`,
+            type: "document",
+            data: {
+              documentId: doc._id.toString(),
+              category: chosenCategory,
+              doctorId: doctor._id.toString(),
+              doctorName: doctor.name,
+              title: doc.title
+            },
+            recipientId: targetUserId,
+            recipientRole: "patient",
+            senderId: doctor._id.toString(),
+            senderRole: "doctor"
+          });
+          await notification.save();
+          
+          // Send push notification
           await sendNotification(
             targetUserId,
             "New Document Uploaded",
@@ -157,6 +178,12 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
               title: doc.title
             }
           );
+          
+          // Broadcast to SSE connections
+          const { broadcastNotification } = await import('../controllers/notificationController.js');
+          await broadcastNotification(notification);
+          
+          console.log('✅ Document upload notification created and sent');
         }
       } catch (notificationError) {
         console.error("❌ Failed to send file upload notification:", notificationError);

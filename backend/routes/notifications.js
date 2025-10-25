@@ -101,4 +101,25 @@ router.post('/test', async (req, res) => {
   }
 });
 
+// @route   POST /api/notifications/trigger-reminders
+// @desc    Manually trigger all reminder notifications
+// @access  Private
+router.post('/trigger-reminders', async (req, res) => {
+  try {
+    const { triggerReminders } = await import('../services/cronService.js');
+    await triggerReminders();
+
+    res.json({
+      success: true,
+      message: 'All reminder notifications triggered successfully'
+    });
+  } catch (error) {
+    console.error('Trigger reminders error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+});
+
 export default router;

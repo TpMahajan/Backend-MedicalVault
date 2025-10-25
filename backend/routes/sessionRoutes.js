@@ -175,6 +175,26 @@ router.post("/request", optionalAuth, async (req, res) => {
     try {
       const doctorName = session.doctorId ? session.doctorId.name : 'Anonymous Doctor';
       const doctorIdForNotif = session.doctorId ? session.doctorId._id.toString() : null;
+      
+      // Create notification record in database
+      const { Notification } = await import('../models/Notification.js');
+      const notification = new Notification({
+        title: "New Session Request",
+        body: `${doctorName} is requesting access to your medical records`,
+        type: "session",
+        data: {
+          sessionId: session._id.toString(),
+          doctorId: doctorIdForNotif,
+          doctorName: doctorName
+        },
+        recipientId: patientId,
+        recipientRole: "patient",
+        senderId: doctorIdForNotif || "system",
+        senderRole: doctorIdForNotif ? "doctor" : "system"
+      });
+      await notification.save();
+      
+      // Send push notification
       await sendNotification(
         patientId,
         "New Session Request",
@@ -186,6 +206,12 @@ router.post("/request", optionalAuth, async (req, res) => {
           doctorName: doctorName
         }
       );
+      
+      // Broadcast to SSE connections
+      const { broadcastNotification } = await import('../controllers/notificationController.js');
+      await broadcastNotification(notification);
+      
+      console.log('✅ Session request notification created and sent');
     } catch (notificationError) {
       console.error("❌ Failed to send session request notification:", notificationError);
       // Don't fail the request if notification fails
@@ -429,10 +455,30 @@ router.post("/:id/respond", async (req, res) => {
     
     // Send notification to doctor about the patient's response
     try {
+      // Create notification record in database
+      const { Notification } = await import('../models/Notification.js');
+      const notification = new Notification({
+        title: `Session Request ${status === 'accepted' ? 'Accepted' : 'Declined'}`,
+        body: `Patient has ${status} your access request`,
+        type: "session",
+        data: {
+          sessionId: session._id.toString(),
+          status: status,
+          patientId: session.patientId.toString(),
+          expiresAt: session.expiresAt.toISOString()
+        },
+        recipientId: session.doctorId._id.toString(),
+        recipientRole: "doctor",
+        senderId: session.patientId.toString(),
+        senderRole: "patient"
+      });
+      await notification.save();
+      
+      // Send push notification
       await sendNotificationToDoctor(
         session.doctorId._id.toString(),
         `Session Request ${status === 'accepted' ? 'Accepted' : 'Declined'}`,
-        `Patient ${req.auth.role === 'patient' ? 'you' : 'has'} ${status} your access request`,
+        `Patient has ${status} your access request`,
         {
           type: "SESSION_RESPONSE",
           sessionId: session._id.toString(),
@@ -441,6 +487,12 @@ router.post("/:id/respond", async (req, res) => {
           expiresAt: session.expiresAt.toISOString()
         }
       );
+      
+      // Broadcast to SSE connections
+      const { broadcastNotification } = await import('../controllers/notificationController.js');
+      await broadcastNotification(notification);
+      
+      console.log('✅ Session response notification created and sent');
     } catch (notificationError) {
       console.error("❌ Failed to send session response notification:", notificationError);
       // Don't fail the request if notification fails

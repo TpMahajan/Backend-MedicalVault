@@ -90,10 +90,16 @@ app.get("/health", (req, res) =>
 const startServer = async () => {
   try {
     await connectDB();
+    
+    // Initialize cron jobs for reminders
+    const { initializeCronJobs } = await import('./services/cronService.js');
+    initializeCronJobs();
+    
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
       console.log(`📚 Health check: http://0.0.0.0:${PORT}/health`);
       console.log(`📂 Serving uploads at: http://0.0.0.0:${PORT}/uploads`);
+      console.log(`⏰ Cron jobs initialized for reminders`);
     });
   } catch (err) {
     console.error("❌ Failed to start server:", err);

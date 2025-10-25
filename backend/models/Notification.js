@@ -13,7 +13,7 @@ const notificationSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['general', 'appointment', 'session', 'document', 'qr_scan', 'system'],
+    enum: ['general', 'appointment', 'session', 'document', 'qr_scan', 'system', 'reminder'],
     default: 'general'
   },
   data: {
@@ -31,7 +31,7 @@ const notificationSchema = new mongoose.Schema({
     required: true
   },
   senderId: {
-    type: mongoose.Schema.Types.ObjectId,
+    type: mongoose.Schema.Types.Mixed,
     required: true
   },
   senderRole: {
