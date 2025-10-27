@@ -92,6 +92,19 @@ const isScheduleQuery = (prompt) => {
   return keywords.some(k => lower.includes(k));
 };
 
+// Helper: detect urgent filter intent
+const isUrgentQuery = (prompt) => {
+  const lower = (prompt || '').toLowerCase();
+  return lower.includes('urgent') || lower.includes('emergency') || lower.includes('critical');
+};
+
+// Helper: detect patient list queries
+const isPatientsQuery = (prompt) => {
+  const keywords = ['my patients', 'patients', 'active patients', 'list patients'];
+  const lower = (prompt || '').toLowerCase();
+  return keywords.some(k => lower.includes(k));
+};
+
 // Helper: get start/end of today in local time
 const getTodayRange = () => {
   const now = new Date();
@@ -262,6 +275,8 @@ router.post("/ask", auth, async (req, res) => {
     const wantsStructured = wantsStructuredData(prompt);
     const isDocumentRequest = isDocumentQuery(prompt);
     const isScheduleRequest = isScheduleQuery(prompt);
+    const isUrgent = isUrgentQuery(prompt);
+    const isPatientsList = isPatientsQuery(prompt);
     
     let documents = [];
     let documentData = [];
@@ -432,7 +447,30 @@ router.post("/ask", auth, async (req, res) => {
         doctorId: req.auth.id,
         appointmentDate: { $gte: start, $lte: end }
       }).sort({ appointmentTime: 1 }).limit(20);
-      appointmentData = formatAppointmentsForAI(todays);
+      let formatted = formatAppointmentsForAI(todays);
+      if (isUrgent) {
+        formatted = formatted.filter(a => (a.type === 'emergency') || /urgent|critical|emergency/i.test(a.reason || ''));
+      }
+      appointmentData = formatted;
+    }
+
+    // Optionally fetch recent patients list for doctor
+    let patientsData = [];
+    if (isPatientsList && req.auth?.role === 'doctor') {
+      const since = new Date();
+      since.setDate(since.getDate() - 30);
+      const recent = await Appointment.find({
+        doctorId: req.auth.id,
+        appointmentDate: { $gte: since }
+      }).sort({ appointmentDate: -1 });
+      const seen = new Set();
+      for (const a of recent) {
+        if (!seen.has(a.patientId)) {
+          seen.add(a.patientId);
+          patientsData.push({ id: a.patientId, name: a.patientName, lastAppointmentDate: a.appointmentDate });
+        }
+        if (patientsData.length >= 20) break;
+      }
     }
 
     // Generate system prompt with user context and documents; append appointment summary if relevant
@@ -442,6 +480,10 @@ router.post("/ask", auth, async (req, res) => {
           return `${i + 1}. ${time} - ${a.name} (${a.type}, ${a.status}) - ${a.reason}`;
         }).join('\n')
       : (isScheduleRequest && req.auth?.role === 'doctor' ? '\n\nToday: No appointments found.' : '');
+
+    const patientsContext = patientsData.length > 0
+      ? `\n\nActive Patients (last 30 days):\n` + patientsData.map((p, i) => `${i + 1}. ${p.name} - Last appointment: ${new Date(p.lastAppointmentDate).toLocaleDateString()}`).join('\n')
+      : '';
 
     const systemPrompt = generateSystemPrompt(
       currentUser,
@@ -453,7 +495,7 @@ router.post("/ask", auth, async (req, res) => {
       userRole,
       patientId,
       conversationContext
-    ) + appointmentContext;
+    ) + appointmentContext + patientsContext;
 
     // Prepare messages for OpenAI API
     const messages = [
@@ -521,6 +563,30 @@ router.post("/ask", auth, async (req, res) => {
       }
     }
 
+    // Provide structured lists for schedule/patients when available
+    if (!structuredData && isScheduleRequest && appointmentData.length > 0) {
+      responseType = 'list';
+      structuredData = {
+        title: isUrgent ? "Today's Urgent Cases" : "Today's Appointments",
+        items: appointmentData.map(a => ({
+          time: a.date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+          name: a.name,
+          type: a.type,
+          status: a.status,
+          reason: a.reason
+        }))
+      };
+    } else if (!structuredData && isPatientsList && patientsData.length > 0) {
+      responseType = 'list';
+      structuredData = {
+        title: 'Active Patients (last 30 days)',
+        items: patientsData.map(p => ({
+          name: p.name,
+          lastAppointment: new Date(p.lastAppointmentDate).toLocaleDateString()
+        }))
+      };
+    }
+
     // Prepare response with enhanced context
     const response = {
       success: true,
@@ -531,7 +597,8 @@ router.post("/ask", auth, async (req, res) => {
       responseType,
       structuredData,
       documentMetadata,
-      data: documentData.length > 0 ? documentData : (appointmentData.length > 0 ? appointmentData : null),
+      data: documentData.length > 0 ? documentData : (appointmentData.length > 0 ? appointmentData : (patientsData.length > 0 ? patientsData : null)),
+      model: (openaiResponse?.data?.model || 'gpt-4o-mini'),
       context: {
         userRole,
         patientId,
