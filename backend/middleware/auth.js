@@ -62,6 +62,7 @@ export const auth = async (req, res, next) => {
 
     if (role !== "anonymous") {
       req.auth = { id: userId, role: role };
+      req.userId = userId; // Set for requireVerified middleware
     }
 
     // If anonymous role, enforce allowlist at middleware level

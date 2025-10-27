@@ -20,6 +20,7 @@ const UserSchema = new mongoose.Schema(
     mobile: { type: String, required: function() { return !this.googleId; }, trim: true },
     googleId: { type: String, unique: true, sparse: true }, // No default - will be undefined for regular users
     loginType: { type: String, enum: ["email", "google"], default: "email" }, // Track login method
+    emailVerified: { type: Boolean, default: false }, // Email verification status
     aadhaar: { type: String, default: null },
 
     // 🔹 Profile update fields

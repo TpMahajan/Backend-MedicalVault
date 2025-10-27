@@ -8,6 +8,8 @@ import bcrypt from "bcryptjs";
 import nodemailer from "nodemailer";
 import { OAuth2Client } from 'google-auth-library';
 import crypto from "crypto";
+import { EmailVerify } from "../models/EmailVerify.js";
+import { sendVerificationEmail } from "../utils/emailService.js";
 
 const router = express.Router();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -32,11 +34,42 @@ router.post("/signup", async (req, res) => {
       password,
       mobile,
       loginType: "email",
+      emailVerified: false, // Email not verified yet
     });
 
     await newUser.save();
 
-    const token = jwt.sign(
+    // Generate verification materials
+    const tokenId = crypto.randomBytes(16).toString("hex");
+    const verificationToken = crypto.randomBytes(32).toString("hex");
+    const code = Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit code
+
+    const salt = await bcrypt.genSalt(12);
+    const tokenHash = await bcrypt.hash(verificationToken, salt);
+    const codeHash = await bcrypt.hash(code, salt);
+
+    // Create EmailVerify record
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
+    const emailVerify = new EmailVerify({
+      userId: newUser._id,
+      tokenId,
+      tokenHash,
+      codeHash,
+      expiresAt,
+      lastSentAt: new Date(),
+    });
+    await emailVerify.save();
+
+    // Send verification email
+    try {
+      await sendVerificationEmail(email.toLowerCase(), name, tokenId, verificationToken, code);
+      console.log("✅ Verification email sent to:", email.toLowerCase());
+    } catch (emailError) {
+      console.error("❌ Failed to send verification email:", emailError);
+      // Don't fail signup if email fails - user can resend
+    }
+
+    const jwtToken = jwt.sign(
       { userId: newUser._id, role: "patient" },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
@@ -44,14 +77,15 @@ router.post("/signup", async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: "User registered successfully",
+      message: "User registered successfully. Please check your email to verify your account.",
       user: {
         id: newUser._id.toString(),
         name: newUser.name,
         email: newUser.email,
         mobile: newUser.mobile,
+        emailVerified: false,
       },
-      token,
+      token: jwtToken,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -112,6 +146,7 @@ router.post("/google", async (req, res) => {
         password: randomPassword, // Will be hashed by pre-save hook
         loginType: "google",
         mobile: "", // Set empty mobile for Google users
+        emailVerified: true, // Google users are pre-verified
       });
       await user.save();
       console.log("✅ New user created via Google:", email);
@@ -126,6 +161,10 @@ router.post("/google", async (req, res) => {
       // Update loginType to google if not already set
       if (user.loginType !== "google") {
         user.loginType = "google";
+      }
+      // Ensure Google users have emailVerified=true
+      if (!user.emailVerified) {
+        user.emailVerified = true;
       }
       user.lastLogin = new Date();
       await user.save();
@@ -153,6 +192,7 @@ router.post("/google", async (req, res) => {
         profilePicture: user.profilePicture,
         loginType: loginType, // Always include loginType
         googleId: user.googleId, // Include googleId for frontend inference
+        emailVerified: user.emailVerified || false,
       },
       token: jwtToken,
     });
@@ -199,6 +239,7 @@ router.post("/login", async (req, res) => {
         email: user.email,
         mobile: user.mobile,
         profilePicture: user.profilePicture,
+        emailVerified: user.emailVerified || false,
       },
       token,
     });
@@ -373,6 +414,205 @@ router.post("/debug-login", async (req, res) => {
   }
 });
 
+// ================= Email Verification Routes =================
+// POST /auth/verify - Verify email with token
+router.post("/verify", async (req, res) => {
+  try {
+    const tokenStr = req.body.token || req.query.token;
+    if (!tokenStr) {
+      return res.status(400).json({ success: false, message: "Token is required" });
+    }
+
+    const [tokenId, token] = tokenStr.split(".");
+    if (!tokenId || !token) {
+      return res.status(400).json({ success: false, message: "Invalid token format" });
+    }
+
+    // Find EmailVerify record
+    const emailVerify = await EmailVerify.findOne({ tokenId });
+    if (!emailVerify) {
+      return res.status(400).json({ success: false, message: "Invalid or expired verification token" });
+    }
+
+    // Check expiration
+    if (new Date() > emailVerify.expiresAt) {
+      await EmailVerify.deleteMany({ userId: emailVerify.userId });
+      return res.status(400).json({ success: false, message: "Verification token has expired" });
+    }
+
+    // Verify token
+    const isValid = await bcrypt.compare(token, emailVerify.tokenHash);
+    if (!isValid) {
+      return res.status(400).json({ success: false, message: "Invalid verification token" });
+    }
+
+    // Update user
+    const user = await User.findById(emailVerify.userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    user.emailVerified = true;
+    await user.save();
+
+    // Clean up verification records
+    await EmailVerify.deleteMany({ userId: emailVerify.userId });
+
+    console.log("✅ Email verified successfully:", { userId: user._id, email: user.email });
+
+    res.json({
+      success: true,
+      message: "Email verified successfully",
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        emailVerified: true,
+      },
+    });
+  } catch (error) {
+    console.error("Verify error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+// POST /auth/verify-code - Verify email with code
+router.post("/verify-code", async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) {
+      return res.status(400).json({ success: false, message: "Email and code are required" });
+    }
+
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    // Find valid EmailVerify for this user
+    const emailVerify = await EmailVerify.findOne({
+      userId: user._id,
+      expiresAt: { $gt: new Date() },
+    }).sort({ createdAt: -1 });
+
+    if (!emailVerify) {
+      return res.status(400).json({ success: false, message: "No valid verification code found" });
+    }
+
+    // Check expiration
+    if (new Date() > emailVerify.expiresAt) {
+      await EmailVerify.deleteMany({ userId: user._id });
+      return res.status(400).json({ success: false, message: "Verification code has expired" });
+    }
+
+    // Verify code
+    const isValid = await bcrypt.compare(code, emailVerify.codeHash);
+    if (!isValid) {
+      return res.status(400).json({ success: false, message: "Invalid verification code" });
+    }
+
+    // Update user
+    user.emailVerified = true;
+    await user.save();
+
+    // Clean up verification records
+    await EmailVerify.deleteMany({ userId: user._id });
+
+    console.log("✅ Email verified successfully via code:", { userId: user._id, email: user.email });
+
+    res.json({
+      success: true,
+      message: "Email verified successfully",
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        emailVerified: true,
+      },
+    });
+  } catch (error) {
+    console.error("Verify code error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+// POST /auth/resend-verification - Resend verification email
+router.post("/resend-verification", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ success: false, message: "Email is required" });
+    }
+
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) {
+      // Return generic success to avoid user enumeration
+      return res.json({ success: true, message: "If your email exists, a verification email has been sent." });
+    }
+
+    // Check if already verified
+    if (user.emailVerified) {
+      return res.status(400).json({ success: false, message: "Email is already verified" });
+    }
+
+    // Rate limiting: check lastSentAt
+    const lastVerify = await EmailVerify.findOne({ userId: user._id }).sort({ lastSentAt: -1 });
+    if (lastVerify) {
+      const timeSinceLastSent = Date.now() - lastVerify.lastSentAt.getTime();
+      const cooldownMs = 60 * 1000; // 60 seconds
+
+      if (timeSinceLastSent < cooldownMs) {
+        const remainingSeconds = Math.ceil((cooldownMs - timeSinceLastSent) / 1000);
+        return res.status(429).json({
+          success: false,
+          message: `Please wait ${remainingSeconds} seconds before requesting another verification email`,
+        });
+      }
+    }
+
+    // Invalidate old tokens
+    await EmailVerify.deleteMany({ userId: user._id });
+
+    // Generate new verification materials
+    const tokenId = crypto.randomBytes(16).toString("hex");
+    const verificationToken = crypto.randomBytes(32).toString("hex");
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+
+    const salt = await bcrypt.genSalt(12);
+    const tokenHash = await bcrypt.hash(verificationToken, salt);
+    const codeHash = await bcrypt.hash(code, salt);
+
+    // Create new EmailVerify record
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
+    const emailVerify = new EmailVerify({
+      userId: user._id,
+      tokenId,
+      tokenHash,
+      codeHash,
+      expiresAt,
+      lastSentAt: new Date(),
+    });
+    await emailVerify.save();
+
+    // Send verification email
+    try {
+      await sendVerificationEmail(user.email, user.name, tokenId, verificationToken, code);
+      console.log("✅ Verification email resent to:", user.email);
+    } catch (emailError) {
+      console.error("❌ Failed to send verification email:", emailError);
+      return res.status(500).json({ success: false, message: "Failed to send verification email" });
+    }
+
+    res.json({
+      success: true,
+      message: "Verification email has been sent",
+    });
+  } catch (error) {
+    console.error("Resend verification error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
 // ================= Test Endpoint for QR Scanner =================
 router.post("/test-patient", async (req, res) => {
   try {
@@ -467,6 +707,15 @@ router.post("/forgot-password", async (req, res) => {
     if (!user) {
       // Respond generically to avoid user enumeration
       return res.json({ success: true, message: "If your email exists, a reset link has been sent." });
+    }
+
+    // Check if email is verified (unless Google user)
+    if (!user.googleId && !user.emailVerified) {
+      console.log("❌ Password reset blocked - email not verified:", { userId: user._id, email: user.email });
+      return res.status(403).json({ 
+        success: false, 
+        message: "Please verify your email first before resetting your password." 
+      });
     }
 
     const expiresInMinutes = Number(process.env.RESET_TOKEN_EXPIRES_MIN || 30);

@@ -5,6 +5,7 @@ import path from "path";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import axios from "axios";
 import { auth } from "../middleware/auth.js";
+import { requireVerified } from "../middleware/requireVerified.js";
 import { Document } from "../models/File.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
@@ -39,7 +40,7 @@ const storage = multerS3({
 const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
 
 // ---------------- Upload ----------------
-router.post("/upload", auth, upload.single("file"), async (req, res) => {
+router.post("/upload", auth, requireVerified, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
 
@@ -529,7 +530,7 @@ router.get("/:id/proxy", auth, checkSession, async (req, res) => {
 });
 
 // ---------------- Delete ----------------
-router.delete("/:id", auth, async (req, res) => {
+router.delete("/:id", auth, requireVerified, async (req, res) => {
   try {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
