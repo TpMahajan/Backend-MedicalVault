@@ -93,6 +93,27 @@ const isScheduleQuery = (prompt) => {
   return keywords.some(k => lower.includes(k));
 };
 
+// Helper: extract a documentId mentioned in the prompt like "document <id>"
+const extractDocumentIdFromPrompt = (prompt) => {
+  const m = (prompt || '').match(/document\s+([a-f\d]{24})/i);
+  return m ? m[1] : null;
+};
+
+// Helper: extract a probable document title after keywords like "analyze"
+const extractDocumentTitleFromPrompt = (prompt) => {
+  const lower = (prompt || '').toLowerCase();
+  // try phrases like: analyze <title>, analyze the <title>
+  const m = lower.match(/analy[sz]e\s+(the\s+)?(.+)/i);
+  if (m && m[2]) {
+    // strip trailing filler words
+    return m[2]
+      .replace(/[\.!?].*$/, '')
+      .replace(/\b(report|document|file)\b/g, '')
+      .trim();
+  }
+  return null;
+};
+
 // Helper: detect urgent filter intent
 const isUrgentQuery = (prompt) => {
   const lower = (prompt || '').toLowerCase();
@@ -289,13 +310,17 @@ router.post("/ask", auth, async (req, res) => {
       : (currentUser?._id?.toString() || null);
 
     // If specific document ID is provided, analyze that document
-    if (documentId) {
+    // Try to infer document by explicit id or fuzzy title
+    let requestedDocumentId = documentId || extractDocumentIdFromPrompt(prompt);
+    let requestedTitle = !requestedDocumentId ? extractDocumentTitleFromPrompt(prompt) : null;
+
+    if (requestedDocumentId) {
       try {
-        console.log(`📄 Analyzing document ID: ${documentId}`);
+        console.log(`📄 Analyzing document ID: ${requestedDocumentId}`);
         
-        const document = await Document.findById(documentId);
+        const document = await Document.findById(requestedDocumentId);
         if (!document) {
-          console.log(`❌ Document not found: ${documentId}`);
+          console.log(`❌ Document not found: ${requestedDocumentId}`);
           return res.status(404).json({
             success: false,
             message: "Document not found"
@@ -308,12 +333,12 @@ router.post("/ask", auth, async (req, res) => {
             return res.status(403).json({ success: false, message: "Patient ID required for document analysis" });
           }
           if (document.userId !== String(patientId)) {
-            console.log(`❌ Access denied for doctor ${req.auth.id} to document ${documentId} for patient ${patientId}`);
+            console.log(`❌ Access denied for doctor ${req.auth.id} to document ${requestedDocumentId} for patient ${patientId}`);
             return res.status(403).json({ success: false, message: "Access denied to this document" });
           }
         } else {
           if (document.userId !== currentUser._id.toString()) {
-            console.log(`❌ Access denied for user: ${currentUser._id} to document: ${documentId}`);
+            console.log(`❌ Access denied for user: ${currentUser._id} to document: ${requestedDocumentId}`);
             return res.status(403).json({ success: false, message: "Access denied to this document" });
           }
         }
@@ -388,6 +413,32 @@ router.post("/ask", auth, async (req, res) => {
           success: false,
           message: `Failed to analyze document: ${error.message}`
         });
+      }
+    } else if (requestedTitle) {
+      // Fuzzy title match within patient's docs
+      const targetUserIdForTitle = (req.auth?.role === 'doctor') ? patientId : currentUser._id.toString();
+      if (!targetUserIdForTitle) {
+        console.log('No target user for title-based document search');
+      } else {
+        const regex = new RegExp(requestedTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        const doc = await Document.findOne({ userId: targetUserIdForTitle, title: regex }).sort({ uploadedAt: -1 });
+        if (doc) {
+          // Analyze the matched document
+          try {
+            const bucketName = doc.s3Bucket || process.env.AWS_S3_BUCKET_NAME;
+            const extractionResult = await documentReader.extractTextFromS3(doc.s3Key, bucketName);
+            if (extractionResult.success) {
+              documentContent = extractionResult.text;
+              documentMetadata = { ...extractionResult.metadata, fileName: doc.title || doc.originalName, documentType: doc.type, uploadedAt: doc.uploadedAt };
+              documents = [doc];
+              documentData = generatePreviewUrls(formatDocumentsForAI([doc], doc.type));
+            } else {
+              return res.status(500).json({ success: false, message: `Failed to extract text from document: ${extractionResult.error}` });
+            }
+          } catch (e) {
+            return res.status(500).json({ success: false, message: `Failed to analyze document: ${e.message}` });
+          }
+        }
       }
     } else if (isDocumentRequest) {
       // Fetch relevant documents based on query
