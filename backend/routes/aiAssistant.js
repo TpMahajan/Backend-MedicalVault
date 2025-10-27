@@ -2,6 +2,7 @@ import express from "express";
 import axios from "axios";
 import { auth } from "../middleware/auth.js";
 import { User } from "../models/User.js";
+import { DoctorUser } from "../models/DoctorUser.js";
 import { Document } from "../models/File.js";
 import DocumentReader from "../services/documentReader.js";
 
@@ -207,13 +208,22 @@ router.post("/ask", auth, async (req, res) => {
       });
     }
 
-    // Get user details from JWT token
-    const user = await User.findById(req.user._id).select("-password");
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found"
-      });
+    // Resolve authenticated principal and role
+    const role = req.auth?.role;
+    let currentUser = null; // entity used for prompt context (doctor or patient)
+    if (role === 'doctor') {
+      const doctor = await DoctorUser.findById(req.auth.id).select("-password");
+      if (!doctor) {
+        return res.status(404).json({ success: false, message: "Doctor not found" });
+      }
+      // Normalize to a minimal shape expected by prompt generator
+      currentUser = { _id: doctor._id, name: doctor.name };
+    } else {
+      const patient = await User.findById(req.user?._id).select("-password");
+      if (!patient) {
+        return res.status(404).json({ success: false, message: "User not found" });
+      }
+      currentUser = patient;
     }
 
     // Detect language and other parameters
@@ -225,6 +235,10 @@ router.post("/ask", auth, async (req, res) => {
     let documentData = [];
     let documentContent = null;
     let documentMetadata = null;
+    // Determine which userId to fetch documents for
+    const targetUserId = (req.auth?.role === 'doctor')
+      ? (patientId || null)
+      : (currentUser?._id?.toString() || null);
 
     // If specific document ID is provided, analyze that document
     if (documentId) {
@@ -240,12 +254,20 @@ router.post("/ask", auth, async (req, res) => {
           });
         }
 
-        if (document.userId !== user._id.toString()) {
-          console.log(`❌ Access denied for user: ${user._id} to document: ${documentId}`);
-          return res.status(403).json({
-            success: false,
-            message: "Access denied to this document"
-          });
+        // Access control: patients can access their own docs; doctors need patientId and must match
+        if (req.auth?.role === 'doctor') {
+          if (!patientId) {
+            return res.status(403).json({ success: false, message: "Patient ID required for document analysis" });
+          }
+          if (document.userId !== String(patientId)) {
+            console.log(`❌ Access denied for doctor ${req.auth.id} to document ${documentId} for patient ${patientId}`);
+            return res.status(403).json({ success: false, message: "Access denied to this document" });
+          }
+        } else {
+          if (document.userId !== currentUser._id.toString()) {
+            console.log(`❌ Access denied for user: ${currentUser._id} to document: ${documentId}`);
+            return res.status(403).json({ success: false, message: "Access denied to this document" });
+          }
         }
 
         console.log(`📋 Document details:`, {
@@ -322,6 +344,10 @@ router.post("/ask", auth, async (req, res) => {
     } else if (isDocumentRequest) {
       // Fetch relevant documents based on query
       const lowerPrompt = prompt.toLowerCase();
+      // If doctor without patient context, skip fetching documents (no target)
+      if (!targetUserId) {
+        console.log("ℹ️ Document query received but no target patientId for doctor. Skipping document fetch.");
+      } else {
       
       if (lowerPrompt.includes("report") || lowerPrompt.includes("this month") || lowerPrompt.includes("recent")) {
         const { startOfMonth, endOfMonth } = getCurrentMonthRange();
@@ -329,46 +355,46 @@ router.post("/ask", auth, async (req, res) => {
         if (lowerPrompt.includes("this month")) {
           // Current month reports
           documents = await Document.find({
-            userId: user._id.toString(),
+            userId: targetUserId,
             type: "Report",
             uploadedAt: { $gte: startOfMonth, $lte: endOfMonth }
           }).sort({ uploadedAt: -1 });
         } else {
           // All reports
           documents = await Document.find({
-            userId: user._id.toString(),
+            userId: targetUserId,
             type: "Report"
           }).sort({ uploadedAt: -1 });
         }
       } else if (lowerPrompt.includes("prescription")) {
         documents = await Document.find({
-          userId: user._id.toString(),
+          userId: targetUserId,
           type: "Prescription"
         }).sort({ uploadedAt: -1 });
       } else if (lowerPrompt.includes("bill")) {
         documents = await Document.find({
-          userId: user._id.toString(),
+          userId: targetUserId,
           type: "Bill"
         }).sort({ uploadedAt: -1 });
       } else if (lowerPrompt.includes("insurance")) {
         documents = await Document.find({
-          userId: user._id.toString(),
+          userId: targetUserId,
           type: "Insurance"
         }).sort({ uploadedAt: -1 });
       } else {
         // General document query - get all documents
         documents = await Document.find({
-          userId: user._id.toString()
+          userId: targetUserId
         }).sort({ uploadedAt: -1 });
       }
-
+      }
       // Format documents for response with preview URLs
       documentData = generatePreviewUrls(formatDocumentsForAI(documents, "general"));
     }
 
     // Generate system prompt with user context and documents
     const systemPrompt = generateSystemPrompt(
-      user, 
+      currentUser, 
       documents, 
       isDocumentRequest, 
       language, 
@@ -448,7 +474,7 @@ router.post("/ask", auth, async (req, res) => {
     // Prepare response with enhanced context
     const response = {
       success: true,
-      user: user.name,
+      user: currentUser.name,
       assistant: "AI Ally Assistant",
       reply: aiReply,
       language,
@@ -620,7 +646,7 @@ router.get("/status", auth, async (req, res) => {
       success: true,
       message: "AI Assistant is available",
       model: "gpt-4o-mini",
-      user: req.user.name
+      user: (req.doctor?.name || req.user?.name || 'Unknown')
     });
   } catch (error) {
     console.error("AI status check error:", error);
