@@ -4,6 +4,7 @@ import { auth } from "../middleware/auth.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { Document } from "../models/File.js";
+import { Appointment } from "../models/Appointment.js";
 import DocumentReader from "../services/documentReader.js";
 
 const router = express.Router();
@@ -78,6 +79,36 @@ const generatePreviewUrls = (documents) => {
   return documents.map(doc => ({
     ...doc,
     previewUrl: `${process.env.BASE_URL || 'http://localhost:5000'}/api/files/${doc.id}/preview`
+  }));
+};
+
+// Helper: detect schedule/appointment related queries
+const isScheduleQuery = (prompt) => {
+  const keywords = [
+    'schedule', 'appointment', 'appointments', 'today', 'urgent', 'emergency',
+    'cases', 'my patients today', 'what do i have', 'agenda'
+  ];
+  const lower = (prompt || '').toLowerCase();
+  return keywords.some(k => lower.includes(k));
+};
+
+// Helper: get start/end of today in local time
+const getTodayRange = () => {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+  return { start, end };
+};
+
+// Helper: format appointments for AI context and frontend data
+const formatAppointmentsForAI = (appointments) => {
+  return appointments.map(a => ({
+    id: a._id,
+    name: a.patientName,
+    date: new Date(`${a.appointmentDate.toISOString().split('T')[0]}T${a.appointmentTime}`),
+    type: a.appointmentType,
+    status: a.status,
+    reason: a.reason
   }));
 };
 
@@ -230,6 +261,7 @@ router.post("/ask", auth, async (req, res) => {
     const language = detectLanguage(prompt);
     const wantsStructured = wantsStructuredData(prompt);
     const isDocumentRequest = isDocumentQuery(prompt);
+    const isScheduleRequest = isScheduleQuery(prompt);
     
     let documents = [];
     let documentData = [];
@@ -392,18 +424,36 @@ router.post("/ask", auth, async (req, res) => {
       documentData = generatePreviewUrls(formatDocumentsForAI(documents, "general"));
     }
 
-    // Generate system prompt with user context and documents
+    // Optionally fetch today's appointments for doctor schedule queries
+    let appointmentData = [];
+    if (isScheduleRequest && req.auth?.role === 'doctor') {
+      const { start, end } = getTodayRange();
+      const todays = await Appointment.find({
+        doctorId: req.auth.id,
+        appointmentDate: { $gte: start, $lte: end }
+      }).sort({ appointmentTime: 1 }).limit(20);
+      appointmentData = formatAppointmentsForAI(todays);
+    }
+
+    // Generate system prompt with user context and documents; append appointment summary if relevant
+    const appointmentContext = appointmentData.length > 0
+      ? `\n\nToday's Appointments (${appointmentData.length}):\n` + appointmentData.map((a, i) => {
+          const time = a.date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+          return `${i + 1}. ${time} - ${a.name} (${a.type}, ${a.status}) - ${a.reason}`;
+        }).join('\n')
+      : (isScheduleRequest && req.auth?.role === 'doctor' ? '\n\nToday: No appointments found.' : '');
+
     const systemPrompt = generateSystemPrompt(
-      currentUser, 
-      documents, 
-      isDocumentRequest, 
-      language, 
-      documentContent, 
+      currentUser,
+      documents,
+      isDocumentRequest,
+      language,
+      documentContent,
       wantsStructured,
       userRole,
       patientId,
       conversationContext
-    );
+    ) + appointmentContext;
 
     // Prepare messages for OpenAI API
     const messages = [
@@ -481,7 +531,7 @@ router.post("/ask", auth, async (req, res) => {
       responseType,
       structuredData,
       documentMetadata,
-      data: documentData.length > 0 ? documentData : null,
+      data: documentData.length > 0 ? documentData : (appointmentData.length > 0 ? appointmentData : null),
       context: {
         userRole,
         patientId,
