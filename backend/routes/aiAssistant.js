@@ -114,6 +114,23 @@ const extractDocumentTitleFromPrompt = (prompt) => {
   return null;
 };
 
+// Helper: simple Levenshtein distance for fuzzy matching
+const levenshtein = (a = '', b = '') => {
+  a = a.toLowerCase();
+  b = b.toLowerCase();
+  const m = Array.from({ length: a.length + 1 }, (_, i) => [i]);
+  for (let j = 1; j <= b.length; j++) m[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      m[i][j] = Math.min(m[i - 1][j] + 1, m[i][j - 1] + 1, m[i - 1][j - 1] + cost);
+    }
+  }
+  return m[a.length][b.length];
+};
+
+const normalizeTitle = (s = '') => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
 // Helper: detect urgent filter intent
 const isUrgentQuery = (prompt) => {
   const lower = (prompt || '').toLowerCase();
@@ -420,8 +437,19 @@ router.post("/ask", auth, async (req, res) => {
       if (!targetUserIdForTitle) {
         console.log('No target user for title-based document search');
       } else {
-        const regex = new RegExp(requestedTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-        const doc = await Document.findOne({ userId: targetUserIdForTitle, title: regex }).sort({ uploadedAt: -1 });
+        const candidates = await Document.find({ userId: targetUserIdForTitle }).sort({ uploadedAt: -1 }).limit(50);
+        const target = normalizeTitle(requestedTitle);
+        let best = null;
+        let bestScore = Number.MAX_SAFE_INTEGER;
+        for (const c of candidates) {
+          const titleNorm = normalizeTitle(c.title || c.originalName || '');
+          if (!titleNorm) continue;
+          const d = levenshtein(titleNorm, target);
+          if (d < bestScore) { bestScore = d; best = c; }
+          // Exact-ish containment wins immediately
+          if (titleNorm.includes(target) || target.includes(titleNorm)) { best = c; break; }
+        }
+        const doc = best;
         if (doc) {
           // Analyze the matched document
           try {
@@ -438,6 +466,8 @@ router.post("/ask", auth, async (req, res) => {
           } catch (e) {
             return res.status(500).json({ success: false, message: `Failed to analyze document: ${e.message}` });
           }
+        } else {
+          console.log('No fuzzy match found for title:', requestedTitle);
         }
       }
     } else if (isDocumentRequest) {
