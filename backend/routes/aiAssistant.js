@@ -5,6 +5,7 @@ import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { Document } from "../models/File.js";
 import { Appointment } from "../models/Appointment.js";
+import { AIChat } from "../models/AIChat.js";
 import DocumentReader from "../services/documentReader.js";
 
 const router = express.Router();
@@ -243,7 +244,7 @@ Keep responses concise (under 150 words). Be friendly and professional.`;
 // POST /api/ai/ask - Main AI Assistant endpoint
 router.post("/ask", auth, async (req, res) => {
   try {
-    const { prompt, documentId, userRole = 'doctor', patientId, conversationContext } = req.body;
+    const { prompt, documentId, userRole = 'doctor', patientId, conversationContext, conversationId } = req.body;
     
     if (!prompt || typeof prompt !== "string" || prompt.trim().length === 0) {
       return res.status(400).json({
@@ -587,6 +588,38 @@ router.post("/ask", auth, async (req, res) => {
       };
     }
 
+    // Persist chat with 24h TTL
+    let savedConversationId = conversationId;
+    try {
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+      const chatFilter = {
+        userId: req.auth.role === 'doctor' ? req.auth.id : currentUser._id.toString(),
+        userRole: req.auth.role === 'doctor' ? 'doctor' : 'patient',
+        ...(patientId ? { patientId: String(patientId) } : { patientId: null })
+      };
+      let chatDoc = null;
+      if (conversationId) {
+        chatDoc = await AIChat.findById(conversationId);
+      }
+      if (!chatDoc) {
+        chatDoc = await AIChat.findOne(chatFilter).sort({ updatedAt: -1 });
+      }
+      if (!chatDoc) {
+        chatDoc = new AIChat({ ...chatFilter, messages: [], expiresAt });
+      }
+      chatDoc.messages.push(
+        { role: 'user', content: prompt, timestamp: new Date() },
+        { role: 'assistant', content: aiReply, timestamp: new Date(), metadata: { language, responseType } }
+      );
+      chatDoc.lastActivityAt = new Date();
+      chatDoc.expiresAt = expiresAt;
+      await chatDoc.save();
+      savedConversationId = chatDoc._id.toString();
+    } catch (persistErr) {
+      console.warn('⚠️ Failed to persist AI chat:', persistErr.message);
+    }
+
     // Prepare response with enhanced context
     const response = {
       success: true,
@@ -603,7 +636,8 @@ router.post("/ask", auth, async (req, res) => {
         userRole,
         patientId,
         sessionId: Date.now(),
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        conversationId: savedConversationId
       }
     };
 
@@ -774,4 +808,81 @@ router.get("/status", auth, async (req, res) => {
   }
 });
 
+// Load recent chat (last 24h) for current principal
+router.get("/chat", auth, async (req, res) => {
+  try {
+    const filter = {
+      userId: req.auth.role === 'doctor' ? req.auth.id : (req.user?._id?.toString() || ''),
+      userRole: req.auth.role === 'doctor' ? 'doctor' : 'patient',
+      ...(req.query.patientId ? { patientId: String(req.query.patientId) } : { patientId: null })
+    };
+    const chat = await AIChat.findOne(filter).sort({ updatedAt: -1 }).lean();
+    if (!chat) return res.json({ success: true, messages: [], conversationId: null });
+    res.json({ success: true, messages: chat.messages || [], conversationId: chat._id });
+  } catch (error) {
+    console.error('Chat load error:', error);
+    res.status(500).json({ success: false, message: 'Failed to load chat' });
+  }
+});
+
+// Clear chat for current principal
+router.delete("/chat", auth, async (req, res) => {
+  try {
+    const filter = {
+      userId: req.auth.role === 'doctor' ? req.auth.id : (req.user?._id?.toString() || ''),
+      userRole: req.auth.role === 'doctor' ? 'doctor' : 'patient',
+      ...(req.query.patientId ? { patientId: String(req.query.patientId) } : { patientId: null })
+    };
+    await AIChat.deleteMany(filter);
+    res.json({ success: true, message: 'Chat cleared' });
+  } catch (error) {
+    console.error('Chat clear error:', error);
+    res.status(500).json({ success: false, message: 'Failed to clear chat' });
+  }
+});
+
 export default router;
+
+// Additional endpoint: analyze patient's documents and return extracted summaries
+// GET /api/ai/patient/:patientId/analyze
+router.get('/patient/:patientId/analyze', auth, async (req, res) => {
+  try {
+    const { patientId } = req.params;
+    // Doctor must specify a patient they have context for
+    if (req.auth?.role === 'doctor' && !patientId) {
+      return res.status(400).json({ success: false, message: 'patientId is required' });
+    }
+
+    // Fetch recent documents for the patient
+    const docs = await Document.find({ userId: String(patientId) }).sort({ uploadedAt: -1 }).limit(10);
+    if (!docs || docs.length === 0) {
+      return res.json({ success: true, summaries: [], count: 0 });
+    }
+
+    const bucketNameFallback = process.env.AWS_S3_BUCKET_NAME;
+    const results = [];
+    for (const doc of docs) {
+      if (!doc.s3Key) continue;
+      try {
+        const extraction = await documentReader.extractTextFromS3(doc.s3Key, doc.s3Bucket || bucketNameFallback);
+        results.push({
+          id: doc._id,
+          title: doc.title || doc.originalName,
+          type: doc.type || doc.category,
+          uploadedAt: doc.uploadedAt,
+          success: extraction.success,
+          textPreview: (extraction.text || '').slice(0, 800),
+          metadata: extraction.metadata || {},
+          wordCount: extraction.wordCount || 0
+        });
+      } catch (e) {
+        results.push({ id: doc._id, title: doc.title, type: doc.type, uploadedAt: doc.uploadedAt, success: false, error: e.message });
+      }
+    }
+
+    res.json({ success: true, summaries: results, count: results.length });
+  } catch (error) {
+    console.error('Patient analyze error:', error);
+    res.status(500).json({ success: false, message: 'Failed to analyze patient documents' });
+  }
+});
