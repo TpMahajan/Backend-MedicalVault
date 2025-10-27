@@ -169,12 +169,17 @@ const generateSystemPrompt = (user, documents, isDocumentQuery = false, language
   const userName = user.name || "User";
   const userRoleContext = userRole === 'doctor' ? 'medical professional' : 'patient';
   
-  const basePrompt = `You are an intelligent multilingual AI Assistant integrated into a medical vault mobile app. 
-You can understand and respond fluently in English, Hindi, Marathi, and Hinglish.
+  const basePrompt = `You are an intelligent multilingual AI Assistant integrated into a medical vault app.
+You can understand English, Hindi, Marathi, and Hinglish.
 You can read, analyze, and summarize documents (PDFs, images, text files).
 When asked for data insights, you can output structured data as JSON for tables or datasets for charts.
 Your responses must be accurate, concise, and contextually relevant.
 Do not hallucinate — only answer from provided document content.
+
+FORMATTING RULES:
+- Use plain text only. No markdown, no headings, no bold, no # or * characters.
+- Use simple hyphen bullets like "- item" for lists.
+- Keep responses short and scannable.
 
 User Context:
 - Name: ${userName}
@@ -258,11 +263,10 @@ TASK: List user's medical documents clearly and concisely.
 DOCUMENTS AVAILABLE:${documentList}
 
 RESPONSE FORMAT:
-- Start with "Hello ${userName}!" in ${language}
-- List documents by category with clear numbering
-- Mention document count per category
-- Keep response under 200 words
-- Be friendly and helpful
+- Do not use markdown.
+- Use plain text with hyphen bullets.
+- Mention document count per category.
+- Keep under 150 words.
 
 Do NOT analyze document content - just list what's available.`;
     }
@@ -276,7 +280,7 @@ Provide brief, helpful responses about:
 - General medical guidance
 - Document analysis and insights
 
-Keep responses concise (under 150 words). Be friendly and professional.`;
+Keep responses concise (under 150 words).`;
 };
 
 // POST /api/ai/ask - Main AI Assistant endpoint
@@ -624,7 +628,14 @@ router.post("/ask", auth, async (req, res) => {
       throw openaiError;
     }
 
-    const aiReply = openaiResponse.data.choices[0].message.content;
+    // Sanitize reply to plain text bullets
+    const rawReply = openaiResponse.data.choices[0].message.content || '';
+    let aiReply = rawReply
+      .replace(/[\*#`]+/g, '')            // remove markdown symbols
+      .replace(/^[\s\-\d\.]+\s*/gm, (m) => m.startsWith('-') ? m : `- `) // normalize leading markers to hyphen
+      .replace(/[\u2022\u25CF\u25A0]/g, '-') // convert bullet chars to hyphen
+      .replace(/[\t]+/g, ' ')             // tabs to spaces
+      .trim();
 
     // Parse response for structured data
     let responseType = "text";
