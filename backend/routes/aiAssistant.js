@@ -83,6 +83,114 @@ const generatePreviewUrls = (documents) => {
   }));
 };
 
+// Helper: parse natural-language date ranges like "past week", "last 7 days", "yesterday", or explicit ranges
+const parseDateRangeFromPrompt = (prompt) => {
+  const lower = (prompt || '').toLowerCase();
+  const now = new Date();
+
+  // Today
+  if (/(today|todays|for today)/i.test(lower)) {
+    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+    const end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+    return { start, end, label: 'today' };
+  }
+
+  // Yesterday
+  if (/(yesterday)/i.test(lower)) {
+    const y = new Date(now);
+    y.setDate(y.getDate() - 1);
+    const start = new Date(y.getFullYear(), y.getMonth(), y.getDate(), 0, 0, 0);
+    const end = new Date(y.getFullYear(), y.getMonth(), y.getDate(), 23, 59, 59, 999);
+    return { start, end, label: 'yesterday' };
+  }
+
+  // Past/Last N days
+  const lastNDaysMatch = lower.match(/(past|last)\s+(\d{1,3})\s*(day|days)/i);
+  if (lastNDaysMatch) {
+    const n = Math.min(parseInt(lastNDaysMatch[2], 10) || 0, 365);
+    const end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+    const start = new Date(end);
+    start.setDate(start.getDate() - n + 1);
+    return { start, end, label: `last_${n}_days` };
+  }
+
+  // Past week / last week / past 7 days
+  if (/(past\s+week|last\s+week|past\s*7\s*days)/i.test(lower)) {
+    const end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+    const start = new Date(end);
+    start.setDate(start.getDate() - 6);
+    return { start, end, label: 'last_7_days' };
+  }
+
+  // Past month / last 30 days
+  if (/(past\s+month|last\s+month|past\s*30\s*days)/i.test(lower)) {
+    const end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+    const start = new Date(end);
+    start.setDate(start.getDate() - 29);
+    return { start, end, label: 'last_30_days' };
+  }
+
+  // This month
+  if (/(this\s+month)/i.test(lower)) {
+    const start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+    const end = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+    return { start, end, label: 'this_month' };
+  }
+
+  // Explicit range: from/to or between X and Y (accepts yyyy-mm-dd or dd/mm/yyyy)
+  const dateTokenToDate = (s) => {
+    if (!s) return null;
+    // Normalize separators
+    const t = s.trim().replace(/\./g, '-').replace(/\//g, '-');
+    // yyyy-mm-dd
+    if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(t)) {
+      const [Y, M, D] = t.split('-').map(Number);
+      return new Date(Y, M - 1, D);
+    }
+    // dd-mm-yyyy
+    if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(t)) {
+      const [D, M, Y] = t.split('-').map(Number);
+      return new Date(Y, M - 1, D);
+    }
+    const d = new Date(t);
+    return isNaN(d.getTime()) ? null : d;
+  };
+
+  const betweenMatch = lower.match(/\b(between|from)\s+([\d.\/-]+)\s+(and|to)\s+([\d.\/-]+)/i);
+  if (betweenMatch) {
+    const d1 = dateTokenToDate(betweenMatch[2]);
+    const d2 = dateTokenToDate(betweenMatch[4]);
+    if (d1 && d2) {
+      const start = new Date(d1.getFullYear(), d1.getMonth(), d1.getDate(), 0, 0, 0, 0);
+      const end = new Date(d2.getFullYear(), d2.getMonth(), d2.getDate(), 23, 59, 59, 999);
+      return { start, end, label: 'custom_range' };
+    }
+  }
+
+  return null; // no explicit range
+};
+
+// Helper: build simple aggregations for charts/tables from documents
+const buildDocumentAggregations = (docs) => {
+  const byType = {};
+  const byDay = {};
+  for (const d of docs) {
+    const type = (d.type || d.category || 'Unknown');
+    byType[type] = (byType[type] || 0) + 1;
+    const dt = new Date(d.uploadedAt || d.date || Date.now());
+    const key = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+    byDay[key] = (byDay[key] || 0) + 1;
+  }
+  const typeLabels = Object.keys(byType);
+  const typeValues = typeLabels.map(k => byType[k]);
+  const dayLabels = Object.keys(byDay).sort();
+  const dayValues = dayLabels.map(k => byDay[k]);
+  return {
+    countsByType: { labels: typeLabels, values: typeValues },
+    countsByDay: { labels: dayLabels, values: dayValues }
+  };
+};
+
 // Helper: detect schedule/appointment related queries
 const isScheduleQuery = (prompt) => {
   const keywords = [
@@ -477,52 +585,47 @@ router.post("/ask", auth, async (req, res) => {
     } else if (isDocumentRequest) {
       // Fetch relevant documents based on query
       const lowerPrompt = prompt.toLowerCase();
+      const dateRange = parseDateRangeFromPrompt(lowerPrompt);
       // If doctor without patient context, skip fetching documents (no target)
       if (!targetUserId) {
         console.log("ℹ️ Document query received but no target patientId for doctor. Skipping document fetch.");
       } else {
       
+      const baseFilter = { userId: targetUserId };
+      if (dateRange) {
+        baseFilter.uploadedAt = { $gte: dateRange.start, $lte: dateRange.end };
+      }
+
       if (lowerPrompt.includes("report") || lowerPrompt.includes("this month") || lowerPrompt.includes("recent")) {
         const { startOfMonth, endOfMonth } = getCurrentMonthRange();
-        
-        if (lowerPrompt.includes("this month")) {
-          // Current month reports
-          documents = await Document.find({
-            userId: targetUserId,
-            type: "Report",
-            uploadedAt: { $gte: startOfMonth, $lte: endOfMonth }
-          }).sort({ uploadedAt: -1 });
-        } else {
-          // All reports
-          documents = await Document.find({
-            userId: targetUserId,
-            type: "Report"
-          }).sort({ uploadedAt: -1 });
+        const filter = { ...baseFilter, type: "Report" };
+        if (!dateRange && lowerPrompt.includes("this month")) {
+          filter.uploadedAt = { $gte: startOfMonth, $lte: endOfMonth };
         }
+        documents = await Document.find(filter).sort({ uploadedAt: -1 });
       } else if (lowerPrompt.includes("prescription")) {
-        documents = await Document.find({
-          userId: targetUserId,
-          type: "Prescription"
-        }).sort({ uploadedAt: -1 });
+        const filter = { ...baseFilter, type: "Prescription" };
+        documents = await Document.find(filter).sort({ uploadedAt: -1 });
       } else if (lowerPrompt.includes("bill")) {
-        documents = await Document.find({
-          userId: targetUserId,
-          type: "Bill"
-        }).sort({ uploadedAt: -1 });
+        const filter = { ...baseFilter, type: "Bill" };
+        documents = await Document.find(filter).sort({ uploadedAt: -1 });
       } else if (lowerPrompt.includes("insurance")) {
-        documents = await Document.find({
-          userId: targetUserId,
-          type: "Insurance"
-        }).sort({ uploadedAt: -1 });
+        const filter = { ...baseFilter, type: "Insurance" };
+        documents = await Document.find(filter).sort({ uploadedAt: -1 });
       } else {
-        // General document query - get all documents
-        documents = await Document.find({
-          userId: targetUserId
-        }).sort({ uploadedAt: -1 });
+        // General document query - get all documents (respect dateRange if any)
+        documents = await Document.find(baseFilter).sort({ uploadedAt: -1 });
       }
       }
       // Format documents for response with preview URLs
       documentData = generatePreviewUrls(formatDocumentsForAI(documents, "general"));
+      // If user asked for structured outputs, prepare simple aggregations for charts/tables
+      if (documents && documents.length > 0) {
+        const aggs = buildDocumentAggregations(documents);
+        // Attach aggregations so frontend can render charts even if LLM didn't return JSON
+        // We'll include these in the response later if needed
+        req._docAggregations = aggs;
+      }
     }
 
     // Optionally fetch today's appointments for doctor schedule queries
@@ -654,6 +757,15 @@ router.post("/ask", auth, async (req, res) => {
         // If JSON parsing fails, keep as text
         console.log("Could not parse structured data from AI response");
       }
+    }
+
+    // Fallback: if user seems to want structured data or asked about documents and we computed aggregations
+    if (!structuredData && (wantsStructured || isDocumentRequest) && req._docAggregations) {
+      // Prefer a chart showing counts by type, and a table of daily counts
+      responseType = wantsStructured ? 'chart' : 'table';
+      structuredData = wantsStructured
+        ? { title: 'Documents by Type', ...req._docAggregations.countsByType }
+        : { title: 'Documents per Day', rows: req._docAggregations.countsByDay.values.map((v, i) => [req._docAggregations.countsByDay.labels[i], v]), columns: ['Date', 'Count'] };
     }
 
     // Provide structured lists for schedule/patients when available
