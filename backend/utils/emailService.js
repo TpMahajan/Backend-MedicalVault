@@ -4,7 +4,7 @@ const resend = process.env.RESEND_API_KEY
   ? new Resend(process.env.RESEND_API_KEY)
   : null;
 
-const MAIL_FROM = process.env.MAIL_FROM || "no-reply@aiallyn.co";
+const MAIL_FROM = process.env.MAIL_FROM_RESEND || process.env.MAIL_FROM || "onboarding@resend.dev";
 const APP_BASE_URL = process.env.APP_BASE_URL || "https://backend-medicalvault.onrender.com";
 const APP_DEEP_LINK = process.env.APP_DEEP_LINK || "aially";
 
@@ -96,12 +96,15 @@ export const sendVerificationEmail = async (to, name, tokenId, token, code) => {
     </html>
   `;
 
+  const emailText = `AI Ally - Verify Your Email\n\nHello ${name},\n\nThank you for signing up for AI Ally!\n\nVerify via app link (if installed):\n${deepLink}\n\nOr open this fallback URL in your browser:\n${fallbackUrl}\n\nYour verification code (valid 30 minutes): ${code}\n\nIf you didn't create an account, you can ignore this message.`;
+
   try {
     const result = await resend.emails.send({
       from: MAIL_FROM,
       to: to,
       subject: "Verify Your AI Ally Email",
       html: emailHtml,
+      text: emailText,
     });
 
     console.log("✅ Verification email sent successfully:", { to, name });

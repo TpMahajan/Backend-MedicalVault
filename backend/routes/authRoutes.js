@@ -669,29 +669,38 @@ export default router;
 
 // ================= Password Reset (Patient) =================
 // Create email transporter with improved configuration
+const smtpPort = Number(process.env.SMTP_PORT || 587);
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || "smtp.gmail.com",
-  port: Number(process.env.SMTP_PORT || 587),
-  secure: false, // true for 465, false for other ports
+  port: smtpPort,
+  secure: smtpPort === 465, // true for 465, false for other ports
   auth: process.env.SMTP_USER && process.env.SMTP_PASS ? {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
   } : undefined,
   tls: {
+    ciphers: "TLSv1.2",
     rejectUnauthorized: false // Allow self-signed certificates in dev
-  }
+  },
+  connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 10000),
+  greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),
+  socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 20000)
 });
 
-// Verify transporter configuration on startup
+// Verify transporter configuration on startup (optional)
 if (process.env.SMTP_USER && process.env.SMTP_PASS) {
-  transporter.verify(function(error, success) {
-    if (error) {
-      console.error("❌ SMTP Configuration Error:", error);
-      console.error("Please check your SMTP credentials in db.env");
-    } else {
-      console.log("✅ SMTP Server is ready to send emails");
-    }
-  });
+  if (process.env.SMTP_VERIFY_ON_STARTUP === "true") {
+    transporter.verify(function(error, success) {
+      if (error) {
+        console.error("❌ SMTP Configuration Error:", error);
+        console.error("Please check your SMTP credentials in db.env");
+      } else {
+        console.log("✅ SMTP Server is ready to send emails");
+      }
+    });
+  } else {
+    console.warn("ℹ️  Skipping SMTP verification on startup (set SMTP_VERIFY_ON_STARTUP=true to enable)");
+  }
 } else {
   console.warn("⚠️  SMTP credentials not configured. Password reset emails will not be sent.");
   console.warn("Please add SMTP_USER and SMTP_PASS to your db.env file.");
@@ -738,7 +747,7 @@ router.post("/forgot-password", async (req, res) => {
     try {
       if (transporter.options.auth) {
         await transporter.sendMail({
-          from: process.env.MAIL_FROM || process.env.SMTP_USER || "no-reply@medicalvault.app",
+          from: process.env.MAIL_FROM_SMTP || process.env.MAIL_FROM || process.env.SMTP_USER || "no-reply@medicalvault.app",
           to: user.email,
           subject: "🔐 Reset Your HealthVault Password",
           html: `
