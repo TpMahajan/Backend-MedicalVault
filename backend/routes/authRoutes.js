@@ -9,7 +9,7 @@ import nodemailer from "nodemailer";
 import { OAuth2Client } from 'google-auth-library';
 import crypto from "crypto";
 import { EmailVerify } from "../models/EmailVerify.js";
-import { sendVerificationEmail } from "../utils/emailService.js";
+import { sendVerificationEmail, sendPasswordResetEmail } from "../utils/emailService.js";
 
 const router = express.Router();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -718,14 +718,7 @@ router.post("/forgot-password", async (req, res) => {
       return res.json({ success: true, message: "If your email exists, a reset link has been sent." });
     }
 
-    // Check if email is verified (unless Google user)
-    if (!user.googleId && !user.emailVerified) {
-      console.log("❌ Password reset blocked - email not verified:", { userId: user._id, email: user.email });
-      return res.status(403).json({ 
-        success: false, 
-        message: "Please verify your email first before resetting your password." 
-      });
-    }
+    // Allow password reset regardless of emailVerified status
 
     const expiresInMinutes = Number(process.env.RESET_TOKEN_EXPIRES_MIN || 30);
     const resetToken = jwt.sign(
@@ -742,10 +735,13 @@ router.post("/forgot-password", async (req, res) => {
     const appBaseUrl = process.env.APP_BASE_URL || "https://backend-medicalvault.onrender.com";
     const resetLink = `${appBaseUrl}/reset-password?token=${encodeURIComponent(resetToken)}`;
 
-    // Send email
+    // Send email using Resend (preferred) or SMTP fallback
     let emailSent = false;
     try {
-      if (transporter.options.auth) {
+      if (process.env.RESEND_API_KEY) {
+        await sendPasswordResetEmail(user.email, user.name, resetLink, expiresInMinutes);
+        emailSent = true;
+      } else if (transporter.options.auth) {
         await transporter.sendMail({
           from: process.env.MAIL_FROM_SMTP || process.env.MAIL_FROM || process.env.SMTP_USER || "no-reply@medicalvault.app",
           to: user.email,
@@ -778,23 +774,17 @@ router.post("/forgot-password", async (req, res) => {
         emailSent = true;
         console.log(`✅ Password reset email sent to: ${user.email}`);
       } else {
-        console.error("❌ SMTP not configured - cannot send password reset email");
+        console.error("❌ No email provider configured for password reset");
       }
     } catch (mailErr) {
       console.error("❌ Email send failed:", mailErr.message);
       console.error("Full error:", mailErr);
-      // Return error to user if email fails
-      return res.status(500).json({ 
-        success: false, 
-        message: "Failed to send password reset email. Please contact support or try again later." 
-      });
+      // Do not leak provider errors to client; return generic success to prevent enumeration
     }
 
     if (!emailSent) {
-      return res.status(500).json({ 
-        success: false, 
-        message: "Email service not configured. Please contact support." 
-      });
+      // Soft-success: To avoid revealing email service status, respond generically
+      return res.json({ success: true, message: "If your email exists, a reset link has been sent." });
     }
 
     res.json({ 

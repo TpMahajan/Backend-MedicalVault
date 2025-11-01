@@ -107,12 +107,53 @@ export const sendVerificationEmail = async (to, name, tokenId, token, code) => {
       text: emailText,
     });
 
-    console.log("✅ Verification email sent successfully:", { to, name });
+    console.log("✅ Verification email sent successfully:", { to, name, id: result?.id });
     return result;
   } catch (error) {
     console.error("❌ Failed to send verification email:", error);
     throw error;
   }
+};
+
+/**
+ * Send password reset email via Resend
+ */
+export const sendPasswordResetEmail = async (to, name, resetLink, expiresInMinutes) => {
+  if (!resend) {
+    throw new Error("Email service not configured");
+  }
+
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <body style="font-family: Arial, sans-serif; background:#f6f6f6; padding:20px;">
+      <div style="max-width:600px;margin:0 auto;background:#ffffff;padding:24px;border-radius:8px;">
+        <h2 style="color:#4A90E2;">Reset Your Password</h2>
+        <p>Hello ${name || "there"},</p>
+        <p>Click the button below to set a new password (valid for ${expiresInMinutes} minutes):</p>
+        <p style="text-align:center; margin:28px 0;">
+          <a href="${resetLink}" style="background:#4A90E2;color:#fff;padding:12px 24px;border-radius:6px;text-decoration:none;display:inline-block;">Reset Password</a>
+        </p>
+        <p>If the button doesn't work, copy this link into your browser:<br>
+          <a href="${resetLink}">${resetLink}</a>
+        </p>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const text = `Hello ${name || "there"},\n\nReset your password using this link (valid for ${expiresInMinutes} minutes):\n${resetLink}`;
+
+  const result = await resend.emails.send({
+    from: MAIL_FROM,
+    to,
+    subject: "Reset Your HealthVault Password",
+    html: html,
+    text: text,
+  });
+
+  console.log("✅ Password reset email sent:", { to, id: result?.id });
+  return result;
 };
 
 /**
