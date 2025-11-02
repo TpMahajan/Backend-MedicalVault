@@ -25,6 +25,7 @@ import sessionRoutes from "./routes/sessionRoutes.js";  // session requests
 import notificationRoutes from "./routes/notifications.js"; // notifications
 import profileRoutes from "./routes/profiles.js";       // profile switching
 import aiAssistantRoutes from "./routes/aiAssistant.js"; // AI assistant ✅
+import { checkEmailConfig } from "./utils/emailService.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -92,6 +93,8 @@ app.get("/health", (req, res) =>
 const startServer = async () => {
   try {
     await connectDB();
+    // Log email configuration readiness at startup
+    checkEmailConfig();
     
     // Initialize cron jobs for reminders
     const { initializeCronJobs } = await import('./services/cronService.js');

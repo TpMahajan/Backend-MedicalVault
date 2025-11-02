@@ -1,4 +1,5 @@
 import { Resend } from "resend";
+import nodemailer from "nodemailer";
 
 const resend = process.env.RESEND_API_KEY
   ? new Resend(process.env.RESEND_API_KEY)
@@ -12,6 +13,24 @@ const APP_BASE_URL = process.env.APP_BASE_URL || "https://backend-medicalvault.o
 const APP_WEB_URL = process.env.FRONTEND_URL || process.env.APP_WEB_URL || "https://health-vault-web.vercel.app";
 const APP_DEEP_LINK = process.env.APP_DEEP_LINK || "aially";
 
+// Optional SMTP fallback (Gmail 465/587)
+const smtpPort = Number(process.env.SMTP_PORT || 587);
+const smtpTransporter = (process.env.SMTP_USER && process.env.SMTP_PASS)
+  ? nodemailer.createTransport({
+      host: process.env.SMTP_HOST || "smtp.gmail.com",
+      port: smtpPort,
+      secure: smtpPort === 465,
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+      },
+      tls: { ciphers: "TLSv1.2", rejectUnauthorized: false },
+      connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 10000),
+      greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),
+      socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 20000),
+    })
+  : null;
+
 /**
  * Send email verification email with deep link and code
  * @param {string} to - Email address
@@ -21,10 +40,6 @@ const APP_DEEP_LINK = process.env.APP_DEEP_LINK || "aially";
  * @param {string} code - 6-digit verification code
  */
 export const sendVerificationEmail = async (to, name, tokenId, token, code) => {
-  if (!resend) {
-    console.error("❌ Resend API key not configured");
-    throw new Error("Email service not configured");
-  }
 
   const deepLink = `${APP_DEEP_LINK}://verify?token=${tokenId}.${token}`;
   const fallbackUrl = `${APP_WEB_URL}/verify-email?token=${tokenId}.${token}`;
@@ -102,21 +117,38 @@ export const sendVerificationEmail = async (to, name, tokenId, token, code) => {
 
   const emailText = `AI Ally - Verify Your Email\n\nHello ${name},\n\nThank you for signing up for AI Ally!\n\nVerify via app link (if installed):\n${deepLink}\n\nOr open this fallback URL in your browser:\n${fallbackUrl}\n\nYour verification code (valid 30 minutes): ${code}\n\nIf you didn't create an account, you can ignore this message.`;
 
-  const { data, error } = await resend.emails.send({
-    from: MAIL_FROM_RESEND,
-    to: to,
-    subject: "Verify Your AI Ally Email",
-    html: emailHtml,
-    text: emailText,
-  });
-
-  if (error) {
-    console.error("❌ Failed to send verification email via Resend:", error);
-    throw error;
+  // Try Resend first if configured
+  if (resend) {
+    const { data, error } = await resend.emails.send({
+      from: MAIL_FROM_RESEND,
+      to: to,
+      subject: "Verify Your AI Ally Email",
+      html: emailHtml,
+      text: emailText,
+    });
+    if (!error && data?.id) {
+      console.log("✅ Verification email via Resend:", { to, name, id: data.id, from: MAIL_FROM_RESEND });
+      return data;
+    }
+    console.error("❌ Resend send failed:", error || { reason: "no data.id returned" });
+  } else {
+    console.warn("ℹ️ Resend not configured; attempting SMTP fallback");
   }
 
-  console.log("✅ Verification email sent successfully:", { to, name, id: data?.id, from: MAIL_FROM_RESEND });
-  return data;
+  // SMTP fallback
+  if (smtpTransporter) {
+    const info = await smtpTransporter.sendMail({
+      from: process.env.MAIL_FROM_SMTP || MAIL_FROM,
+      to,
+      subject: "Verify Your AI Ally Email",
+      html: emailHtml,
+      text: emailText,
+    });
+    console.log("✅ Verification email via SMTP:", { to, messageId: info?.messageId });
+    return { id: info?.messageId };
+  }
+
+  throw new Error("No email provider available for verification emails");
 };
 
 /**
