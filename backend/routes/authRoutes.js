@@ -1,6 +1,7 @@
 import express from "express";
 import jwt from "jsonwebtoken";
 import { User } from "../models/User.js";
+import rateLimit from "express-rate-limit";
 import { auth } from "../middleware/auth.js";
 import { getMe, updateMe } from "../controllers/authController.js";
 import { DoctorUser } from "../models/DoctorUser.js";  // doctor model
@@ -13,6 +14,21 @@ import { sendVerificationEmail, sendPasswordResetEmail } from "../utils/emailSer
 
 const router = express.Router();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+// Rate limiters for email-related endpoints (must be defined before routes)
+const emailLimiter = rateLimit({
+  windowMs: Number(process.env.EMAIL_LIMIT_WINDOW_MS || 15 * 60 * 1000),
+  max: Number(process.env.EMAIL_LIMIT_MAX || 5),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const codeLimiter = rateLimit({
+  windowMs: Number(process.env.CODE_LIMIT_WINDOW_MS || 15 * 60 * 1000),
+  max: Number(process.env.CODE_LIMIT_MAX || 10),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // ================= Patient Signup =================
 router.post("/signup", async (req, res) => {
@@ -477,7 +493,7 @@ router.post("/verify", async (req, res) => {
 });
 
 // POST /auth/verify-code - Verify email with code
-router.post("/verify-code", async (req, res) => {
+router.post("/verify-code", codeLimiter, async (req, res) => {
   try {
     const { email, code } = req.body;
     if (!email || !code) {
@@ -537,7 +553,7 @@ router.post("/verify-code", async (req, res) => {
 });
 
 // POST /auth/resend-verification - Resend verification email
-router.post("/resend-verification", async (req, res) => {
+router.post("/resend-verification", emailLimiter, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) {
@@ -707,7 +723,7 @@ if (process.env.SMTP_USER && process.env.SMTP_PASS) {
 }
 
 // POST /auth/forgot-password
-router.post("/forgot-password", async (req, res) => {
+router.post("/forgot-password", emailLimiter, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ success: false, message: "Email is required" });
@@ -732,8 +748,8 @@ router.post("/forgot-password", async (req, res) => {
     user.resetTokenExpiry = expiryDate;
     await user.save();
 
-    const appBaseUrl = process.env.APP_BASE_URL || "https://backend-medicalvault.onrender.com";
-    const resetLink = `${appBaseUrl}/reset-password?token=${encodeURIComponent(resetToken)}`;
+    const frontendUrl = process.env.FRONTEND_URL || process.env.APP_WEB_URL || "https://health-vault-web.vercel.app";
+    const resetLink = `${frontendUrl}/reset-password?token=${encodeURIComponent(resetToken)}`;
 
     // Send email using Resend (preferred) or SMTP fallback
     let emailSent = false;

@@ -6,6 +6,7 @@ const resend = process.env.RESEND_API_KEY
 
 const MAIL_FROM = process.env.MAIL_FROM_RESEND || process.env.MAIL_FROM || "onboarding@resend.dev";
 const APP_BASE_URL = process.env.APP_BASE_URL || "https://backend-medicalvault.onrender.com";
+const APP_WEB_URL = process.env.FRONTEND_URL || process.env.APP_WEB_URL || "https://health-vault-web.vercel.app";
 const APP_DEEP_LINK = process.env.APP_DEEP_LINK || "aially";
 
 /**
@@ -23,7 +24,7 @@ export const sendVerificationEmail = async (to, name, tokenId, token, code) => {
   }
 
   const deepLink = `${APP_DEEP_LINK}://verify?token=${tokenId}.${token}`;
-  const fallbackUrl = `${APP_BASE_URL}/verify?token=${tokenId}.${token}`;
+  const fallbackUrl = `${APP_WEB_URL}/verify-email?token=${tokenId}.${token}`;
 
   const emailHtml = `
     <!DOCTYPE html>
@@ -185,6 +186,7 @@ export const checkEmailConfig = () => {
     hasApiKey: !!process.env.RESEND_API_KEY,
     mailFrom: MAIL_FROM,
     appBaseUrl: APP_BASE_URL,
+    appWebUrl: APP_WEB_URL,
     appDeepLink: APP_DEEP_LINK,
   });
 
