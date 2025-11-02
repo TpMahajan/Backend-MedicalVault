@@ -4,7 +4,10 @@ const resend = process.env.RESEND_API_KEY
   ? new Resend(process.env.RESEND_API_KEY)
   : null;
 
-const MAIL_FROM = process.env.MAIL_FROM_RESEND || process.env.MAIL_FROM || "onboarding@resend.dev";
+// Use a Resend-verified sender for Resend API. Do NOT default to MAIL_FROM (SMTP) here.
+const MAIL_FROM_RESEND = process.env.MAIL_FROM_RESEND || "onboarding@resend.dev";
+// SMTP or generic mail-from (used by nodemailer paths elsewhere)
+const MAIL_FROM = process.env.MAIL_FROM || process.env.SMTP_USER || "no-reply@medicalvault.app";
 const APP_BASE_URL = process.env.APP_BASE_URL || "https://backend-medicalvault.onrender.com";
 const APP_WEB_URL = process.env.FRONTEND_URL || process.env.APP_WEB_URL || "https://health-vault-web.vercel.app";
 const APP_DEEP_LINK = process.env.APP_DEEP_LINK || "aially";
@@ -99,21 +102,21 @@ export const sendVerificationEmail = async (to, name, tokenId, token, code) => {
 
   const emailText = `AI Ally - Verify Your Email\n\nHello ${name},\n\nThank you for signing up for AI Ally!\n\nVerify via app link (if installed):\n${deepLink}\n\nOr open this fallback URL in your browser:\n${fallbackUrl}\n\nYour verification code (valid 30 minutes): ${code}\n\nIf you didn't create an account, you can ignore this message.`;
 
-  try {
-    const result = await resend.emails.send({
-      from: MAIL_FROM,
-      to: to,
-      subject: "Verify Your AI Ally Email",
-      html: emailHtml,
-      text: emailText,
-    });
+  const { data, error } = await resend.emails.send({
+    from: MAIL_FROM_RESEND,
+    to: to,
+    subject: "Verify Your AI Ally Email",
+    html: emailHtml,
+    text: emailText,
+  });
 
-    console.log("✅ Verification email sent successfully:", { to, name, id: result?.id });
-    return result;
-  } catch (error) {
-    console.error("❌ Failed to send verification email:", error);
+  if (error) {
+    console.error("❌ Failed to send verification email via Resend:", error);
     throw error;
   }
+
+  console.log("✅ Verification email sent successfully:", { to, name, id: data?.id, from: MAIL_FROM_RESEND });
+  return data;
 };
 
 /**
@@ -145,16 +148,21 @@ export const sendPasswordResetEmail = async (to, name, resetLink, expiresInMinut
 
   const text = `Hello ${name || "there"},\n\nReset your password using this link (valid for ${expiresInMinutes} minutes):\n${resetLink}`;
 
-  const result = await resend.emails.send({
-    from: MAIL_FROM,
+  const { data, error } = await resend.emails.send({
+    from: MAIL_FROM_RESEND,
     to,
     subject: "Reset Your HealthVault Password",
     html: html,
     text: text,
   });
 
-  console.log("✅ Password reset email sent:", { to, id: result?.id });
-  return result;
+  if (error) {
+    console.error("❌ Failed to send password reset email via Resend:", error);
+    throw error;
+  }
+
+  console.log("✅ Password reset email sent:", { to, id: data?.id, from: MAIL_FROM_RESEND });
+  return data;
 };
 
 /**
@@ -184,7 +192,8 @@ export const checkEmailConfig = () => {
 
   console.log("✅ Email service configured:", {
     hasApiKey: !!process.env.RESEND_API_KEY,
-    mailFrom: MAIL_FROM,
+    mailFromResend: MAIL_FROM_RESEND,
+    mailFromSmtp: MAIL_FROM,
     appBaseUrl: APP_BASE_URL,
     appWebUrl: APP_WEB_URL,
     appDeepLink: APP_DEEP_LINK,

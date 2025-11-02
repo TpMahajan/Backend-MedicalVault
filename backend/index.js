@@ -31,6 +31,8 @@ const PORT = process.env.PORT || 5000;
 const ENV = process.env.NODE_ENV || "development";
 
 // -------------------- Middleware --------------------
+// Behind Render/Proxies: trust first proxy so rate limiter and IPs work
+app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS || 1));
 app.use(
   helmet({
     contentSecurityPolicy: false,
