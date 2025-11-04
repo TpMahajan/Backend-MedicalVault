@@ -10,13 +10,14 @@ router.post("/", auth, async (req, res) => {
     const role = req.auth?.role || "patient";
     const patientId = role === "patient" ? (req.user?._id || req.user?.id) : undefined;
 
-    const { profileId, name, age, location } = req.body || {};
+    const { profileId, name, age, location, mobile } = req.body || {};
 
     const sos = await SOS.create({
       patientId,
       profileId: profileId?.toString?.() ?? profileId ?? "",
       name: name ?? "",
       age: age?.toString?.() ?? age ?? "",
+      mobile: (mobile ?? (role === 'patient' ? (req.user?.mobile || '') : ''))?.toString?.() ?? '',
       location: location ?? "",
       submittedByRole: role,
     });
@@ -43,5 +44,19 @@ router.get("/", optionalAuth, async (req, res) => {
 });
 
 export default router;
+
+// Delete/clear an SOS item (temporary open access; secure later)
+router.delete("/:id", optionalAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ success: false, message: "Missing id" });
+    const result = await SOS.findByIdAndDelete(id);
+    if (!result) return res.status(404).json({ success: false, message: "Not found" });
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("SOS delete error:", e);
+    return res.status(500).json({ success: false, message: "Failed to delete" });
+  }
+});
 
 

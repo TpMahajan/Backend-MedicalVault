@@ -73,18 +73,16 @@ export const getUserProfile = async (req, res) => {
     const hasActiveSession = isDoctor && !!req.session;
     const mode = isAnonymous ? "anonymous" : isSelf ? "patient" : isDoctor ? "doctor" : "anonymous";
     
-    let selectFields = 'name profilePicture createdAt'; // Default limited fields
-    
+    let selectFields;
     if (hasActiveSession || isSelf) {
-      // Doctor with active session or patient viewing own profile => full data
-      selectFields = '-password'; // All fields except password
+      // Doctor with active session or the patient themself
+      selectFields = '-password';
       console.log('🔐 Returning full patient data (mode:', mode, 'isSelf:', isSelf, 'hasActiveSession:', hasActiveSession, ')');
-    } else if (isAnonymous) {
-      // Anonymous users can see essential demographics plus meds/history for read-only review
-      selectFields = 'name profilePicture age gender dateOfBirth bloodType height weight email mobile createdAt medications medicalHistory';
-      console.log('👻 Returning anonymous patient data (mode:', mode, ')');
     } else {
-      console.log('👤 Returning limited public profile data (mode:', mode, ')');
+      // For all other viewers (including another logged-in patient), return essential demographics
+      // This includes mobile to support SOS contact; tighten later with proper admin/doctor roles
+      selectFields = 'name profilePicture age gender dateOfBirth bloodType height weight email mobile createdAt';
+      console.log('👤 Returning essential demographics (mode:', mode, ')');
     }
 
     const user = await User.findById(req.params.id)

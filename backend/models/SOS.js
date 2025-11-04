@@ -6,6 +6,7 @@ const SOSSchema = new mongoose.Schema(
     profileId: { type: String },
     name: { type: String },
     age: { type: String },
+    mobile: { type: String },
     location: { type: String },
     submittedByRole: { type: String, enum: ["patient", "doctor", "anonymous"], default: "patient" },
   },
