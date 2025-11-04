@@ -25,6 +25,7 @@ import sessionRoutes from "./routes/sessionRoutes.js";  // session requests
 import notificationRoutes from "./routes/notifications.js"; // notifications
 import profileRoutes from "./routes/profiles.js";       // profile switching
 import aiAssistantRoutes from "./routes/aiAssistant.js"; // AI assistant ✅
+import sosRoutes from "./routes/sosRoutes.js";          // SOS messages
 import { checkEmailConfig } from "./utils/emailService.js";
 
 const app = express();
@@ -67,6 +68,7 @@ app.use("/api/sessions", sessionRoutes);      // session requests
 app.use("/api/notifications", notificationRoutes); // notifications
 app.use("/api/profiles", profileRoutes);      // profile switching
 app.use("/api/ai", aiAssistantRoutes);        // AI assistant ✅
+app.use("/api/sos", sosRoutes);               // SOS
 
 // -------------------- Health Check --------------------
 app.get("/health", (req, res) =>
