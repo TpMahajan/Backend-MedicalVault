@@ -34,7 +34,9 @@ router.post("/generate", auth, async (req, res) => {
     // Generate short-lived anonymous-access JWT (15 minutes)
     const payload = {
       userId: req.user._id.toString(),
+      uid: req.user._id.toString(), // provide both for backward/forward compatibility
       role: "anonymous",
+      typ: "vault_share",
     };
 
     const token = jwt.sign(payload, process.env.JWT_SECRET, {
@@ -87,7 +89,8 @@ router.get("/resolve/:token", async (req, res) => {
 
     // Fetch user's grouped documents
     const { Document } = await import("../models/File.js");
-    const docs = await Document.find({ patientId: decoded.uid });
+    const targetUid = decoded.uid || decoded.userId;
+    const docs = await Document.find({ patientId: targetUid });
 
     const grouped = {
       reports: docs.filter(d => d.type?.toLowerCase() === "lab report" || d.type?.toLowerCase() === "imaging"),
@@ -101,7 +104,7 @@ router.get("/resolve/:token", async (req, res) => {
 
     return res.json({
       success: true,
-      patientId: decoded.uid,
+      patientId: targetUid,
       counts: Object.fromEntries(Object.entries(grouped).map(([k, v]) => [k, v.length])),
       records: grouped,
     });
@@ -135,7 +138,8 @@ router.get("/preview", async (req, res) => {
     }
 
     // Fetch full patient profile
-    const user = await User.findById(decoded.uid).select(
+    const targetUid = decoded.uid || decoded.userId;
+    const user = await User.findById(targetUid).select(
       "name email profilePicture age gender dateOfBirth bloodType height weight lastVisit nextAppointment emergencyContact medicalHistory medications medicalRecords"
     );
 
@@ -151,6 +155,102 @@ router.get("/preview", async (req, res) => {
     return res
       .status(400)
       .json({ ok: false, msg: "Invalid/expired token", error: e.message });
+  }
+});
+
+/**
+ * GET /api/qr/validate?token=...
+ * Public (no auth): returns { valid: boolean, expiresAt?, patientId? }
+ */
+router.get("/validate", async (req, res) => {
+  try {
+    const { token } = req.query;
+    if (!token) return res.json({ valid: false, reason: "missing_token" });
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch (e) {
+      return res.json({ valid: false, reason: "jwt_invalid_or_expired" });
+    }
+
+    const qrDoc = await QRCode.findOne({ token, status: "active" });
+    if (!qrDoc) {
+      return res.json({ valid: false, reason: "not_active" });
+    }
+
+    return res.json({
+      valid: true,
+      expiresAt: decoded.exp ? decoded.exp * 1000 : qrDoc.expiresAt,
+      patientId: decoded.uid || decoded.userId,
+    });
+  } catch (e) {
+    return res.json({ valid: false, reason: "error", error: e.message });
+  }
+});
+
+/**
+ * POST /api/qr/invalidate
+ * Auth: patient. Expires all active QR codes for this patient immediately.
+ */
+router.post("/invalidate", auth, async (req, res) => {
+  try {
+    const result = await QRCode.updateMany(
+      { patientId: req.user._id, status: "active" },
+      { status: "expired" }
+    );
+    return res.json({ ok: true, expired: result.modifiedCount || 0 });
+  } catch (e) {
+    return res.status(500).json({ ok: false, msg: "Failed to invalidate", error: e.message });
+  }
+});
+
+/**
+ * POST /api/qr/expire-all
+ * Alias of /invalidate
+ */
+router.post("/expire-all", auth, async (req, res) => {
+  try {
+    const result = await QRCode.updateMany(
+      { patientId: req.user._id, status: "active" },
+      { status: "expired" }
+    );
+    return res.json({ ok: true, expired: result.modifiedCount || 0 });
+  } catch (e) {
+    return res.status(500).json({ ok: false, msg: "Failed to expire-all", error: e.message });
+  }
+});
+
+/**
+ * POST /api/qr/rotate
+ * Auth: patient. Expires old and creates a new QR (same as generate).
+ */
+router.post("/rotate", auth, async (req, res) => {
+  try {
+    // expire current actives
+    await QRCode.updateMany({ patientId: req.user._id, status: "active" }, { status: "expired" });
+
+    const payload = {
+      userId: req.user._id.toString(),
+      uid: req.user._id.toString(),
+      role: "anonymous",
+      typ: "vault_share",
+    };
+
+    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: "15m" });
+
+    const qrDoc = await QRCode.create({
+      patientId: req.user._id,
+      token,
+      expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+      status: "active",
+    });
+
+    const qrUrl = `https://health-vault-web.vercel.app/patient-details/${req.user._id.toString()}?token=${encodeURIComponent(token)}`;
+
+    return res.json({ ok: true, token, qrUrl, expiresAt: qrDoc.expiresAt });
+  } catch (e) {
+    return res.status(500).json({ ok: false, msg: "QR rotate failed", error: e.message });
   }
 });
 
