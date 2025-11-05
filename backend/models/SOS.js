@@ -9,6 +9,7 @@ const SOSSchema = new mongoose.Schema(
     mobile: { type: String },
     location: { type: String },
     submittedByRole: { type: String, enum: ["patient", "doctor", "anonymous"], default: "patient" },
+    isRead: { type: Boolean, default: false },
   },
   { timestamps: true }
 );

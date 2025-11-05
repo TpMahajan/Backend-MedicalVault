@@ -35,11 +35,26 @@ router.get("/", optionalAuth, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);
     const skip = Math.max(parseInt(req.query.skip || "0", 10), 0);
-    const items = await SOS.find({}).sort({ createdAt: 1 }).skip(skip).limit(limit).lean();
+    const unreadOnly = String(req.query.unread || "false").toLowerCase() === 'true';
+    const filter = unreadOnly ? { isRead: { $ne: true } } : {};
+    const items = await SOS.find(filter).sort({ createdAt: 1 }).skip(skip).limit(limit).lean();
     return res.json({ success: true, data: items });
   } catch (e) {
     console.error("SOS list error:", e);
     return res.status(500).json({ success: false, message: "Failed to fetch SOS" });
+  }
+});
+
+// Mark a batch of SOS messages as read
+router.post("/mark-read", optionalAuth, async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    if (!ids.length) return res.status(400).json({ success: false, message: "ids array is required" });
+    await SOS.updateMany({ _id: { $in: ids } }, { $set: { isRead: true } });
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("SOS mark-read error:", e);
+    return res.status(500).json({ success: false, message: "Failed to mark as read" });
   }
 });
 
