@@ -5,11 +5,14 @@ import { User } from "../models/User.js";
 // @access  Private
 export const updateProfile = async (req, res) => {
   try {
-    const { name, profilePicture } = req.body;
+    const { name, profilePicture, allergies } = req.body;
     const updateData = {};
 
     if (name !== undefined) updateData.name = name;
     if (profilePicture !== undefined) updateData.profilePicture = profilePicture;
+    if (allergies !== undefined) {
+      updateData.allergies = typeof allergies === "string" ? allergies : "";
+    }
 
     const user = await User.findByIdAndUpdate(
       req.user._id,

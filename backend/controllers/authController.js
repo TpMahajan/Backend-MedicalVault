@@ -186,6 +186,7 @@ export const updateMe = async (req, res) => {
       "medications",
       "medicalRecords",
       "profilePicture",
+      "allergies",
       "fcmToken"
     ];
 
@@ -228,6 +229,7 @@ export const updateMe = async (req, res) => {
         medications: user.medications,
         medicalRecords: user.medicalRecords,
         profilePicture: user.profilePicture,
+        allergies: user.allergies,
       },
     });
   } catch (error) {

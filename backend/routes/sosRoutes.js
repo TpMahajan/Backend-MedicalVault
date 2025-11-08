@@ -1,31 +1,164 @@
 import express from "express";
 import { auth, optionalAuth } from "../middleware/auth.js";
 import SOS from "../models/SOS.js";
+import { User } from "../models/User.js";
+import { SosEvent } from "../models/SosEvent.js";
+import { MassIncident } from "../models/MassIncident.js";
 
 const router = express.Router();
+
+// Mass crowd SOS detection thresholds (Meters + Minutes)
+const MASS_WINDOW_MINUTES = 10; // time window to consider for clustering
+const MASS_RADIUS_METERS = 15; // radius within which events are considered part of the same cluster
+const MASS_THRESHOLD = 8; // minimum SOS events required to trigger a mass incident
 
 // Create SOS message (patient/doctor)
 router.post("/", auth, async (req, res) => {
   try {
-    const role = req.auth?.role || "patient";
-    const patientId = role === "patient" ? (req.user?._id || req.user?.id) : undefined;
+    const { latitude, longitude } = req.body || {};
+    const hasGeoPayload =
+      latitude !== undefined &&
+      longitude !== undefined &&
+      Number.isFinite(Number(latitude)) &&
+      Number.isFinite(Number(longitude));
 
-    const { profileId, name, age, location, mobile } = req.body || {};
+    // Legacy fallback for older clients that still POST profile/name/location strings
+    if (!hasGeoPayload) {
+      const role = req.auth?.role || "patient";
+      const patientId =
+        role === "patient" ? (req.user?._id || req.user?.id) : undefined;
+      const { profileId, name, age, location, mobile } = req.body || {};
 
-    const sos = await SOS.create({
-      patientId,
-      profileId: profileId?.toString?.() ?? profileId ?? "",
-      name: name ?? "",
-      age: age?.toString?.() ?? age ?? "",
-      mobile: (mobile ?? (role === 'patient' ? (req.user?.mobile || '') : ''))?.toString?.() ?? '',
-      location: location ?? "",
-      submittedByRole: role,
+      const legacySos = await SOS.create({
+        patientId,
+        profileId: profileId?.toString?.() ?? profileId ?? "",
+        name: name ?? "",
+        age: age?.toString?.() ?? age ?? "",
+        mobile:
+          (mobile ?? (role === "patient" ? req.user?.mobile || "" : ""))?.toString?.() ??
+          "",
+        location: location ?? "",
+        submittedByRole: role,
+      });
+
+      return res.status(201).json({
+        success: true,
+        data: legacySos,
+        massIncidentTriggered: false,
+        massIncidentId: null,
+      });
+    }
+
+    const lng = Number(longitude);
+    const lat = Number(latitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({
+        success: false,
+        message: "Latitude and longitude must be valid numbers.",
+      });
+    }
+
+    const accuracyMeters =
+      req.body.accuracyMeters !== undefined
+        ? Number(req.body.accuracyMeters)
+        : undefined;
+    const notes =
+      typeof req.body.notes === "string" ? req.body.notes.trim() : undefined;
+    const source =
+      typeof req.body.source === "string" ? req.body.source : "patient_app";
+
+    const userId = req.user?._id || req.user?.id || req.auth?.id;
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "Unable to resolve user for SOS request.",
+      });
+    }
+
+    const userProfile = await User.findById(userId).select("allergies");
+    const allergiesSnapshot =
+      userProfile?.allergies?.trim?.() || userProfile?.allergies || "";
+
+    const sosEvent = await SosEvent.create({
+      userId,
+      source,
+      location: {
+        type: "Point",
+        coordinates: [lng, lat],
+      },
+      accuracyMeters: Number.isFinite(accuracyMeters) ? accuracyMeters : undefined,
+      allergiesSnapshot,
+      severity: "red",
+      notes,
     });
 
-    return res.status(201).json({ success: true, data: sos });
+    const now = new Date();
+    const since = new Date(now.getTime() - MASS_WINDOW_MINUTES * 60 * 1000);
+
+    const sosNearby = await SosEvent.find({
+      location: {
+        $near: {
+          $geometry: { type: "Point", coordinates: [lng, lat] },
+          $maxDistance: MASS_RADIUS_METERS,
+        },
+      },
+      createdAt: { $gte: since },
+    });
+
+    let incident = null;
+
+    if (sosNearby.length >= MASS_THRESHOLD) {
+      incident = await MassIncident.findOne({
+        status: "active",
+        center: {
+          $near: {
+            $geometry: { type: "Point", coordinates: [lng, lat] },
+            $maxDistance: MASS_RADIUS_METERS,
+          },
+        },
+      });
+
+      if (!incident) {
+        const firstCreatedAt = sosNearby.reduce(
+          (earliest, event) =>
+            event.createdAt < earliest ? event.createdAt : earliest,
+          sosNearby[0].createdAt
+        );
+
+        incident = await MassIncident.create({
+          center: { type: "Point", coordinates: [lng, lat] },
+          radiusMeters: MASS_RADIUS_METERS,
+          sosCount: sosNearby.length,
+          firstSOSAt: firstCreatedAt,
+          lastSOSAt: now,
+          status: "active",
+        });
+      } else {
+        incident.sosCount = sosNearby.length;
+        incident.lastSOSAt = now;
+        await incident.save();
+      }
+
+      // TODO: Integrate FCM/email/SMS alerts for admins/responders (#mass-sos-alerts)
+      console.log(
+        "MASS INCIDENT DETECTED:",
+        incident._id.toString(),
+        sosNearby.length,
+        "events"
+      );
+    }
+
+    return res.status(201).json({
+      success: true,
+      sos: sosEvent,
+      massIncidentTriggered: Boolean(incident),
+      massIncidentId: incident ? incident._id : null,
+    });
   } catch (e) {
     console.error("SOS create error:", e);
-    return res.status(500).json({ success: false, message: "Failed to create SOS" });
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to create SOS" });
   }
 });
 

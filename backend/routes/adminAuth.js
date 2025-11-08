@@ -1,8 +1,47 @@
 import express from "express";
 import jwt from "jsonwebtoken";
 import { AdminUser } from "../models/AdminUser.js";
+import { MassIncident } from "../models/MassIncident.js";
 
 const router = express.Router();
+
+const requireAdminAuth = async (req, res, next) => {
+  try {
+    const token = req.header("Authorization")?.replace("Bearer ", "");
+    if (!token) {
+      return res
+        .status(401)
+        .json({ success: false, message: "Admin authorization required" });
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (!decoded?.adminId || decoded?.role !== "admin") {
+      return res
+        .status(403)
+        .json({ success: false, message: "Admin access denied" });
+    }
+
+    const admin = await AdminUser.findById(decoded.adminId).select("-password");
+    if (!admin || admin.isActive === false) {
+      return res
+        .status(403)
+        .json({ success: false, message: "Admin account inactive" });
+    }
+
+    req.admin = admin;
+    next();
+  } catch (err) {
+    console.error("Admin auth error:", err);
+    if (err.name === "JsonWebTokenError" || err.name === "TokenExpiredError") {
+      return res
+        .status(401)
+        .json({ success: false, message: "Invalid or expired admin token" });
+    }
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to authenticate admin" });
+  }
+};
 
 // POST /api/admin/signup
 router.post("/signup", async (req, res) => {
@@ -41,6 +80,22 @@ router.post("/login", async (req, res) => {
     res.json({ success: true, message: "Login successful", admin: { id: admin._id, name: admin.name, email: admin.email }, token });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.get("/mass-incidents", requireAdminAuth, async (req, res) => {
+  try {
+    const status = (req.query.status || "active").toString();
+    const incidents = await MassIncident.find({ status })
+      .sort({ lastSOSAt: -1 })
+      .lean();
+
+    res.json({ success: true, incidents });
+  } catch (err) {
+    console.error("Fetch mass incidents error:", err);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch mass incidents" });
   }
 });
 

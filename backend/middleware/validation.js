@@ -57,6 +57,13 @@ export const updateProfileValidation = [
     .optional()
     .isURL()
     .withMessage('Profile picture must be a valid URL'),
+  body('allergies')
+    .optional()
+    .isString()
+    .withMessage('Allergies must be provided as plain text')
+    .trim()
+    .isLength({ max: 1000 })
+    .withMessage('Allergies must be 1000 characters or fewer'),
   validate
 ];
 

@@ -39,6 +39,12 @@ const UserSchema = new mongoose.Schema(
       phone: { type: String, default: null },
     },
 
+    allergies: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+
     medicalHistory: [
       {
         condition: { type: String },
