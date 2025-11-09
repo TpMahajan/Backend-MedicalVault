@@ -27,6 +27,8 @@ import profileRoutes from "./routes/profiles.js";       // profile switching
 import aiAssistantRoutes from "./routes/aiAssistant.js"; // AI assistant ✅
 import sosRoutes from "./routes/sosRoutes.js";          // SOS messages
 import adminAuthRoutes from "./routes/adminAuth.js";    // admin auth
+import lostFoundRoutes from "./routes/lostFound.js";    // lost & found (user)
+import adminLostFoundRoutes from "./routes/adminLostFound.js"; // lost & found admin
 import { checkEmailConfig } from "./utils/emailService.js";
 
 const app = express();
@@ -71,6 +73,8 @@ app.use("/api/profiles", profileRoutes);      // profile switching
 app.use("/api/ai", aiAssistantRoutes);        // AI assistant ✅
 app.use("/api/sos", sosRoutes);               // SOS
 app.use("/api/admin", adminAuthRoutes);       // admin auth
+app.use("/api/lost-found", lostFoundRoutes);  // lost & found
+app.use("/api/admin/lost-found", adminLostFoundRoutes); // admin lost & found
 
 // -------------------- Health Check --------------------
 app.get("/health", (req, res) =>
