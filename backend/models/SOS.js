@@ -8,8 +8,17 @@ const SOSSchema = new mongoose.Schema(
     age: { type: String },
     mobile: { type: String },
     location: { type: String },
-    submittedByRole: { type: String, enum: ["patient", "doctor", "anonymous"], default: "patient" },
+    submittedByRole: {
+      type: String,
+      enum: ["patient", "doctor", "anonymous"],
+      default: "patient",
+    },
     isRead: { type: Boolean, default: false },
+    allergiesSnapshot: { type: String },
+    notes: { type: String },
+    accuracyMeters: { type: Number },
+    geoLat: { type: Number },
+    geoLng: { type: Number },
   },
   { timestamps: true }
 );

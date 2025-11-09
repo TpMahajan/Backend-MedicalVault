@@ -63,9 +63,36 @@ router.post("/", auth, async (req, res) => {
         ? Number(req.body.accuracyMeters)
         : undefined;
     const notes =
-      typeof req.body.notes === "string" ? req.body.notes.trim() : undefined;
+      typeof req.body.notes === "string" && req.body.notes.trim().length
+        ? req.body.notes.trim()
+        : undefined;
     const source =
       typeof req.body.source === "string" ? req.body.source : "patient_app";
+    const providedAllergies =
+      typeof req.body.allergies === "string" && req.body.allergies.trim().length
+        ? req.body.allergies.trim()
+        : undefined;
+    const providedName =
+      typeof req.body.name === "string" && req.body.name.trim().length
+        ? req.body.name.trim()
+        : undefined;
+    const providedMobile =
+      typeof req.body.mobile === "string" && req.body.mobile.trim().length
+        ? req.body.mobile.trim()
+        : undefined;
+    const providedAge =
+      typeof req.body.age === "string" && req.body.age.trim().length
+        ? req.body.age.trim()
+        : undefined;
+    const providedLocationText =
+      typeof req.body.locationText === "string" &&
+      req.body.locationText.trim().length
+        ? req.body.locationText.trim()
+        : undefined;
+    const providedProfileId =
+      typeof req.body.profileId === "string" && req.body.profileId.trim().length
+        ? req.body.profileId.trim()
+        : undefined;
 
     const userId = req.user?._id || req.user?.id || req.auth?.id;
     if (!userId) {
@@ -75,9 +102,48 @@ router.post("/", auth, async (req, res) => {
       });
     }
 
-    const userProfile = await User.findById(userId).select("allergies");
+    const userProfile = await User.findById(userId).select(
+      "allergies name mobile age dateOfBirth"
+    );
     const allergiesSnapshot =
-      userProfile?.allergies?.trim?.() || userProfile?.allergies || "";
+      providedAllergies ??
+      userProfile?.allergies?.trim?.() ??
+      userProfile?.allergies ??
+      "";
+    const displayName = providedName ?? userProfile?.name ?? "";
+    const displayMobile =
+      providedMobile ?? userProfile?.mobile?.toString?.() ?? "";
+
+    const computeAgeFromDob = (dobValue) => {
+      if (!dobValue) return null;
+      try {
+        const dob =
+          dobValue instanceof Date
+            ? dobValue
+            : new Date(dobValue?.toString?.() ?? dobValue);
+        if (Number.isNaN(dob.getTime())) return null;
+        const now = new Date();
+        let age = now.getUTCFullYear() - dob.getUTCFullYear();
+        const monthDiff = now.getUTCMonth() - dob.getUTCMonth();
+        if (
+          monthDiff < 0 ||
+          (monthDiff === 0 && now.getUTCDate() < dob.getUTCDate())
+        ) {
+          age--;
+        }
+        return age;
+      } catch {
+        return null;
+      }
+    };
+
+    const derivedAge =
+      providedAge ??
+      (userProfile?.age != null ? String(userProfile.age) : undefined) ??
+      (() => {
+        const computed = computeAgeFromDob(userProfile?.dateOfBirth);
+        return computed != null ? String(computed) : undefined;
+      })();
 
     const sosEvent = await SosEvent.create({
       userId,
@@ -90,6 +156,31 @@ router.post("/", auth, async (req, res) => {
       allergiesSnapshot,
       severity: "red",
       notes,
+    });
+
+    const locationString =
+      providedLocationText ??
+      `${lat.toFixed(6)},${lng.toFixed(6)}${
+        Number.isFinite(accuracyMeters)
+          ? ` (±${Math.round(Math.abs(accuracyMeters))}m)`
+          : ""
+      }`;
+
+    await SOS.create({
+      patientId: userId,
+      profileId: providedProfileId ?? userId.toString(),
+      name: displayName,
+      age: derivedAge,
+      mobile: displayMobile,
+      location: locationString,
+      submittedByRole: req.auth?.role || "patient",
+      allergiesSnapshot,
+      notes,
+      accuracyMeters: Number.isFinite(accuracyMeters)
+        ? accuracyMeters
+        : undefined,
+      geoLat: lat,
+      geoLng: lng,
     });
 
     const now = new Date();
