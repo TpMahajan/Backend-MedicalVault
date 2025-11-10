@@ -11,6 +11,10 @@ import { OAuth2Client } from 'google-auth-library';
 import crypto from "crypto";
 import { EmailVerify } from "../models/EmailVerify.js";
 import { sendVerificationEmail, sendPasswordResetEmail } from "../utils/emailService.js";
+import multer from "multer";
+import multerS3 from "multer-s3";
+import path from "path";
+import s3Client, { BUCKET_NAME } from "../config/s3.js";
 
 const router = express.Router();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -28,6 +32,34 @@ const codeLimiter = rateLimit({
   max: Number(process.env.CODE_LIMIT_MAX || 10),
   standardHeaders: true,
   legacyHeaders: false,
+});
+
+const profilePhotoUpload = multer({
+  storage: multerS3({
+    s3: s3Client,
+    bucket: BUCKET_NAME,
+    key: (req, file, cb) => {
+      const ext = path.extname(file.originalname) || ".jpg";
+      const baseName = path
+        .parse(file.originalname)
+        .name.replace(/\s+/g, "_")
+        .slice(0, 40);
+      const unique = Math.random().toString(36).slice(2, 10);
+      const userId =
+        (req.user?._id?.toString() ?? req.user?.id?.toString()) || "unknown";
+      const fileName = `profile-pictures/${userId}/${Date.now()}-${unique}-${baseName}${ext}`;
+      cb(null, fileName);
+    },
+    contentType: multerS3.AUTO_CONTENT_TYPE,
+    metadata: (req, file, cb) => {
+      cb(null, {
+        fieldName: file.fieldname,
+        uploadedBy:
+          (req.user?._id?.toString() ?? req.user?.id?.toString()) || "unknown",
+      });
+    },
+  }),
+  limits: { fileSize: 5 * 1024 * 1024 },
 });
 
 // ================= Patient Signup =================
@@ -680,6 +712,68 @@ router.post("/test-patient", async (req, res) => {
     });
   }
 });
+
+router.post(
+  "/profile-picture",
+  auth,
+  profilePhotoUpload.single("photo"),
+  async (req, res) => {
+    try {
+      if (!req.file || !req.file.location) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Photo upload failed" });
+      }
+
+      const userId = req.user._id || req.user.id;
+      const updatedUser = await User.findByIdAndUpdate(
+        userId,
+        { profilePicture: req.file.location },
+        { new: true, runValidators: true }
+      ).select("-password");
+
+      if (!updatedUser) {
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found" });
+      }
+
+      res.status(201).json({
+        success: true,
+        message: "Profile picture updated successfully",
+        data: {
+          photoUrl: req.file.location,
+          user: {
+            id: updatedUser._id.toString(),
+            name: updatedUser.name,
+            email: updatedUser.email,
+            mobile: updatedUser.mobile,
+            aadhaar: updatedUser.aadhaar,
+            dateOfBirth: updatedUser.dateOfBirth,
+            age: updatedUser.age,
+            gender: updatedUser.gender,
+            bloodType: updatedUser.bloodType,
+            height: updatedUser.height,
+            weight: updatedUser.weight,
+            lastVisit: updatedUser.lastVisit,
+            nextAppointment: updatedUser.nextAppointment,
+            emergencyContact: updatedUser.emergencyContact,
+            medicalHistory: updatedUser.medicalHistory,
+            medications: updatedUser.medications,
+            medicalRecords: updatedUser.medicalRecords,
+            profilePicture: updatedUser.profilePicture,
+            allergies: updatedUser.allergies,
+          },
+        },
+      });
+    } catch (error) {
+      console.error("Profile picture upload error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Internal server error" });
+    }
+  }
+);
 
 export default router;
 
