@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
 import { User } from "../models/User.js";
+import { buildUserResponse } from "../utils/userResponse.js";
 
 // Generate JWT Token
 const generateToken = (id) => {
@@ -145,7 +146,8 @@ export const getMe = async (req, res) => {
       });
     }
 
-    const user = await User.findById((req.user?._id || req.user?.id)).select('-password');
+    const userDoc = await User.findById((req.user?._id || req.user?.id)).select('-password');
+    const user = await buildUserResponse(userDoc);
 
     res.json({
       success: true,
@@ -198,39 +200,21 @@ export const updateMe = async (req, res) => {
     });
 
     // Update user in DB
-    const user = await User.findByIdAndUpdate(req.user._id || req.user.id, updates, {
+    const userDoc = await User.findByIdAndUpdate(req.user._id || req.user.id, updates, {
       new: true,
       runValidators: true,
     }).select("-password");
 
-    if (!user) {
+    if (!userDoc) {
       return res.status(404).json({ success: false, message: "User not found" });
     }
+
+    const user = await buildUserResponse(userDoc);
 
     res.json({
       success: true,
       message: "Profile updated successfully",
-      data: {
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        mobile: user.mobile,
-        aadhaar: user.aadhaar,
-        dateOfBirth: user.dateOfBirth,
-        age: user.age,
-        gender: user.gender,
-        bloodType: user.bloodType,
-        height: user.height,
-        weight: user.weight,
-        lastVisit: user.lastVisit,
-        nextAppointment: user.nextAppointment,
-        emergencyContact: user.emergencyContact,
-        medicalHistory: user.medicalHistory,
-        medications: user.medications,
-        medicalRecords: user.medicalRecords,
-        profilePicture: user.profilePicture,
-        allergies: user.allergies,
-      },
+      data: user,
     });
   } catch (error) {
     console.error("Update me error:", error);

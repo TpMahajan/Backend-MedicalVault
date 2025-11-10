@@ -15,6 +15,9 @@ import multer from "multer";
 import multerS3 from "multer-s3";
 import path from "path";
 import s3Client, { BUCKET_NAME } from "../config/s3.js";
+import { GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { buildUserResponse } from "../utils/userResponse.js";
 
 const router = express.Router();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -229,19 +232,12 @@ router.post("/google", async (req, res) => {
     // Infer loginType if not present in user document
     const loginType = user.loginType || (user.googleId ? 'google' : 'email');
     
+    const responseUser = await buildUserResponse(user);
+
     res.status(200).json({
       success: true,
       message: user.googleId === googleId ? "Login successful" : "Account created successfully",
-      user: {
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        mobile: user.mobile || "",
-        profilePicture: user.profilePicture,
-        loginType: loginType, // Always include loginType
-        googleId: user.googleId, // Include googleId for frontend inference
-        emailVerified: user.emailVerified || false,
-      },
+      user: responseUser,
       token: jwtToken,
     });
 
@@ -278,17 +274,12 @@ router.post("/login", async (req, res) => {
     user.lastLogin = new Date();
     await user.save();
 
+    const responseUser = await buildUserResponse(user);
+
     res.status(200).json({
       success: true,
       message: "Login successful",
-      user: {
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        mobile: user.mobile,
-        profilePicture: user.profilePicture,
-        emailVerified: user.emailVerified || false,
-      },
+      user: responseUser,
       token,
     });
   } catch (error) {
@@ -693,16 +684,13 @@ router.post("/test-patient", async (req, res) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
     );
 
+    const responseUser = await buildUserResponse(patient);
+
     res.json({
       success: true,
       message: "Test patient token generated",
       token,
-      patient: {
-        id: patient._id.toString(),
-        name: patient.name,
-        email: patient.email,
-        mobile: patient.mobile
-      }
+      patient: responseUser,
     });
   } catch (error) {
     console.error("Test patient creation error:", error);
@@ -719,16 +707,18 @@ router.post(
   profilePhotoUpload.single("photo"),
   async (req, res) => {
     try {
-      if (!req.file || !req.file.location) {
+      if (!req.file || (!req.file.location && !req.file.key)) {
         return res
           .status(400)
           .json({ success: false, message: "Photo upload failed" });
       }
 
       const userId = req.user._id || req.user.id;
+      const photoKey = req.file.key || req.file.location;
+
       const updatedUser = await User.findByIdAndUpdate(
         userId,
-        { profilePicture: req.file.location },
+        { profilePicture: photoKey },
         { new: true, runValidators: true }
       ).select("-password");
 
@@ -738,34 +728,34 @@ router.post(
           .json({ success: false, message: "User not found" });
       }
 
-      console.log("✅ Profile photo uploaded:", req.file.location);
+      let signedUrl = null;
+      if (photoKey) {
+        try {
+          const command = new GetObjectCommand({
+            Bucket: BUCKET_NAME,
+            Key: photoKey,
+          });
+          signedUrl = await getSignedUrl(
+            s3Client,
+            command,
+            { expiresIn: Number(process.env.PROFILE_PIC_URL_TTL || 3600) },
+          );
+        } catch (error) {
+          console.error(
+            "Failed to generate signed profile picture URL:",
+            error.message || error,
+          );
+        }
+      }
+
+      const responseUser = await buildUserResponse(updatedUser);
 
       res.status(201).json({
         success: true,
         message: "Profile picture updated successfully",
         data: {
-          photoUrl: req.file.location,
-          user: {
-            id: updatedUser._id.toString(),
-            name: updatedUser.name,
-            email: updatedUser.email,
-            mobile: updatedUser.mobile,
-            aadhaar: updatedUser.aadhaar,
-            dateOfBirth: updatedUser.dateOfBirth,
-            age: updatedUser.age,
-            gender: updatedUser.gender,
-            bloodType: updatedUser.bloodType,
-            height: updatedUser.height,
-            weight: updatedUser.weight,
-            lastVisit: updatedUser.lastVisit,
-            nextAppointment: updatedUser.nextAppointment,
-            emergencyContact: updatedUser.emergencyContact,
-            medicalHistory: updatedUser.medicalHistory,
-            medications: updatedUser.medications,
-            medicalRecords: updatedUser.medicalRecords,
-            profilePicture: updatedUser.profilePicture,
-            allergies: updatedUser.allergies,
-          },
+          photoUrl: signedUrl,
+          user: responseUser,
         },
       });
     } catch (error) {
