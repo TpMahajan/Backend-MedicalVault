@@ -38,6 +38,7 @@ const profilePhotoUpload = multer({
   storage: multerS3({
     s3: s3Client,
     bucket: BUCKET_NAME,
+    acl: "public-read",
     key: (req, file, cb) => {
       const ext = path.extname(file.originalname) || ".jpg";
       const baseName = path
@@ -737,6 +738,8 @@ router.post(
           .status(404)
           .json({ success: false, message: "User not found" });
       }
+
+      console.log("✅ Profile photo uploaded:", req.file.location);
 
       res.status(201).json({
         success: true,
