@@ -107,7 +107,44 @@ export const getUserProfile = async (req, res) => {
     // Use buildUserResponse to properly generate profilePictureUrl for all access types
     // Convert lean object back to a document-like object for buildUserResponse
     const userDoc = user;
-    const processedUser = await buildUserResponse(userDoc);
+    let processedUser = await buildUserResponse(userDoc);
+
+    // Ensure _id is preserved for frontend compatibility
+    if (processedUser && !processedUser._id && processedUser.id) {
+      processedUser._id = processedUser.id;
+    }
+
+    // For anonymous access, ensure all fields are preserved from raw user data
+    // This is a safety measure in case buildUserResponse doesn't include everything
+    if (isAnonymous && processedUser) {
+      // Preserve medications, medicalHistory, allergies, and emergencyContact from raw data
+      if (user.medications !== undefined) {
+        processedUser.medications = Array.isArray(user.medications) ? user.medications : [];
+      }
+      if (user.medicalHistory !== undefined) {
+        processedUser.medicalHistory = Array.isArray(user.medicalHistory) ? user.medicalHistory : [];
+      }
+      if (user.allergies !== undefined) {
+        processedUser.allergies = user.allergies || '';
+      }
+      if (user.emergencyContact !== undefined) {
+        processedUser.emergencyContact = user.emergencyContact || {
+          name: null,
+          relationship: null,
+          phone: null
+        };
+      }
+    }
+
+    // Debug logging for anonymous access
+    if (isAnonymous) {
+      console.log('👻 Anonymous access - Raw user data:', JSON.stringify(user, null, 2));
+      console.log('👻 Anonymous access - Processed user data:', JSON.stringify(processedUser, null, 2));
+      console.log('👻 Anonymous access - Medications:', processedUser?.medications);
+      console.log('👻 Anonymous access - Medical History:', processedUser?.medicalHistory);
+      console.log('👻 Anonymous access - Allergies:', processedUser?.allergies);
+      console.log('👻 Anonymous access - Emergency Contact:', processedUser?.emergencyContact);
+    }
 
     res.json({
       success: true,
