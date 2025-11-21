@@ -1,4 +1,5 @@
 import { User } from "../models/User.js";
+import { buildUserResponse } from "../utils/userResponse.js";
 
 // @desc    Update user profile
 // @route   PUT /api/user/profile
@@ -81,6 +82,10 @@ export const getUserProfile = async (req, res) => {
       // Doctor with active session or the patient themself
       selectFields = '-password';
       console.log('🔐 Returning full patient data (mode:', mode, 'isSelf:', isSelf, 'hasActiveSession:', hasActiveSession, ')');
+    } else if (isAnonymous) {
+      // For anonymous access, include medications, medicalHistory, allergies, and emergencyContact
+      selectFields = 'name profilePicture age gender dateOfBirth bloodType height weight email mobile createdAt medications medicalHistory allergies emergencyContact';
+      console.log('👻 Returning anonymous access data (mode:', mode, ')');
     } else {
       // For all other viewers (including another logged-in patient), return essential demographics
       // This includes mobile to support SOS contact; tighten later with proper admin/doctor roles
@@ -88,7 +93,7 @@ export const getUserProfile = async (req, res) => {
       console.log('👤 Returning essential demographics (mode:', mode, ')');
     }
 
-    const user = await User.findById(req.params.id)
+    let user = await User.findById(req.params.id)
       .select(selectFields)
       .lean();
 
@@ -99,9 +104,14 @@ export const getUserProfile = async (req, res) => {
       });
     }
 
+    // Use buildUserResponse to properly generate profilePictureUrl for all access types
+    // Convert lean object back to a document-like object for buildUserResponse
+    const userDoc = user;
+    const processedUser = await buildUserResponse(userDoc);
+
     res.json({
       success: true,
-      data: hasActiveSession || isSelf ? { user } : { user },
+      data: { user: processedUser },
       sessionAccess: hasActiveSession,
       mode
     });
