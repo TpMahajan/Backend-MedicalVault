@@ -118,17 +118,37 @@ export const getUserProfile = async (req, res) => {
     // This is a safety measure in case buildUserResponse doesn't include everything
     if (isAnonymous && processedUser) {
       // Preserve medications, medicalHistory, allergies, and emergencyContact from raw data
+      // Always use raw user data first, as it's the source of truth
       if (user.medications !== undefined) {
         processedUser.medications = Array.isArray(user.medications) ? user.medications : [];
+      } else {
+        processedUser.medications = [];
       }
+      
       if (user.medicalHistory !== undefined) {
         processedUser.medicalHistory = Array.isArray(user.medicalHistory) ? user.medicalHistory : [];
+      } else {
+        processedUser.medicalHistory = [];
       }
-      if (user.allergies !== undefined) {
-        processedUser.allergies = user.allergies || '';
+      
+      // Always preserve allergies from raw user data - check if it exists in the selected fields
+      // If allergies field exists in user (even if null/empty), use it; otherwise default to empty string
+      if ('allergies' in user) {
+        // Field was selected, use its value (could be null, empty string, or actual value)
+        processedUser.allergies = (user.allergies !== null && user.allergies !== undefined) ? String(user.allergies) : '';
+      } else {
+        // Field wasn't selected (shouldn't happen, but safety check)
+        processedUser.allergies = '';
       }
+      
       if (user.emergencyContact !== undefined) {
         processedUser.emergencyContact = user.emergencyContact || {
+          name: null,
+          relationship: null,
+          phone: null
+        };
+      } else {
+        processedUser.emergencyContact = {
           name: null,
           relationship: null,
           phone: null
@@ -139,10 +159,11 @@ export const getUserProfile = async (req, res) => {
     // Debug logging for anonymous access
     if (isAnonymous) {
       console.log('👻 Anonymous access - Raw user data:', JSON.stringify(user, null, 2));
+      console.log('👻 Anonymous access - Raw allergies value:', user.allergies, 'type:', typeof user.allergies);
       console.log('👻 Anonymous access - Processed user data:', JSON.stringify(processedUser, null, 2));
+      console.log('👻 Anonymous access - Processed allergies value:', processedUser?.allergies, 'type:', typeof processedUser?.allergies);
       console.log('👻 Anonymous access - Medications:', processedUser?.medications);
       console.log('👻 Anonymous access - Medical History:', processedUser?.medicalHistory);
-      console.log('👻 Anonymous access - Allergies:', processedUser?.allergies);
       console.log('👻 Anonymous access - Emergency Contact:', processedUser?.emergencyContact);
     }
 
