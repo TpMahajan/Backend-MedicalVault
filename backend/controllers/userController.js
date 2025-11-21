@@ -175,6 +175,48 @@ export const getUserProfile = async (req, res) => {
   }
 };
 
+// @desc    Get medical card data (public, no auth required)
+// @route   GET /api/users/:id/medical-card
+// @access  Public
+export const getMedicalCard = async (req, res) => {
+  try {
+    const userId = req.params.id;
+    
+    // Select only fields needed for medical card
+    const selectFields = 'name profilePicture age gender dateOfBirth bloodType height weight email mobile medications allergies emergencyContact';
+    
+    const user = await User.findById(userId)
+      .select(selectFields)
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    // Process user response to get profilePictureUrl
+    const processedUser = await buildUserResponse(user);
+
+    // Ensure _id is preserved
+    if (processedUser && !processedUser._id && processedUser.id) {
+      processedUser._id = processedUser.id;
+    }
+
+    res.json({
+      success: true,
+      data: { user: processedUser }
+    });
+  } catch (error) {
+    console.error('Get medical card error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+};
+
 // @desc    Delete user account
 // @route   DELETE /api/user/account
 // @access  Private

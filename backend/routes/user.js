@@ -3,7 +3,8 @@ import {
   updateProfile, 
   updateFCMToken, 
   getUserProfile, 
-  deleteAccount 
+  deleteAccount,
+  getMedicalCard
 } from '../controllers/userController.js';
 import { 
   updateProfileValidation, 
@@ -27,6 +28,11 @@ router.put('/profile', auth, updateProfileValidation, updateProfile);
 // @desc    Update FCM token
 // @access  Private
 router.put('/fcm-token', auth, fcmLimiter, fcmTokenValidation, updateFCMToken);
+
+// @route   GET /api/users/:id/medical-card
+// @desc    Get medical card data (public, no auth required)
+// @access  Public
+router.get('/:id/medical-card', getMedicalCard);
 
 // @route   GET /api/users/:id
 // @desc    Get user profile by ID (public info)
