@@ -529,6 +529,87 @@ router.get("/:id/proxy", auth, checkSession, async (req, res) => {
   }
 });
 
+// ---------------- Update Document ----------------
+router.put("/:id", auth, requireVerified, async (req, res) => {
+  try {
+    const doc = await Document.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, msg: "File not found" });
+
+    // Check if user owns this document
+    if (doc.userId.toString() !== req.auth.id.toString()) {
+      return res.status(403).json({ success: false, msg: "Unauthorized access" });
+    }
+
+    const { title, category, date, description, notes } = req.body;
+
+    // Validate and normalize category
+    const validCategories = ["Report", "Prescription", "Bill", "Insurance"];
+    let chosenCategory = doc.category || "Report"; // Keep existing if not provided
+    
+    if (category) {
+      const normalizedCategory = String(category).toLowerCase().trim();
+      if (normalizedCategory.includes("report")) {
+        chosenCategory = "Report";
+      } else if (normalizedCategory.includes("prescription")) {
+        chosenCategory = "Prescription";
+      } else if (normalizedCategory.includes("bill")) {
+        chosenCategory = "Bill";
+      } else if (normalizedCategory.includes("insurance")) {
+        chosenCategory = "Insurance";
+      }
+    }
+
+    // Prepare update object
+    const updateData = {};
+    if (title !== undefined) updateData.title = title;
+    if (chosenCategory) {
+      updateData.category = chosenCategory;
+      updateData.type = chosenCategory;
+    }
+    if (description !== undefined) updateData.description = description;
+    if (notes !== undefined) updateData.notes = notes;
+    if (date !== undefined && date.trim() !== '') {
+      try {
+        const parsedDate = new Date(date);
+        if (!isNaN(parsedDate.getTime())) {
+          updateData.uploadedAt = parsedDate;
+          updateData.date = date;
+        }
+      } catch (error) {
+        console.log('⚠️ Invalid date provided, keeping existing date:', error.message);
+      }
+    }
+
+    // Update document
+    const updatedDoc = await Document.findByIdAndUpdate(
+      req.params.id,
+      updateData,
+      { new: true, runValidators: true }
+    );
+
+    // Generate signed URL for response
+    let signedUrl = null;
+    if (updatedDoc.s3Key) {
+      try {
+        signedUrl = await generateSignedUrl(updatedDoc.s3Key, updatedDoc.s3Bucket);
+      } catch (error) {
+        console.error("Error generating signed URL:", error);
+      }
+    }
+
+    res.json({
+      success: true,
+      document: {
+        ...updatedDoc.toObject(),
+        url: signedUrl,
+      },
+    });
+  } catch (err) {
+    console.error("Update error:", err);
+    res.status(500).json({ success: false, msg: "Update failed", error: err.message });
+  }
+});
+
 // ---------------- Delete ----------------
 router.delete("/:id", auth, requireVerified, async (req, res) => {
   try {
