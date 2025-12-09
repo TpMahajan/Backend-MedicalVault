@@ -2,6 +2,8 @@ import { LostPersonReport } from "../models/LostPersonReport.js";
 import { FoundPersonReport } from "../models/FoundPersonReport.js";
 import { User } from "../models/User.js";
 import { matchFoundToLost } from "../services/lostFoundMatcher.js";
+import { generateSignedUrl } from "../utils/s3Utils.js";
+import { BUCKET_NAME } from "../config/s3.js";
 
 const parseCoordinate = (value) => {
   if (value === undefined || value === null || value === "") return null;
@@ -200,6 +202,39 @@ export const createFoundReport = async (req, res) => {
   }
 };
 
+// Helper to generate signed URL if photoUrl is an S3 key
+const resolvePhotoUrl = async (photoUrl) => {
+  if (!photoUrl) return null;
+  
+  // If it's already a full URL (starts with http/https), return as is
+  if (photoUrl.startsWith('http://') || photoUrl.startsWith('https://')) {
+    // Check if it's a direct S3 URL that needs signing
+    if (photoUrl.includes('.s3.') && photoUrl.includes(BUCKET_NAME)) {
+      // Extract S3 key from URL
+      const urlParts = photoUrl.split('/');
+      const keyIndex = urlParts.findIndex(part => part.includes('.s3.'));
+      if (keyIndex !== -1 && keyIndex < urlParts.length - 1) {
+        const s3Key = urlParts.slice(keyIndex + 1).join('/');
+        try {
+          return await generateSignedUrl(s3Key, BUCKET_NAME, 3600 * 24 * 7); // 7 days
+        } catch (err) {
+          console.error("Error generating signed URL:", err);
+          return photoUrl; // Fallback to original
+        }
+      }
+    }
+    return photoUrl;
+  }
+  
+  // If it looks like an S3 key (no http), generate signed URL
+  try {
+    return await generateSignedUrl(photoUrl, BUCKET_NAME, 3600 * 24 * 7); // 7 days
+  } catch (err) {
+    console.error("Error generating signed URL for key:", err);
+    return photoUrl; // Fallback to original
+  }
+};
+
 export const getMyLostReports = async (req, res) => {
   try {
     const userId = req.user?._id || req.auth?.id;
@@ -212,10 +247,31 @@ export const getMyLostReports = async (req, res) => {
         "approxAge gender description currentLocation foundTime photoUrl condition status"
       );
 
+    // Generate signed URLs for all photo URLs
+    const reportsWithSignedUrls = await Promise.all(
+      reports.map(async (report) => {
+        const reportObj = report.toObject();
+        
+        // Resolve main photo URL
+        if (reportObj.photoUrl) {
+          reportObj.photoUrl = await resolvePhotoUrl(reportObj.photoUrl);
+        }
+        
+        // Resolve matched report photo URL if exists
+        if (reportObj.matchedFoundReportId?.photoUrl) {
+          reportObj.matchedFoundReportId.photoUrl = await resolvePhotoUrl(
+            reportObj.matchedFoundReportId.photoUrl
+          );
+        }
+        
+        return reportObj;
+      })
+    );
+
     res.json({
       success: true,
       data: {
-        reports,
+        reports: reportsWithSignedUrls,
       },
     });
   } catch (error) {
