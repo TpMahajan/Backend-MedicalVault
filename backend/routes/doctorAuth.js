@@ -175,10 +175,39 @@ router.get("/profile", auth, async (req, res) => {
     return res.status(404).json({ success: false, message: "Doctor not found." });
   }
   const avatarUrl = await buildSignedAvatarUrl(req.doctor.avatar);
+  const doctorData = req.doctor.toObject();
+  
+  // Ensure preferences object exists with defaults
+  if (!doctorData.preferences) {
+    doctorData.preferences = {
+      language: 'en',
+      timezone: 'America/New_York',
+      theme: 'auto',
+      notifications: {
+        newPatients: true,
+        appointmentReminders: true,
+        labResults: false,
+        medicationUpdates: true,
+        emergencyAlerts: true,
+      },
+      privacy: {
+        dataSharing: false,
+        analytics: true,
+        marketing: false,
+        thirdParty: false,
+      },
+      appearance: {
+        compactMode: false,
+        showAvatars: true,
+        animations: true,
+      },
+    };
+  }
+  
   res.json({
     success: true,
     message: "Profile retrieved successfully.",
-    doctor: { ...req.doctor.toObject(), avatarUrl },
+    doctor: { ...doctorData, avatarUrl },
   });
 });
 
@@ -189,16 +218,59 @@ router.put("/profile", auth, async (req, res) => {
       return res.status(404).json({ success: false, message: "Doctor not found." });
     }
 
-    const updateData = req.body;
-    const updatedDoctor = await DoctorUser.findByIdAndUpdate(req.doctor._id, updateData, {
+    const updateData = { ...req.body };
+    
+    // Remove preferences from main updateData and handle separately
+    const { preferences, ...profileData } = updateData;
+    
+    const updateQuery = { ...profileData };
+    
+    // Handle preferences using dot notation for MongoDB
+    if (preferences) {
+      // Update top-level preference fields
+      if (preferences.language !== undefined) {
+        updateQuery['preferences.language'] = preferences.language;
+      }
+      if (preferences.timezone !== undefined) {
+        updateQuery['preferences.timezone'] = preferences.timezone;
+      }
+      if (preferences.theme !== undefined) {
+        updateQuery['preferences.theme'] = preferences.theme;
+      }
+      
+      // Handle nested notifications object
+      if (preferences.notifications) {
+        Object.keys(preferences.notifications).forEach(key => {
+          updateQuery[`preferences.notifications.${key}`] = preferences.notifications[key];
+        });
+      }
+      
+      // Handle nested privacy object
+      if (preferences.privacy) {
+        Object.keys(preferences.privacy).forEach(key => {
+          updateQuery[`preferences.privacy.${key}`] = preferences.privacy[key];
+        });
+      }
+      
+      // Handle nested appearance object
+      if (preferences.appearance) {
+        Object.keys(preferences.appearance).forEach(key => {
+          updateQuery[`preferences.appearance.${key}`] = preferences.appearance[key];
+        });
+      }
+    }
+
+    const updatedDoctor = await DoctorUser.findByIdAndUpdate(req.doctor._id, { $set: updateQuery }, {
       new: true,
       runValidators: true,
     }).select("-password");
 
+    const avatarUrl = await buildSignedAvatarUrl(updatedDoctor.avatar);
+
     res.json({
       success: true,
       message: "Profile updated successfully.",
-      doctor: updatedDoctor,
+      doctor: { ...updatedDoctor.toObject(), avatarUrl },
     });
   } catch (error) {
     console.error("Profile update error:", error);
@@ -241,6 +313,98 @@ router.put("/fcm-token", auth, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Internal server error while updating FCM token.",
+    });
+  }
+});
+
+// ================= Get Security Settings =================
+router.get("/security-settings", auth, async (req, res) => {
+  try {
+    if (!req.doctor) {
+      return res.status(404).json({ success: false, message: "Doctor not found." });
+    }
+
+    // Calculate password expiry info
+    const passwordInfo = {
+      lastChanged: req.doctor.passwordChangedAt,
+      expiresIn: req.doctor.securitySettings.passwordExpiry,
+      isExpired: req.doctor.isPasswordExpired(),
+      daysUntilExpiry: (() => {
+        const expiryDate = new Date(req.doctor.passwordChangedAt);
+        expiryDate.setDate(expiryDate.getDate() + req.doctor.securitySettings.passwordExpiry);
+        const daysLeft = Math.ceil((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
+        return daysLeft > 0 ? daysLeft : 0;
+      })(),
+    };
+
+    res.json({
+      success: true,
+      securitySettings: req.doctor.securitySettings,
+      passwordInfo: passwordInfo,
+    });
+  } catch (error) {
+    console.error("Get security settings error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error while fetching security settings.",
+    });
+  }
+});
+
+// ================= Update Security Settings =================
+router.put("/security-settings", auth, async (req, res) => {
+  try {
+    if (!req.doctor) {
+      return res.status(404).json({ success: false, message: "Doctor not found." });
+    }
+
+    const { twoFactorAuth, sessionTimeout, passwordExpiry, loginNotifications } = req.body;
+
+    // Validate input
+    const updateData = {};
+    if (typeof twoFactorAuth === 'boolean') {
+      updateData['securitySettings.twoFactorAuth'] = twoFactorAuth;
+    }
+    if (typeof sessionTimeout === 'number' && sessionTimeout >= 5 && sessionTimeout <= 480) {
+      updateData['securitySettings.sessionTimeout'] = sessionTimeout;
+    }
+    if (typeof passwordExpiry === 'number' && passwordExpiry >= 30 && passwordExpiry <= 365) {
+      updateData['securitySettings.passwordExpiry'] = passwordExpiry;
+    }
+    if (typeof loginNotifications === 'boolean') {
+      updateData['securitySettings.loginNotifications'] = loginNotifications;
+    }
+
+    const updatedDoctor = await DoctorUser.findByIdAndUpdate(
+      req.doctor._id,
+      { $set: updateData },
+      { new: true, runValidators: true }
+    ).select("-password");
+
+    // Calculate password expiry info
+    const passwordInfo = {
+      lastChanged: updatedDoctor.passwordChangedAt,
+      expiresIn: updatedDoctor.securitySettings.passwordExpiry,
+      isExpired: updatedDoctor.isPasswordExpired(),
+      daysUntilExpiry: (() => {
+        const expiryDate = new Date(updatedDoctor.passwordChangedAt);
+        expiryDate.setDate(expiryDate.getDate() + updatedDoctor.securitySettings.passwordExpiry);
+        const daysLeft = Math.ceil((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
+        return daysLeft > 0 ? daysLeft : 0;
+      })(),
+    };
+
+    res.json({
+      success: true,
+      message: "Security settings updated successfully.",
+      securitySettings: updatedDoctor.securitySettings,
+      passwordInfo: passwordInfo,
+    });
+  } catch (error) {
+    console.error("Update security settings error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error while updating security settings.",
     });
   }
 });

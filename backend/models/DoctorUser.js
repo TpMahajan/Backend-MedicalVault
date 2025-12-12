@@ -49,6 +49,31 @@ const doctorUserSchema = new mongoose.Schema({
     loginNotifications: { type: Boolean, default: true },
   },
 
+  // Application Settings
+  preferences: {
+    language: { type: String, default: 'en' },
+    timezone: { type: String, default: 'America/New_York' },
+    theme: { type: String, default: 'auto', enum: ['light', 'dark', 'auto'] },
+    notifications: {
+      newPatients: { type: Boolean, default: true },
+      appointmentReminders: { type: Boolean, default: true },
+      labResults: { type: Boolean, default: false },
+      medicationUpdates: { type: Boolean, default: true },
+      emergencyAlerts: { type: Boolean, default: true },
+    },
+    privacy: {
+      dataSharing: { type: Boolean, default: false },
+      analytics: { type: Boolean, default: true },
+      marketing: { type: Boolean, default: false },
+      thirdParty: { type: Boolean, default: false },
+    },
+    appearance: {
+      compactMode: { type: Boolean, default: false },
+      showAvatars: { type: Boolean, default: true },
+      animations: { type: Boolean, default: true },
+    },
+  },
+
   // FCM token for push notifications
   fcmToken: { type: String, default: null },
 
