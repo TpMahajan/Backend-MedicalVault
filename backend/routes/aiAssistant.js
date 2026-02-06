@@ -971,7 +971,7 @@ router.post("/ask", auth, async (req, res) => {
         req._docAggregations = aggs;
       }
     }
-
+//hello
     // Optionally fetch today's appointments for doctor schedule queries
     let appointmentData = [];
     if (isScheduleRequest && req.auth?.role === 'doctor') {
