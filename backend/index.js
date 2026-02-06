@@ -20,6 +20,7 @@ import documentRoutes from "./routes/document.js";      // file/documents
 import qrRoutes from "./routes/qrRoutes.js";            // QR
 import doctorAuthRoutes from "./routes/doctorAuth.js";  // doctor auth ✅
 import appointmentRoutes from "./routes/appointments.js"; // appointments ✅
+import patientAppointmentRoutes from "./routes/patientAppointments.js"; // patient appointments
 import userRoutes from "./routes/user.js";              // user management
 import sessionRoutes from "./routes/sessionRoutes.js";  // session requests
 import notificationRoutes from "./routes/notifications.js"; // notifications
@@ -65,6 +66,7 @@ app.use("/api/auth", authRoutes);             // patients
 app.use("/api/doctors", doctorAuthRoutes);    // doctors ✅
 app.use("/api/files", documentRoutes);        // documents
 app.use("/api/appointments", appointmentRoutes); // appointments ✅
+app.use("/api/patient", patientAppointmentRoutes); // patient appointments
 app.use("/api/qr", qrRoutes);                 // QR
 app.use("/api/users", userRoutes);            // user management
 app.use("/api/sessions", sessionRoutes);      // session requests

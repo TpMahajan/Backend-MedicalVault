@@ -6,7 +6,9 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import { DoctorUser } from "../models/DoctorUser.js";
-import { auth } from "../middleware/auth.js";
+import { DoctorAvailability } from "../models/DoctorAvailability.js";
+import { Appointment } from "../models/Appointment.js";
+import { auth, requireDoctor } from "../middleware/auth.js";
 import s3Client, { BUCKET_NAME, REGION } from "../config/s3.js";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { generateSignedUrl } from "../utils/s3Utils.js";
@@ -166,6 +168,91 @@ router.post("/login", async (req, res) => {
       success: false,
       message: "Internal server error during login.",
     });
+  }
+});
+
+// ================= Doctor Availability =================
+router.get("/availability", auth, requireDoctor, async (req, res) => {
+  try {
+    const slots = await DoctorAvailability.find({ doctorId: req.doctor._id }).lean();
+    res.json({ success: true, availability: slots });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.put("/availability", auth, requireDoctor, async (req, res) => {
+  try {
+    const { slots } = req.body;
+    if (!Array.isArray(slots)) {
+      return res.status(400).json({ success: false, message: "slots array is required" });
+    }
+    await DoctorAvailability.deleteMany({ doctorId: req.doctor._id });
+    const created = await DoctorAvailability.insertMany(
+      slots.map((s) => ({
+        doctorId: req.doctor._id,
+        dayOfWeek: s.dayOfWeek,
+        startTime: s.startTime,
+        endTime: s.endTime,
+        slotDuration: s.slotDuration || 15,
+        isRecurring: s.isRecurring !== false,
+        isBlocked: s.isBlocked || false,
+      }))
+    );
+    res.json({ success: true, availability: created });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// GET /api/doctors/available-slots/:doctorId?date= - get available slots for a date (for patient booking)
+router.get("/available-slots/:doctorId", auth, async (req, res) => {
+  try {
+    const { doctorId } = req.params;
+    const dateStr = req.query.date;
+    if (!dateStr) {
+      return res.status(400).json({ success: false, message: "date query is required" });
+    }
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) {
+      return res.status(400).json({ success: false, message: "Invalid date" });
+    }
+    const dayOfWeek = d.getDay();
+    const avail = await DoctorAvailability.find({
+      doctorId,
+      dayOfWeek,
+      isBlocked: false,
+    }).lean();
+    const existing = await Appointment.find({
+      doctorId,
+      appointmentDate: { $gte: new Date(d.setHours(0, 0, 0, 0)), $lt: new Date(d.setHours(23, 59, 59, 999)) },
+      status: { $nin: ["cancelled"] },
+    }).select("appointmentTime duration").lean();
+    const taken = new Set();
+    for (const apt of existing) {
+      const [h, m] = (apt.appointmentTime || "00:00").split(":").map(Number);
+          taken.add(`${h}:${m}`);
+    }
+    const result = [];
+    for (const a of avail) {
+      const [startH, startM] = a.startTime.split(":").map(Number);
+      const [endH, endM] = a.endTime.split(":").map(Number);
+      const duration = a.slotDuration || 15;
+      let minutes = startH * 60 + startM;
+      const endMinutes = endH * 60 + endM;
+      while (minutes + duration <= endMinutes) {
+        const h = Math.floor(minutes / 60);
+        const m = minutes % 60;
+        const key = `${h}:${m}`;
+        if (!taken.has(key)) {
+          result.push(`${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`);
+        }
+        minutes += duration;
+      }
+    }
+    res.json({ success: true, slots: result.sort() });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 

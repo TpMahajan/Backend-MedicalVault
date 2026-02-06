@@ -48,24 +48,60 @@ const appointmentSchema = new mongoose.Schema({
     required: [true, "Doctor name is required"],
     trim: true,
   },
+  doctorSpecialization: { type: String, trim: true, default: "" },
+  hospitalClinicName: { type: String, trim: true, default: "" },
+
+  // Mode and video
+  mode: {
+    type: String,
+    enum: ["in-person", "online"],
+    default: "in-person",
+  },
+  videoCallUrl: { type: String, trim: true, default: "" },
 
   // Appointment status
   status: {
     type: String,
-    enum: ["scheduled", "confirmed", "completed", "cancelled", "rescheduled", "no-show"],
+    enum: ["pending", "scheduled", "confirmed", "completed", "cancelled", "rescheduled", "no-show", "missed"],
     default: "scheduled",
   },
 
-  // Additional notes
+  // Notes (legacy + new split)
   notes: { type: String, trim: true, default: "" },
+  patientNotes: { type: String, trim: true, default: "" },
+  doctorNotesPrivate: { type: String, trim: true, default: "" },
+  doctorNotesShared: { type: String, trim: true, default: "" },
 
-  // Reminder
+  // Reminders
   reminderSent: { type: Boolean, default: false },
+  reminder24hSent: { type: Boolean, default: false },
+  reminder1hSent: { type: Boolean, default: false },
+
+  // Reschedule
+  rescheduleRequestedAt: { type: Date },
+  rescheduleReason: { type: String, trim: true },
+  originalAppointmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Appointment" },
+
+  // Doctor running late
+  doctorRunningLateAt: { type: Date },
+  doctorRunningLateMinutes: { type: Number },
+
+  // Audit
+  createdBy: {
+    type: String,
+    enum: ["patient", "doctor", "system"],
+    default: "doctor",
+  },
 
   // Timestamps
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
 });
+
+// Indexes for query performance
+appointmentSchema.index({ patientId: 1, appointmentDate: 1 });
+appointmentSchema.index({ doctorId: 1, appointmentDate: 1 });
+appointmentSchema.index({ status: 1 });
 
 // Auto-update updatedAt
 appointmentSchema.pre("save", function (next) {

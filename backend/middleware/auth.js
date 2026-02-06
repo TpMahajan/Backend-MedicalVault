@@ -111,6 +111,28 @@ export const auth = async (req, res, next) => {
   }
 };
 
+// Require doctor role (must be used after auth)
+export const requireDoctor = (req, res, next) => {
+  if (!req.doctor) {
+    return res.status(403).json({
+      success: false,
+      message: "Doctor access required.",
+    });
+  }
+  next();
+};
+
+// Require patient role (must be used after auth)
+export const requirePatient = (req, res, next) => {
+  if (!req.user) {
+    return res.status(403).json({
+      success: false,
+      message: "Patient access required.",
+    });
+  }
+  next();
+};
+
 // Middleware for optional authentication
 export const optionalAuth = async (req, res, next) => {
   try {

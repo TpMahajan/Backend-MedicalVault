@@ -5,6 +5,7 @@ const fileSchema = new mongoose.Schema(
     // Linkage
     userId: { type: String, required: true, trim: true },   // ✅ Always use userId
     doctorId: { type: mongoose.Schema.Types.ObjectId, ref: "DoctorUser" },
+    appointmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Appointment" },
 
     // File info
     title: { type: String, required: true, trim: true },

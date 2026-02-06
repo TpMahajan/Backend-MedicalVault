@@ -16,11 +16,22 @@ export const initializeCronJobs = () => {
     timezone: "Asia/Kolkata" // Adjust timezone as needed
   });
 
-  // Run appointment reminders every 6 hours to catch appointments
+  // Run appointment reminders every 6 hours (legacy)
   cron.schedule('0 */6 * * *', async () => {
     console.log('⏰ Running appointment reminders every 6 hours...');
     const { sendAppointmentReminders } = await import('./reminderService.js');
     await sendAppointmentReminders();
+  }, {
+    scheduled: true,
+    timezone: "Asia/Kolkata"
+  });
+
+  // Run 24h and 1h appointment reminders every 15 minutes
+  cron.schedule('*/15 * * * *', async () => {
+    console.log('⏰ Running 24h/1h appointment reminders...');
+    const { send24hReminders, send1hReminders } = await import('./reminderService.js');
+    await send24hReminders();
+    await send1hReminders();
   }, {
     scheduled: true,
     timezone: "Asia/Kolkata"

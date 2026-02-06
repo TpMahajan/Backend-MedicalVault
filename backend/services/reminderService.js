@@ -5,89 +5,168 @@ import { Notification } from '../models/Notification.js';
 import { sendNotification } from '../utils/notifications.js';
 import { broadcastNotification } from '../controllers/notificationController.js';
 
+const getSmartReminderBody = (appointment, hoursAhead) => {
+  const isEmergency = appointment.appointmentType === 'emergency';
+  const doctorName = appointment.doctorName || 'your doctor';
+  const time = appointment.appointmentTime || '';
+  if (hoursAhead <= 1 && isEmergency) {
+    return `Urgent: Your emergency appointment with Dr. ${doctorName} is in 1 hour at ${time}.`;
+  }
+  if (hoursAhead <= 1) {
+    return `Reminder: Your appointment with Dr. ${doctorName} is in 1 hour at ${time}.`;
+  }
+  if (isEmergency) {
+    return `Urgent: Your emergency appointment with Dr. ${doctorName} is tomorrow at ${time}.`;
+  }
+  return `Reminder: Your checkup with Dr. ${doctorName} is tomorrow at ${time}.`;
+};
+
+const buildAppointmentDateTime = (apt) => {
+  const d = new Date(apt.appointmentDate);
+  const [h, m] = (apt.appointmentTime || '00:00').split(':').map(Number);
+  d.setHours(h, m, 0, 0);
+  return d;
+};
+
 /**
- * Send appointment reminders
+ * Send 24h appointment reminders
  */
-export const sendAppointmentReminders = async () => {
+export const send24hReminders = async () => {
   try {
-    console.log('🔔 Starting appointment reminder check...');
-    
-    // Get appointments that are scheduled for tomorrow (24 hours from now)
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    tomorrow.setHours(0, 0, 0, 0);
-    
-    const dayAfter = new Date(tomorrow);
-    dayAfter.setDate(dayAfter.getDate() + 1);
-    
-    const upcomingAppointments = await Appointment.find({
-      appointmentDate: {
-        $gte: tomorrow,
-        $lt: dayAfter
-      },
+    console.log('🔔 Starting 24h appointment reminder check...');
+    const now = new Date();
+    const in24h = new Date(now.getTime() + 23 * 60 * 60 * 1000);
+    const in25h = new Date(now.getTime() + 25 * 60 * 60 * 1000);
+
+    const appointments = await Appointment.find({
       status: { $in: ['scheduled', 'confirmed'] },
-      reminderSent: false
+      reminder24hSent: false,
     }).populate('doctorId', 'name email');
 
-    console.log(`📅 Found ${upcomingAppointments.length} appointments for tomorrow`);
+    const toRemind = appointments.filter((apt) => {
+      const aptDt = buildAppointmentDateTime(apt);
+      return aptDt >= in24h && aptDt <= in25h;
+    });
 
-    for (const appointment of upcomingAppointments) {
+    console.log(`📅 Found ${toRemind.length} appointments for 24h reminder`);
+
+    for (const appointment of toRemind) {
       try {
-        // Get patient info
         const patient = await User.findById(appointment.patientId);
-        if (!patient) {
-          console.log(`⚠️ Patient not found for appointment ${appointment._id}`);
-          continue;
-        }
+        if (!patient) continue;
 
-        // Create reminder notification
+        const body = getSmartReminderBody(appointment, 24);
+        const data = {
+          type: 'APPOINTMENT_24H_REMINDER',
+          appointmentId: appointment._id.toString(),
+          appointmentDate: appointment.appointmentDate,
+          appointmentTime: appointment.appointmentTime,
+          doctorName: appointment.doctorName,
+          reason: appointment.reason,
+          deepLink: `/appointments/${appointment._id}`,
+        };
+
         const notification = new Notification({
-          title: "Appointment Reminder",
-          body: `You have an appointment tomorrow at ${appointment.appointmentTime} with Dr. ${appointment.doctorName}`,
-          type: "reminder",
-          data: {
-            appointmentId: appointment._id.toString(),
-            appointmentDate: appointment.appointmentDate,
-            appointmentTime: appointment.appointmentTime,
-            doctorName: appointment.doctorName,
-            reason: appointment.reason
-          },
+          title: 'Appointment Reminder',
+          body,
+          type: 'reminder',
+          data: { ...data },
           recipientId: appointment.patientId,
-          recipientRole: "patient",
-          senderId: appointment.doctorId._id.toString(),
-          senderRole: "doctor"
+          recipientRole: 'patient',
+          senderId: (appointment.doctorId?._id || appointment.doctorId)?.toString() || 'system',
+          senderRole: 'doctor',
         });
         await notification.save();
 
-        // Send push notification
         if (patient.fcmToken) {
-          await sendNotification(
-            appointment.patientId,
-            "Appointment Reminder",
-            `You have an appointment tomorrow at ${appointment.appointmentTime} with Dr. ${appointment.doctorName}`,
-            {
-              type: "APPOINTMENT_REMINDER",
-              appointmentId: appointment._id.toString(),
-              appointmentDate: appointment.appointmentDate,
-              appointmentTime: appointment.appointmentTime,
-              doctorName: appointment.doctorName
-            }
-          );
+          await sendNotification(appointment.patientId, 'Appointment Reminder', body, data);
         }
-
-        // Broadcast to SSE connections
         await broadcastNotification(notification);
-
-        // Mark reminder as sent
-        await Appointment.findByIdAndUpdate(appointment._id, { reminderSent: true });
-
-        console.log(`✅ Reminder sent for appointment ${appointment._id}`);
+        await Appointment.findByIdAndUpdate(appointment._id, { reminder24hSent: true, reminderSent: true });
+        console.log(`✅ 24h reminder sent for appointment ${appointment._id}`);
       } catch (error) {
-        console.error(`❌ Error sending reminder for appointment ${appointment._id}:`, error);
+        console.error(`❌ Error sending 24h reminder for ${appointment._id}:`, error);
       }
     }
+    console.log('🔔 24h reminder check completed');
+  } catch (error) {
+    console.error('❌ Error in 24h reminder service:', error);
+  }
+};
 
-    console.log('🔔 Appointment reminder check completed');
+/**
+ * Send 1h appointment reminders
+ */
+export const send1hReminders = async () => {
+  try {
+    console.log('🔔 Starting 1h appointment reminder check...');
+    const now = new Date();
+    const in55min = new Date(now.getTime() + 55 * 60 * 1000);
+    const in65min = new Date(now.getTime() + 65 * 60 * 1000);
+
+    const appointments = await Appointment.find({
+      status: { $in: ['scheduled', 'confirmed'] },
+      reminder1hSent: false,
+    }).populate('doctorId', 'name email');
+
+    const toRemind = appointments.filter((apt) => {
+      const aptDt = buildAppointmentDateTime(apt);
+      return aptDt >= in55min && aptDt <= in65min;
+    });
+
+    console.log(`📅 Found ${toRemind.length} appointments for 1h reminder`);
+
+    for (const appointment of toRemind) {
+      try {
+        const patient = await User.findById(appointment.patientId);
+        if (!patient) continue;
+
+        const body = getSmartReminderBody(appointment, 1);
+        const data = {
+          type: 'APPOINTMENT_1H_REMINDER',
+          appointmentId: appointment._id.toString(),
+          appointmentDate: appointment.appointmentDate,
+          appointmentTime: appointment.appointmentTime,
+          doctorName: appointment.doctorName,
+          reason: appointment.reason,
+          deepLink: `/appointments/${appointment._id}`,
+        };
+
+        const notification = new Notification({
+          title: 'Appointment Starting Soon',
+          body,
+          type: 'reminder',
+          data: { ...data },
+          recipientId: appointment.patientId,
+          recipientRole: 'patient',
+          senderId: (appointment.doctorId?._id || appointment.doctorId)?.toString() || 'system',
+          senderRole: 'doctor',
+        });
+        await notification.save();
+
+        if (patient.fcmToken) {
+          await sendNotification(appointment.patientId, 'Appointment Starting Soon', body, data);
+        }
+        await broadcastNotification(notification);
+        await Appointment.findByIdAndUpdate(appointment._id, { reminder1hSent: true, reminderSent: true });
+        console.log(`✅ 1h reminder sent for appointment ${appointment._id}`);
+      } catch (error) {
+        console.error(`❌ Error sending 1h reminder for ${appointment._id}:`, error);
+      }
+    }
+    console.log('🔔 1h reminder check completed');
+  } catch (error) {
+    console.error('❌ Error in 1h reminder service:', error);
+  }
+};
+
+/**
+ * Send appointment reminders (legacy: tomorrow-based, uses reminderSent)
+ */
+export const sendAppointmentReminders = async () => {
+  try {
+    await send24hReminders();
+    await send1hReminders();
   } catch (error) {
     console.error('❌ Error in appointment reminder service:', error);
   }
