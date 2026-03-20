@@ -5,6 +5,7 @@ import { Advertisement } from "../models/Advertisement.js";
 import { AdvertisementClickLog } from "../models/AdvertisementClickLog.js";
 import { Product } from "../models/Product.js";
 import { UIConfig } from "../models/UIConfig.js";
+import { PUBLIC_ALERT_PLATFORMS } from "../services/publicConfigRealtime.js";
 
 const router = express.Router();
 
@@ -56,6 +57,24 @@ function normalizeSurface(value, fallback = "") {
   return raw || "UNKNOWN";
 }
 
+function normalizeAlertPlatforms(value) {
+  const raw = Array.isArray(value) ? value : [value];
+  const normalized = raw
+    .flatMap((entry) =>
+      String(entry || "")
+        .split(",")
+        .map((part) => part.trim().toUpperCase())
+        .filter(Boolean)
+    )
+    .filter(
+      (entry) => entry === "ALL" || PUBLIC_ALERT_PLATFORMS.includes(entry)
+    );
+
+  if (normalized.includes("ALL")) return [...PUBLIC_ALERT_PLATFORMS];
+  const unique = [...new Set(normalized.filter((entry) => entry !== "ALL"))];
+  return unique.length > 0 ? unique : [...PUBLIC_ALERT_PLATFORMS];
+}
+
 function buildTrackedUrl(redirectUrl, params) {
   try {
     const url = new URL(redirectUrl);
@@ -87,11 +106,11 @@ router.get("/ads", async (req, res) => {
     };
 
     if (placement) {
-      query.placement = placement;
+      query.$or = [{ placement }, { placements: placement }];
     }
 
     const ads = await Advertisement.find(query)
-      .sort({ placement: 1, createdAt: -1 })
+      .sort({ createdAt: -1 })
       .lean();
 
     cacheState.ads.set(cacheKey, writeCache(ads));
@@ -138,9 +157,25 @@ router.post("/ads/:id/click", async (req, res) => {
       });
     }
 
+    const targetSurfaces = Array.isArray(ad.placements) && ad.placements.length > 0
+      ? ad.placements
+      : [String(ad.placement || "").toUpperCase()].filter(Boolean);
+
     const body = req.body || {};
     const platform = normalizePlatform(body.platform || req.query.platform);
-    const surface = normalizeSurface(body.surface || req.query.surface, ad.placement);
+    const surface = normalizeSurface(
+      body.surface || req.query.surface,
+      targetSurfaces[0] || ad.placement
+    );
+    if (
+      targetSurfaces.length > 0 &&
+      !targetSurfaces.includes(surface)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Advertisement is not configured for this surface",
+      });
+    }
     const userId = sanitizeString(body.userId || req.query.userId, 120);
     const userType = sanitizeString(body.userType || req.query.userType, 60);
     const sessionId = sanitizeString(body.sessionId || req.query.sessionId, 120);
@@ -167,7 +202,7 @@ router.post("/ads/:id/click", async (req, res) => {
     await AdvertisementClickLog.create({
       eventId,
       advertisementId: ad._id,
-      placement: ad.placement,
+      placement: surface,
       redirectUrl: ad.redirectUrl,
       trackedUrl,
       platform,
@@ -238,6 +273,22 @@ router.get("/ui-config", async (req, res) => {
       config = created.toObject();
     }
 
+    const alerts = Array.isArray(config.dashboardAlerts)
+      ? config.dashboardAlerts.map((alert) => {
+          const platforms = normalizeAlertPlatforms(
+            alert?.platforms ?? alert?.platform
+          );
+          return {
+            ...alert,
+            platforms,
+            platform:
+              platforms.length >= PUBLIC_ALERT_PLATFORMS.length
+                ? "ALL"
+                : platforms.join(","),
+          };
+        })
+      : [];
+
     const payload = {
       buttonColor: config.buttonColor,
       iconColor: config.iconColor,
@@ -245,7 +296,7 @@ router.get("/ui-config", async (req, res) => {
       themeMode: config.themeMode,
       qrActions: config.qrActions || [],
       dashboardCards: config.dashboardCards || [],
-      dashboardAlerts: config.dashboardAlerts || [],
+      dashboardAlerts: alerts,
       updatedAt: config.updatedAt,
     };
 

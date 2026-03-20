@@ -20,7 +20,7 @@
     "express": "^4.19.2",
     "express-rate-limit": "^7.1.5",
     "express-validator": "^7.0.1",
-    "firebase-admin": "^10.3.0",
+    "firebase-admin": "^13.7.0",
     "google-auth-library": "^9.14.2",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
@@ -32,12 +32,17 @@
     "nodemailer": "^7.0.6",
     "pdf-parse": "^2.3.12",
     "resend": "^6.2.2",
-    "tesseract.js": "^6.0.1"
+    "tesseract.js": "^6.0.1",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "jest": "^29.7.0",
     "nodemon": "^3.1.0",
     "supertest": "^6.3.3"
+  },
+  "overrides": {
+    "fast-xml-parser": "5.5.8",
+    "@tootallnate/once": "3.0.1"
   },
   "keywords": [
     "nodejs",

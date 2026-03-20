@@ -1,9 +1,11 @@
 import express from "express";
+import mongoose from "mongoose";
 import { auth, optionalAuth } from "../middleware/auth.js";
 import { Session } from "../models/Session.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { Appointment } from "../models/Appointment.js";
+import { DirectMessage } from "../models/DirectMessage.js";
 import { sendNotification, sendNotificationToDoctor } from "../utils/notifications.js";
 import { persistSessionHistory } from "../services/sessionHistoryPersistence.js";
 import { BUCKET_NAME } from "../config/s3.js";
@@ -17,6 +19,25 @@ const asText = (value) => (value == null ? "" : String(value).trim());
 
 const resolveDoctorSpecialization = (doctor) =>
   asText(doctor?.specialization || doctor?.specialty);
+
+const isValidObjectId = (value) =>
+  mongoose.Types.ObjectId.isValid(asText(value));
+
+const asObjectId = (value) => new mongoose.Types.ObjectId(asText(value));
+
+const normalizeMinutes = (value, fallback = 20) => {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(5, Math.min(120, parsed));
+};
+
+const resolveParticipantName = (participant, fallback) => {
+  const fromProfile = asText(participant?.name);
+  const fromFallback = asText(fallback);
+  if (fromProfile) return fromProfile;
+  if (fromFallback) return fromFallback;
+  return "User";
+};
 
 const resolveDoctorAvatarUrl = async (doctor) => {
   const raw =
@@ -81,6 +102,229 @@ const buildDoctorSummary = async (doctor) => {
     specialty: specialization,
     memberSince: doctor.createdAt || null,
     chatUrl: asText(doctor.chatUrl || doctor.chatDeepLink),
+  };
+};
+
+const resolveDoctorPatientLink = async ({ doctorId, patientId }) => {
+  if (!isValidObjectId(doctorId) || !isValidObjectId(patientId)) {
+    return {
+      linkedSession: null,
+      linkedAppointment: null,
+      relationType: "",
+      relationId: "",
+    };
+  }
+
+  const normalizedDoctorId = asText(doctorId);
+  const normalizedPatientId = asText(patientId);
+  const patientIdVariants = [normalizedPatientId];
+
+  const linkedSession = await Session.findOne({
+    doctorId: normalizedDoctorId,
+    patientId: normalizedPatientId,
+    status: { $in: ["pending", "accepted", "ended", "declined"] },
+  })
+    .sort({ createdAt: -1 })
+    .select("_id status createdAt")
+    .lean();
+
+  const linkedAppointment = linkedSession
+    ? null
+    : await Appointment.findOne({
+        doctorId: normalizedDoctorId,
+        patientId: { $in: patientIdVariants },
+      })
+        .sort({ appointmentDate: -1, createdAt: -1 })
+        .select("_id appointmentDate createdAt")
+        .lean();
+
+  return {
+    linkedSession,
+    linkedAppointment,
+    relationType: linkedSession
+      ? "session"
+      : linkedAppointment
+      ? "appointment"
+      : "",
+    relationId: linkedSession
+      ? linkedSession._id.toString()
+      : linkedAppointment
+      ? linkedAppointment._id.toString()
+      : "",
+  };
+};
+
+const sendDirectMessageToRecipient = async ({
+  recipientRole,
+  recipientId,
+  title,
+  body,
+  payload,
+}) => {
+  if (recipientRole === "doctor") {
+    await sendNotificationToDoctor(recipientId, title, body, payload);
+    return;
+  }
+  await sendNotification(recipientId, title, body, payload);
+};
+
+const dispatchDirectMessage = async ({
+  senderRole,
+  senderId,
+  counterpartId,
+  message,
+  sessionId,
+  senderName,
+  counterpartName,
+}) => {
+  const normalizedSenderRole = asText(senderRole).toLowerCase();
+  const normalizedSenderId = asText(senderId);
+  const normalizedCounterpartId = asText(counterpartId);
+  const normalizedMessage = asText(message);
+  const normalizedSessionId = asText(sessionId);
+
+  if (!["doctor", "patient"].includes(normalizedSenderRole)) {
+    return {
+      success: false,
+      status: 403,
+      message: "Only doctors or patients can send direct messages.",
+    };
+  }
+
+  if (!normalizedCounterpartId || !normalizedMessage) {
+    return {
+      success: false,
+      status: 400,
+      message: "counterpartId and message are required.",
+    };
+  }
+
+  if (!isValidObjectId(normalizedSenderId) || !isValidObjectId(normalizedCounterpartId)) {
+    return {
+      success: false,
+      status: 400,
+      message: "Invalid sender or recipient identifier.",
+    };
+  }
+
+  let doctorId = "";
+  let patientId = "";
+  let recipientRole = "";
+  let recipientId = "";
+
+  if (normalizedSenderRole === "doctor") {
+    doctorId = normalizedSenderId;
+    patientId = normalizedCounterpartId;
+    recipientRole = "patient";
+    recipientId = patientId;
+  } else {
+    patientId = normalizedSenderId;
+    doctorId = normalizedCounterpartId;
+    recipientRole = "doctor";
+    recipientId = doctorId;
+  }
+
+  const relation = await resolveDoctorPatientLink({ doctorId, patientId });
+  if (!relation.linkedSession && !relation.linkedAppointment) {
+    return {
+      success: false,
+      status: 403,
+      message:
+        "Direct chat is allowed only between connected doctor-patient pairs.",
+    };
+  }
+
+  const resolvedSessionId =
+    normalizedSessionId ||
+    relation.relationId ||
+    "";
+
+  const directMessage = await DirectMessage.create({
+    doctorId: asObjectId(doctorId),
+    patientId: asObjectId(patientId),
+    ...(isValidObjectId(resolvedSessionId)
+      ? { sessionId: asObjectId(resolvedSessionId) }
+      : {}),
+    senderRole: normalizedSenderRole,
+    senderId: asObjectId(normalizedSenderId),
+    recipientRole,
+    recipientId: asObjectId(recipientId),
+    message: normalizedMessage,
+    readByRecipient: false,
+    metadata: {
+      relationType: relation.relationType || "session",
+    },
+  });
+
+  const { Notification } = await import("../models/Notification.js");
+  const { broadcastNotification } = await import(
+    "../controllers/notificationController.js"
+  );
+
+  const finalSenderName = resolveParticipantName(
+    { name: senderName },
+    normalizedSenderRole === "doctor" ? "Doctor" : "Patient"
+  );
+  const finalCounterpartName = resolveParticipantName(
+    { name: counterpartName },
+    normalizedSenderRole === "doctor" ? "Patient" : "Doctor"
+  );
+
+  const notificationTitle = `New message from ${finalSenderName}`;
+  const notificationPayload = {
+    type: "DIRECT_MESSAGE",
+    messageId: directMessage._id.toString(),
+    doctorId,
+    patientId,
+    sessionId: resolvedSessionId,
+    relationType: relation.relationType || "session",
+    senderRole: normalizedSenderRole,
+    senderId: normalizedSenderId,
+    senderName: finalSenderName,
+    counterpartId: normalizedSenderId,
+    counterpartRole: normalizedSenderRole,
+    recipientRole,
+  };
+
+  const notification = await Notification.create({
+    title: notificationTitle,
+    body: normalizedMessage,
+    type: "session",
+    data: notificationPayload,
+    recipientId: asObjectId(recipientId),
+    recipientRole,
+    senderId: asObjectId(normalizedSenderId),
+    senderRole: normalizedSenderRole,
+  });
+
+  await sendDirectMessageToRecipient({
+    recipientRole,
+    recipientId,
+    title: notificationTitle,
+    body: normalizedMessage,
+    payload: notificationPayload,
+  });
+
+  await broadcastNotification(notification);
+
+  return {
+    success: true,
+    status: 200,
+    relationType: relation.relationType || "session",
+    relationId: relation.relationId,
+    chatMessage: {
+      id: directMessage._id.toString(),
+      doctorId,
+      patientId,
+      sessionId: resolvedSessionId,
+      senderRole: normalizedSenderRole,
+      senderId: normalizedSenderId,
+      message: normalizedMessage,
+      createdAt: directMessage.createdAt,
+      readByRecipient: directMessage.readByRecipient,
+    },
+    notificationId: notification._id.toString(),
+    counterpartName: finalCounterpartName,
   };
 };
 
@@ -421,7 +665,287 @@ router.get("/:id/status", optionalAuth, async (req, res) => {
 // All other routes require authentication
 router.use(auth);
 
-// ---------------- Patient Sends Message To Doctor ----------------
+// ---------------- Direct Chat Threads ----------------
+// GET /api/sessions/chat/threads
+router.get("/chat/threads", async (req, res) => {
+  try {
+    const role = asText(req.auth?.role).toLowerCase();
+    const authId = asText(req.auth?.id);
+
+    if (!["doctor", "patient"].includes(role)) {
+      return res.status(403).json({
+        success: false,
+        message: "Only doctors and patients can view chat threads.",
+      });
+    }
+
+    if (!isValidObjectId(authId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid user identifier.",
+      });
+    }
+
+    const authObjectId = asObjectId(authId);
+    const isDoctor = role === "doctor";
+    const counterpartField = isDoctor ? "$patientId" : "$doctorId";
+    const matchStage = isDoctor
+      ? { doctorId: authObjectId }
+      : { patientId: authObjectId };
+
+    const threadsRaw = await DirectMessage.aggregate([
+      { $match: matchStage },
+      { $sort: { createdAt: -1 } },
+      {
+        $group: {
+          _id: counterpartField,
+          doctorId: { $first: "$doctorId" },
+          patientId: { $first: "$patientId" },
+          lastMessage: { $first: "$message" },
+          lastSenderRole: { $first: "$senderRole" },
+          lastAt: { $first: "$createdAt" },
+          unreadCount: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    { $eq: ["$recipientRole", role] },
+                    { $eq: ["$recipientId", authObjectId] },
+                    { $eq: ["$readByRecipient", false] },
+                  ],
+                },
+                1,
+                0,
+              ],
+            },
+          },
+        },
+      },
+      { $sort: { lastAt: -1 } },
+      { $limit: 200 },
+    ]);
+
+    const counterpartIds = threadsRaw
+      .map((thread) => asText(thread?._id))
+      .filter(Boolean)
+      .filter((id) => isValidObjectId(id));
+
+    const counterpartDocs = isDoctor
+      ? await User.find({ _id: { $in: counterpartIds } })
+          .select("name email mobile profilePicture")
+          .lean()
+      : await DoctorUser.find({ _id: { $in: counterpartIds } })
+          .select("name email mobile avatar profilePicture profilePictureUrl specialty")
+          .lean();
+
+    const counterpartById = new Map(
+      counterpartDocs.map((entry) => [entry._id.toString(), entry])
+    );
+
+    const threads = threadsRaw.map((thread) => {
+      const counterpartId = asText(thread?._id);
+      const counterpart = counterpartById.get(counterpartId) || {};
+
+      return {
+        counterpartId,
+        counterpartRole: isDoctor ? "patient" : "doctor",
+        counterpartName: resolveParticipantName(
+          counterpart,
+          isDoctor ? "Patient" : "Doctor"
+        ),
+        counterpartEmail: asText(counterpart?.email),
+        counterpartMobile: asText(counterpart?.mobile),
+        counterpartAvatar:
+          asText(
+            counterpart?.profilePictureUrl ||
+              counterpart?.profilePicture ||
+              counterpart?.avatar
+          ) || "",
+        doctorId: asText(thread?.doctorId),
+        patientId: asText(thread?.patientId),
+        lastMessage: asText(thread?.lastMessage),
+        lastSenderRole: asText(thread?.lastSenderRole).toLowerCase(),
+        lastAt: thread?.lastAt || null,
+        unreadCount: Number(thread?.unreadCount || 0),
+      };
+    });
+
+    return res.json({
+      success: true,
+      count: threads.length,
+      threads,
+    });
+  } catch (error) {
+    console.error("Fetch chat threads error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch chat threads",
+      error: error.message,
+    });
+  }
+});
+
+// ---------------- Direct Chat Messages ----------------
+// GET /api/sessions/chat/messages/:counterpartId
+router.get("/chat/messages/:counterpartId", async (req, res) => {
+  try {
+    const role = asText(req.auth?.role).toLowerCase();
+    const authId = asText(req.auth?.id);
+    const counterpartId = asText(req.params.counterpartId);
+    const limit = Math.max(
+      1,
+      Math.min(500, Number.parseInt(req.query.limit, 10) || 200)
+    );
+
+    if (!["doctor", "patient"].includes(role)) {
+      return res.status(403).json({
+        success: false,
+        message: "Only doctors and patients can view chat messages.",
+      });
+    }
+
+    if (!isValidObjectId(authId) || !isValidObjectId(counterpartId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid chat participant identifier.",
+      });
+    }
+
+    const doctorId = role === "doctor" ? authId : counterpartId;
+    const patientId = role === "doctor" ? counterpartId : authId;
+
+    const relation = await resolveDoctorPatientLink({ doctorId, patientId });
+    if (!relation.linkedSession && !relation.linkedAppointment) {
+      return res.status(403).json({
+        success: false,
+        message: "You can only access chats for linked doctor-patient pairs.",
+      });
+    }
+
+    const docs = await DirectMessage.find({
+      doctorId: asObjectId(doctorId),
+      patientId: asObjectId(patientId),
+    })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    const messages = docs.reverse().map((entry) => ({
+      id: entry._id.toString(),
+      doctorId: asText(entry.doctorId),
+      patientId: asText(entry.patientId),
+      sessionId: asText(entry.sessionId),
+      senderRole: asText(entry.senderRole).toLowerCase(),
+      senderId: asText(entry.senderId),
+      recipientRole: asText(entry.recipientRole).toLowerCase(),
+      recipientId: asText(entry.recipientId),
+      message: asText(entry.message),
+      createdAt: entry.createdAt,
+      readByRecipient: entry.readByRecipient === true,
+      readAt: entry.readAt || null,
+    }));
+
+    await DirectMessage.updateMany(
+      {
+        doctorId: asObjectId(doctorId),
+        patientId: asObjectId(patientId),
+        recipientRole: role,
+        recipientId: asObjectId(authId),
+        readByRecipient: false,
+      },
+      {
+        $set: {
+          readByRecipient: true,
+          readAt: new Date(),
+        },
+      }
+    );
+
+    return res.json({
+      success: true,
+      relationType: relation.relationType || "session",
+      relationId: relation.relationId || "",
+      count: messages.length,
+      messages,
+    });
+  } catch (error) {
+    console.error("Fetch chat messages error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch chat messages",
+      error: error.message,
+    });
+  }
+});
+
+// ---------------- Send Direct Message ----------------
+// POST /api/sessions/chat/send
+router.post("/chat/send", async (req, res) => {
+  try {
+    const role = asText(req.auth?.role).toLowerCase();
+    const counterpartId = asText(
+      req.body.counterpartId || req.body.doctorId || req.body.patientId
+    );
+    const text = asText(req.body.message);
+    const sessionId = asText(req.body.sessionId);
+
+    const senderProfile =
+      role === "doctor"
+        ? await DoctorUser.findById(req.auth.id).select("name email").lean()
+        : await User.findById(req.auth.id).select("name email").lean();
+
+    const counterpartProfile =
+      role === "doctor"
+        ? await User.findById(counterpartId).select("name email").lean()
+        : await DoctorUser.findById(counterpartId).select("name email").lean();
+
+    if (!counterpartProfile) {
+      return res.status(404).json({
+        success: false,
+        message:
+          role === "doctor" ? "Patient not found" : "Doctor not found",
+      });
+    }
+
+    const dispatch = await dispatchDirectMessage({
+      senderRole: role,
+      senderId: req.auth.id,
+      counterpartId,
+      message: text,
+      sessionId,
+      senderName: resolveParticipantName(senderProfile, role),
+      counterpartName: resolveParticipantName(
+        counterpartProfile,
+        role === "doctor" ? "Patient" : "Doctor"
+      ),
+    });
+
+    if (!dispatch.success) {
+      return res.status(dispatch.status || 400).json({
+        success: false,
+        message: dispatch.message || "Failed to send direct message",
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "Message sent successfully",
+      relationType: dispatch.relationType,
+      relationId: dispatch.relationId,
+      notificationId: dispatch.notificationId,
+      chatMessage: dispatch.chatMessage,
+    });
+  } catch (error) {
+    console.error("Send direct chat message error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to send direct message",
+      error: error.message,
+    });
+  }
+});
+
+// ---------------- Legacy Patient Chat Endpoint ----------------
 // POST /api/sessions/chat-doctor
 router.post("/chat-doctor", async (req, res) => {
   try {
@@ -434,111 +958,31 @@ router.post("/chat-doctor", async (req, res) => {
 
     const doctorId = asText(req.body.doctorId);
     const doctorName = asText(req.body.doctorName);
-    const message = asText(req.body.message);
+    const text = asText(req.body.message);
     const sessionId = asText(req.body.sessionId);
 
-    if (!doctorId || !message) {
-      return res.status(400).json({
-        success: false,
-        message: "doctorId and message are required",
-      });
-    }
-
-    const doctor = await DoctorUser.findById(doctorId)
-      .select("name email fcmToken avatar profilePicture profilePictureUrl specialty experience mobile createdAt")
-      .lean();
-    if (!doctor) {
-      return res.status(404).json({
-        success: false,
-        message: "Doctor not found",
-      });
-    }
-
-    // Ensure patient has connected with doctor earlier.
-    // Accept either an earlier session link or an appointment link.
-    const linkedSession = await Session.findOne({
-      doctorId,
-      patientId: req.auth.id,
-      status: { $in: ["accepted", "ended", "declined"] },
-    })
-      .sort({ createdAt: -1 })
-      .lean();
-
-    const linkedAppointment = linkedSession
-      ? null
-      : await Appointment.findOne({
-          doctorId,
-          patientId: req.auth.id,
-        })
-          .sort({ appointmentDate: -1, createdAt: -1 })
-          .lean();
-
-    if (!linkedSession && !linkedAppointment) {
-      return res.status(403).json({
-        success: false,
-        message:
-          "You can message only doctors connected through prior sessions or appointments.",
-      });
-    }
-
-    const resolvedSessionId =
-      sessionId ||
-      linkedSession?._id?.toString() ||
-      linkedAppointment?._id?.toString() ||
-      "";
-    const relationType = linkedSession ? "session" : "appointment";
-
-    const { Notification } = await import("../models/Notification.js");
-    const { broadcastNotification } = await import(
-      "../controllers/notificationController.js"
-    );
-    const { sendPushNotification } = await import("../config/firebase.js");
-
-    const senderName =
-      asText(req.user?.name) || asText(req.user?.email) || "Patient";
-    const resolvedDoctorName = asText(doctor.name) || doctorName || "Doctor";
-
-    const notification = await Notification.create({
-      title: `Message from ${senderName}`,
-      body: message,
-      type: "session",
-      data: {
-        type: "PATIENT_MESSAGE",
-        doctorId,
-        sessionId: resolvedSessionId,
-        relationType,
-        patientId: req.auth.id.toString(),
-        doctorName: resolvedDoctorName,
-      },
-      recipientId: doctorId,
-      recipientRole: "doctor",
-      senderId: req.auth.id,
+    const dispatch = await dispatchDirectMessage({
       senderRole: "patient",
+      senderId: req.auth.id,
+      counterpartId: doctorId,
+      message: text,
+      sessionId,
+      senderName: resolveParticipantName(req.user, "Patient"),
+      counterpartName: doctorName || "Doctor",
     });
 
-    if (doctor.fcmToken) {
-      await sendPushNotification(
-        doctor.fcmToken,
-        {
-          title: `New message from ${senderName}`,
-          body: message,
-        },
-        {
-          type: "PATIENT_MESSAGE",
-          doctorId,
-          patientId: req.auth.id.toString(),
-          sessionId: resolvedSessionId,
-          relationType,
-        }
-      );
+    if (!dispatch.success) {
+      return res.status(dispatch.status || 400).json({
+        success: false,
+        message: dispatch.message || "Failed to send message to doctor",
+      });
     }
-
-    await broadcastNotification(notification);
 
     return res.json({
       success: true,
-      message: `Message sent to Dr. ${resolvedDoctorName}`,
-      notificationId: notification._id,
+      message: `Message sent to Dr. ${dispatch.counterpartName}`,
+      notificationId: dispatch.notificationId,
+      chatMessage: dispatch.chatMessage,
     });
   } catch (error) {
     console.error("Chat doctor error:", error);
@@ -602,6 +1046,57 @@ router.get("/requests", async (req, res) => {
       success: false,
       message: "Failed to fetch session requests",
       error: error.message
+    });
+  }
+});
+
+// ---------------- Patient Fetches Pending Session Extension Requests ----------------
+// GET /api/sessions/extension-requests
+router.get("/extension-requests", async (req, res) => {
+  try {
+    if (req.auth.role !== "patient") {
+      return res.status(403).json({
+        success: false,
+        message: "Only patients can view extension requests",
+      });
+    }
+
+    await Session.cleanExpiredSessions();
+
+    const sessions = await Session.find({
+      patientId: req.auth.id,
+      status: "accepted",
+      expiresAt: { $gt: new Date() },
+      "extensionRequest.status": "pending",
+    })
+      .populate(
+        "doctorId",
+        "name email mobile avatar profilePicture profilePictureUrl experience specialty specialization createdAt chatUrl chatDeepLink"
+      )
+      .sort({ "extensionRequest.requestedAt": -1, createdAt: -1 });
+
+    const requests = await Promise.all(
+      sessions.map(async (session) => ({
+        sessionId: session._id.toString(),
+        doctor: await buildDoctorSummary(session.doctorId),
+        minutes: Number(session.extensionRequest?.minutes || 20),
+        requestedAt:
+          session.extensionRequest?.requestedAt || session.updatedAt || session.createdAt,
+        currentExpiresAt: session.expiresAt,
+      }))
+    );
+
+    return res.json({
+      success: true,
+      count: requests.length,
+      requests,
+    });
+  } catch (error) {
+    console.error("Fetch extension requests error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch extension requests",
+      error: error.message,
     });
   }
 });
@@ -1838,48 +2333,295 @@ router.get('/session-history', async (req, res) => {
 });
 
 
-// ---------------- Extend Session Time ----------------
+// ---------------- Doctor Requests Session Extension ----------------
 // POST /api/sessions/extend/:sessionId
 router.post("/extend/:sessionId", async (req, res) => {
   try {
+    if (req.auth?.role !== "doctor") {
+      return res.status(403).json({
+        success: false,
+        message: "Only doctors can request session extensions",
+      });
+    }
+
     const { sessionId } = req.params;
-    const { minutes = 20 } = req.body;
+    const minutes = normalizeMinutes(req.body?.minutes, 20);
 
-    // Validate sessionId format
     if (!sessionId || !sessionId.match(/^[0-9a-fA-F]{24}$/)) {
-      return res.status(400).json({ success: false, message: "Invalid session ID format" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid session ID format" });
     }
 
-    const session = await Session.findById(sessionId);
+    const session = await Session.findById(sessionId).populate(
+      "doctorId",
+      "name email mobile avatar profilePicture profilePictureUrl experience specialty specialization createdAt chatUrl chatDeepLink"
+    );
     if (!session) {
-      return res.status(404).json({ success: false, message: "Session not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Session not found" });
     }
 
-    // Verify ownership
     if (session.doctorId.toString() !== req.auth.id.toString()) {
-      return res.status(403).json({ success: false, message: "You can only extend your own sessions" });
+      return res.status(403).json({
+        success: false,
+        message: "You can only extend your own sessions",
+      });
     }
 
-    // Extend from current expiration or now, whichever is later
-    const baseTime = Math.max(Date.now(), session.expiresAt.getTime());
-    session.expiresAt = new Date(baseTime + (minutes * 60 * 1000));
-    session.status = "accepted"; // Ensure it remains active if it was pending or something
+    if (session.status !== "accepted") {
+      return res.status(409).json({
+        success: false,
+        message: "Only active accepted sessions can be extended",
+      });
+    }
+
+    if (session.expiresAt <= new Date()) {
+      return res.status(410).json({
+        success: false,
+        message: "Session has already expired",
+      });
+    }
+
+    if (session.extensionRequest?.status === "pending") {
+      return res.status(409).json({
+        success: false,
+        message: "An extension request is already pending patient approval",
+      });
+    }
+
+    session.extensionRequest = {
+      status: "pending",
+      minutes,
+      requestedAt: new Date(),
+      respondedAt: null,
+      requestedBy: asObjectId(req.auth.id),
+    };
 
     await session.save();
 
-    console.log(`⏰ Session ${sessionId} extended by ${minutes} minutes for doctor ${req.auth.id}`);
+    const doctorName = resolveParticipantName(session.doctorId, "Doctor");
+    const patientRecipientId = asText(session.patientId);
+
+    try {
+      const { Notification } = await import("../models/Notification.js");
+      const { broadcastNotification } = await import(
+        "../controllers/notificationController.js"
+      );
+
+      const notificationPayload = {
+        type: "SESSION_EXTENSION_REQUEST",
+        sessionId: session._id.toString(),
+        doctorId: asText(session.doctorId?._id || session.doctorId),
+        doctorName,
+        minutes: String(minutes),
+        requestedAt: session.extensionRequest.requestedAt?.toISOString() || "",
+        currentExpiresAt: session.expiresAt?.toISOString() || "",
+      };
+
+      const notification = await Notification.create({
+        title: "Session Extension Request",
+        body: `Dr. ${doctorName} requested ${minutes} more minutes for this session.`,
+        type: "session",
+        data: notificationPayload,
+        recipientId: asObjectId(patientRecipientId),
+        recipientRole: "patient",
+        senderId: asObjectId(req.auth.id),
+        senderRole: "doctor",
+      });
+
+      await sendNotification(
+        patientRecipientId,
+        "Session Extension Request",
+        `Dr. ${doctorName} requested ${minutes} more minutes for this session.`,
+        notificationPayload
+      );
+
+      await broadcastNotification(notification);
+    } catch (notificationError) {
+      console.error(
+        "Failed to notify patient about extension request:",
+        notificationError
+      );
+    }
 
     res.json({
       success: true,
-      message: `Session extended by ${minutes} minutes`,
+      message: `Extension request for ${minutes} minutes sent to patient`,
       data: {
-        expiresAt: session.expiresAt,
-        timeRemaining: Math.max(0, Math.floor((session.expiresAt - new Date()) / 1000))
-      }
+        sessionId: session._id.toString(),
+        status: session.extensionRequest.status,
+        minutes,
+        requestedAt: session.extensionRequest.requestedAt,
+        currentExpiresAt: session.expiresAt,
+      },
     });
   } catch (error) {
-    console.error("❌ Extend session error:", error);
-    res.status(500).json({ success: false, message: "Failed to extend session", error: error.message });
+    console.error("Extend session request error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to request session extension",
+      error: error.message,
+    });
+  }
+});
+
+// ---------------- Patient Responds To Session Extension Request ----------------
+// POST /api/sessions/extend/:sessionId/respond
+router.post("/extend/:sessionId/respond", async (req, res) => {
+  try {
+    if (req.auth?.role !== "patient") {
+      return res.status(403).json({
+        success: false,
+        message: "Only patients can respond to extension requests",
+      });
+    }
+
+    const { sessionId } = req.params;
+    const requestedStatus = asText(req.body?.status).toLowerCase();
+    if (!["accepted", "declined"].includes(requestedStatus)) {
+      return res.status(400).json({
+        success: false,
+        message: "Status must be 'accepted' or 'declined'",
+      });
+    }
+
+    if (!sessionId || !sessionId.match(/^[0-9a-fA-F]{24}$/)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid session ID format",
+      });
+    }
+
+    const session = await Session.findById(sessionId).populate(
+      "doctorId",
+      "name email mobile avatar profilePicture profilePictureUrl experience specialty specialization createdAt chatUrl chatDeepLink"
+    );
+    if (!session) {
+      return res.status(404).json({
+        success: false,
+        message: "Session not found",
+      });
+    }
+
+    if (asText(session.patientId) !== asText(req.auth.id)) {
+      return res.status(403).json({
+        success: false,
+        message: "You can only respond to your own extension requests",
+      });
+    }
+
+    if (session.status !== "accepted" || session.expiresAt <= new Date()) {
+      return res.status(410).json({
+        success: false,
+        message: "Session is no longer active",
+      });
+    }
+
+    if (session.extensionRequest?.status !== "pending") {
+      return res.status(409).json({
+        success: false,
+        message: "No pending extension request found for this session",
+      });
+    }
+
+    const requestedMinutes = normalizeMinutes(
+      session.extensionRequest?.minutes,
+      20
+    );
+    session.extensionRequest.status = requestedStatus;
+    session.extensionRequest.respondedAt = new Date();
+    session.extensionRequest.minutes = requestedMinutes;
+
+    if (requestedStatus === "accepted") {
+      const baseTime = Math.max(Date.now(), session.expiresAt.getTime());
+      session.expiresAt = new Date(baseTime + requestedMinutes * 60 * 1000);
+      session.status = "accepted";
+    }
+
+    await session.save();
+
+    const doctorRecipientId = asText(
+      session.doctorId && typeof session.doctorId === "object"
+        ? session.doctorId._id
+        : session.doctorId
+    );
+    const doctorName = resolveParticipantName(session.doctorId, "Doctor");
+
+    try {
+      const { Notification } = await import("../models/Notification.js");
+      const { broadcastNotification } = await import(
+        "../controllers/notificationController.js"
+      );
+
+      const notificationPayload = {
+        type: "SESSION_EXTENSION_RESPONSE",
+        sessionId: session._id.toString(),
+        status: requestedStatus,
+        patientId: asText(req.auth.id),
+        minutes: String(requestedMinutes),
+        expiresAt: session.expiresAt?.toISOString() || "",
+        respondedAt: session.extensionRequest.respondedAt?.toISOString() || "",
+      };
+
+      const notification = await Notification.create({
+        title:
+          requestedStatus === "accepted"
+            ? "Session Extension Approved"
+            : "Session Extension Declined",
+        body:
+          requestedStatus === "accepted"
+            ? `Patient approved +${requestedMinutes} minutes for this session.`
+            : "Patient declined your session extension request.",
+        type: "session",
+        data: notificationPayload,
+        recipientId: asObjectId(doctorRecipientId),
+        recipientRole: "doctor",
+        senderId: asObjectId(req.auth.id),
+        senderRole: "patient",
+      });
+
+      await sendNotificationToDoctor(
+        doctorRecipientId,
+        requestedStatus === "accepted"
+          ? "Session Extension Approved"
+          : "Session Extension Declined",
+        requestedStatus === "accepted"
+          ? `Patient approved +${requestedMinutes} minutes for this session.`
+          : "Patient declined your session extension request.",
+        notificationPayload
+      );
+
+      await broadcastNotification(notification);
+    } catch (notificationError) {
+      console.error(
+        "Failed to notify doctor about extension response:",
+        notificationError
+      );
+    }
+
+    return res.json({
+      success: true,
+      message:
+        requestedStatus === "accepted"
+          ? `Session extended by ${requestedMinutes} minutes`
+          : "Session extension request declined",
+      data: {
+        sessionId: session._id.toString(),
+        status: requestedStatus,
+        minutes: requestedMinutes,
+        expiresAt: session.expiresAt,
+        doctorName,
+      },
+    });
+  } catch (error) {
+    console.error("Respond extension request error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to respond to extension request",
+      error: error.message,
+    });
   }
 });
 
@@ -1978,6 +2720,7 @@ router.patch('/:sessionId/update', async (req, res) => {
 
 
 export default router;
+
 
 
 

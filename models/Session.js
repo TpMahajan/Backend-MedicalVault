@@ -56,6 +56,31 @@ const sessionSchema = new mongoose.Schema(
       type: Date,
     },
 
+    // Doctor-initiated extension request metadata (patient must respond)
+    extensionRequest: {
+      status: {
+        type: String,
+        enum: ["none", "pending", "accepted", "declined"],
+        default: "none",
+      },
+      minutes: {
+        type: Number,
+        default: 0,
+        min: 0,
+        max: 180,
+      },
+      requestedAt: {
+        type: Date,
+      },
+      respondedAt: {
+        type: Date,
+      },
+      requestedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "DoctorUser",
+      },
+    },
+
     // New fields for medical records/history
     diagnosis: {
       type: String,

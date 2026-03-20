@@ -38,6 +38,7 @@ import inventoryRoutes from "./routes/inventory.js";           // public invento
 import { Session } from "./models/Session.js";
 import { checkEmailConfig } from "./utils/emailService.js";
 import patientAppointmentRoutes from "./routes/patientAppointments.js"; // patient appointments (Flutter)
+import { initPublicConfigRealtime } from "./services/publicConfigRealtime.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -185,12 +186,14 @@ const startServer = async () => {
       sessionCleanupTimer.unref();
     }
 
-    app.listen(PORT, "0.0.0.0", () => {
+    const server = app.listen(PORT, "0.0.0.0", () => {
       console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
       console.log(`📚 Health check: http://0.0.0.0:${PORT}/health`);
       console.log(`📂 Serving uploads at: http://0.0.0.0:${PORT}/uploads`);
       console.log(`⏰ Cron jobs initialized for reminders`);
     });
+
+    initPublicConfigRealtime(server);
   } catch (err) {
     console.error("❌ Failed to start server:", err);
     process.exit(1);

@@ -1,5 +1,7 @@
 import mongoose from "mongoose";
 
+const ALERT_PLATFORM_VALUES = ["APP", "WEB"];
+
 const uiActionSchema = new mongoose.Schema(
   {
     label: { type: String, required: true, trim: true, maxlength: 80 },
@@ -38,6 +40,17 @@ const uiAlertSchema = new mongoose.Schema(
       enum: ["ALL", "APP", "WEB"],
       uppercase: true,
       trim: true,
+    },
+    platforms: {
+      type: [
+        {
+          type: String,
+          enum: ALERT_PLATFORM_VALUES,
+          uppercase: true,
+          trim: true,
+        },
+      ],
+      default: undefined,
     },
     priority: {
       type: String,
@@ -84,5 +97,51 @@ const uiConfigSchema = new mongoose.Schema(
     collection: "ui_config",
   }
 );
+
+uiConfigSchema.pre("validate", function normalizeAlertPlatforms(next) {
+  if (!Array.isArray(this.dashboardAlerts)) {
+    next();
+    return;
+  }
+
+  this.dashboardAlerts = this.dashboardAlerts.map((alert) => {
+    if (!alert || typeof alert !== "object") return alert;
+    const normalized = Array.isArray(alert.platforms)
+      ? [...new Set(
+          alert.platforms
+            .map((entry) => String(entry || "").trim().toUpperCase())
+            .filter((entry) => ALERT_PLATFORM_VALUES.includes(entry))
+        )]
+      : [];
+
+    if (normalized.length > 0) {
+      alert.platforms = normalized;
+      if (!alert.platform || alert.platform === "ALL") {
+        alert.platform =
+          normalized.length >= ALERT_PLATFORM_VALUES.length
+            ? "ALL"
+            : normalized.join(",");
+      }
+      return alert;
+    }
+
+    const legacy = String(alert.platform || "ALL").trim().toUpperCase();
+    if (!legacy || legacy === "ALL") {
+      alert.platforms = [...ALERT_PLATFORM_VALUES];
+      alert.platform = "ALL";
+      return alert;
+    }
+    if (ALERT_PLATFORM_VALUES.includes(legacy)) {
+      alert.platforms = [legacy];
+      alert.platform = legacy;
+    } else {
+      alert.platforms = [...ALERT_PLATFORM_VALUES];
+      alert.platform = "ALL";
+    }
+    return alert;
+  });
+
+  next();
+});
 
 export const UIConfig = mongoose.model("UIConfig", uiConfigSchema);

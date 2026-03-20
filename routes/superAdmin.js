@@ -14,6 +14,11 @@ import { SuperAdminActivityLog } from "../models/SuperAdminActivityLog.js";
 import { AdvertisementClickLog } from "../models/AdvertisementClickLog.js";
 import { clearPublicConfigCache } from "./publicConfig.js";
 import { initializeFirebase, sendPushNotification } from "../config/firebase.js";
+import {
+  PUBLIC_AD_SURFACES,
+  PUBLIC_ALERT_PLATFORMS,
+  broadcastPublicConfigEvent,
+} from "../services/publicConfigRealtime.js";
 
 const router = express.Router();
 initializeFirebase();
@@ -43,7 +48,8 @@ const PERMISSIONS = [
 ];
 const USER_ROLES = ["PATIENT", "DOCTOR", "ADMIN"];
 const ALERT_AUDIENCES = ["ALL", "PATIENT", "DOCTOR"];
-const ALERT_PLATFORMS = ["ALL", "APP", "WEB"];
+const ALERT_PLATFORMS = ["ALL", ...PUBLIC_ALERT_PLATFORMS];
+const AD_SURFACES = [...PUBLIC_AD_SURFACES];
 
 function normalizeRole(value) {
   return String(value || "")
@@ -85,6 +91,45 @@ function normalizeAlertPlatform(value) {
     .trim()
     .toUpperCase();
   return ALERT_PLATFORMS.includes(platform) ? platform : "ALL";
+}
+
+function normalizeAlertPlatforms(value) {
+  const raw = Array.isArray(value) ? value : [value];
+  const normalized = raw
+    .flatMap((entry) =>
+      String(entry || "")
+        .split(",")
+        .map((part) => part.trim().toUpperCase())
+        .filter(Boolean)
+    )
+    .filter((entry) => ALERT_PLATFORMS.includes(entry));
+
+  if (normalized.includes("ALL")) return [...PUBLIC_ALERT_PLATFORMS];
+  const unique = [...new Set(normalized.filter((entry) => entry !== "ALL"))];
+  return unique.length > 0 ? unique : [...PUBLIC_ALERT_PLATFORMS];
+}
+
+function normalizeAdPlacements(value) {
+  const raw = Array.isArray(value) ? value : [value];
+  const normalized = raw
+    .flatMap((entry) =>
+      String(entry || "")
+        .split(",")
+        .map((part) => part.trim().toUpperCase())
+        .filter(Boolean)
+    )
+    .filter((entry) => AD_SURFACES.includes(entry) || entry === "ALL");
+
+  if (normalized.includes("ALL")) return [...AD_SURFACES];
+  const unique = [...new Set(normalized.filter((entry) => entry !== "ALL"))];
+  return unique;
+}
+
+function summarizeAlertPlatform(platforms) {
+  const normalized = Array.isArray(platforms) ? platforms : [];
+  if (normalized.length >= PUBLIC_ALERT_PLATFORMS.length) return "ALL";
+  if (normalized.length === 1) return normalized[0];
+  return normalized.join(",");
 }
 
 function normalizeDurationMinutes(value, fallback = 2) {
@@ -384,10 +429,21 @@ router.get("/alerts", requireSuperAdminAuth, async (req, res) => {
       })
       .slice(0, limit);
 
+    const normalizedAlerts = filtered.map((alert) => {
+      const platforms = normalizeAlertPlatforms(
+        alert?.platforms ?? alert?.platform
+      );
+      return {
+        ...alert,
+        platforms,
+        platform: summarizeAlertPlatform(platforms),
+      };
+    });
+
     return res.json({
       success: true,
-      count: filtered.length,
-      alerts: filtered,
+      count: normalizedAlerts.length,
+      alerts: normalizedAlerts,
     });
   } catch (error) {
     return res.status(500).json({
@@ -403,7 +459,10 @@ router.post("/alerts/broadcast", requireSuperAdminAuth, async (req, res) => {
     const title = String(req.body.title || "System Alert").trim();
     const message = String(req.body.message || req.body.body || "").trim();
     const audience = normalizeAlertAudience(req.body.audience);
-    const platform = normalizeAlertPlatform(req.body.platform);
+    const platforms = normalizeAlertPlatforms(
+      req.body.platforms ?? req.body.platform
+    );
+    const platform = summarizeAlertPlatform(platforms);
     const durationMinutes = normalizeDurationMinutes(req.body.durationMinutes);
     const highlight = toBoolean(req.body.highlight, true);
     const priority = String(req.body.priority || "HIGH")
@@ -432,6 +491,7 @@ router.post("/alerts/broadcast", requireSuperAdminAuth, async (req, res) => {
       message,
       audience,
       platform,
+      platforms,
       priority: normalizedPriority,
       highlight,
       isActive: true,
@@ -460,6 +520,12 @@ router.post("/alerts/broadcast", requireSuperAdminAuth, async (req, res) => {
     config.updatedBy = req.superAdmin.email;
     await config.save();
     clearPublicConfigCache();
+    broadcastPublicConfigEvent({
+      type: "alerts.updated",
+      platforms,
+      surfaces: [],
+      reason: "SUPERADMIN_ALERT_BROADCAST",
+    });
 
     await logActivity(req, {
       action: "BROADCAST_ALERT",
@@ -469,6 +535,7 @@ router.post("/alerts/broadcast", requireSuperAdminAuth, async (req, res) => {
         title: newAlert.title,
         audience,
         platform,
+        platforms,
         durationMinutes,
         highlight,
         priority: normalizedPriority,
@@ -1132,7 +1199,9 @@ router.get("/advertisements", requireSuperAdminAuth, async (req, res) => {
   try {
     const placement = normalizeRole(req.query.placement || "");
     const query = {};
-    if (placement) query.placement = placement;
+    if (placement) {
+      query.$or = [{ placement }, { placements: placement }];
+    }
     const ads = await Advertisement.find(query).sort({ createdAt: -1 }).lean();
     return res.json({ success: true, advertisements: ads });
   } catch (error) {
@@ -1174,11 +1243,15 @@ router.get(
 
 router.post("/advertisements", requireSuperAdminAuth, async (req, res) => {
   try {
+    const placements = normalizeAdPlacements(
+      req.body.placements ?? req.body.placement
+    );
     const payload = {
       title: String(req.body.title || "").trim(),
       imageUrl: String(req.body.imageUrl || "").trim(),
       redirectUrl: String(req.body.redirectUrl || "").trim(),
-      placement: normalizeRole(req.body.placement),
+      placement: placements[0] || "",
+      placements,
       isActive: toBoolean(req.body.isActive, true),
       startDate: req.body.startDate,
       endDate: req.body.endDate,
@@ -1186,10 +1259,17 @@ router.post("/advertisements", requireSuperAdminAuth, async (req, res) => {
       updatedBy: req.superAdmin.email,
     };
 
-    if (!payload.title || !payload.imageUrl || !payload.redirectUrl || !payload.placement) {
+    if (
+      !payload.title ||
+      !payload.imageUrl ||
+      !payload.redirectUrl ||
+      !payload.placement ||
+      placements.length === 0
+    ) {
       return res.status(400).json({
         success: false,
-        message: "title, imageUrl, redirectUrl and placement are required",
+        message:
+          "title, imageUrl, redirectUrl and at least one placement are required",
       });
     }
     if (!validateDateOrder(payload.startDate, payload.endDate)) {
@@ -1201,12 +1281,18 @@ router.post("/advertisements", requireSuperAdminAuth, async (req, res) => {
 
     const ad = await Advertisement.create(payload);
     clearPublicConfigCache();
+    broadcastPublicConfigEvent({
+      type: "ads.updated",
+      surfaces: ad.placements || [ad.placement].filter(Boolean),
+      platforms: [],
+      reason: "SUPERADMIN_ADVERTISEMENT_CREATED",
+    });
 
     await logActivity(req, {
       action: "CREATE_ADVERTISEMENT",
       targetType: "ADVERTISEMENT",
       targetId: ad._id?.toString(),
-      details: { placement: ad.placement, title: ad.title },
+      details: { placements: ad.placements || [ad.placement], title: ad.title },
     });
 
     return res.status(201).json({ success: true, advertisement: ad });
@@ -1229,7 +1315,19 @@ router.put("/advertisements/:id", requireSuperAdminAuth, async (req, res) => {
     if (req.body.title != null) ad.title = String(req.body.title).trim();
     if (req.body.imageUrl != null) ad.imageUrl = String(req.body.imageUrl).trim();
     if (req.body.redirectUrl != null) ad.redirectUrl = String(req.body.redirectUrl).trim();
-    if (req.body.placement != null) ad.placement = normalizeRole(req.body.placement);
+    if (req.body.placements != null || req.body.placement != null) {
+      const placements = normalizeAdPlacements(
+        req.body.placements ?? req.body.placement
+      );
+      if (placements.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "At least one valid placement is required",
+        });
+      }
+      ad.placements = placements;
+      ad.placement = placements[0];
+    }
     if (req.body.isActive != null) ad.isActive = toBoolean(req.body.isActive, ad.isActive);
     if (req.body.startDate != null) ad.startDate = req.body.startDate;
     if (req.body.endDate != null) ad.endDate = req.body.endDate;
@@ -1244,12 +1342,21 @@ router.put("/advertisements/:id", requireSuperAdminAuth, async (req, res) => {
 
     await ad.save();
     clearPublicConfigCache();
+    broadcastPublicConfigEvent({
+      type: "ads.updated",
+      surfaces: ad.placements || [ad.placement].filter(Boolean),
+      platforms: [],
+      reason: "SUPERADMIN_ADVERTISEMENT_UPDATED",
+    });
 
     await logActivity(req, {
       action: "UPDATE_ADVERTISEMENT",
       targetType: "ADVERTISEMENT",
       targetId: ad._id?.toString(),
-      details: { placement: ad.placement, isActive: ad.isActive },
+      details: {
+        placements: ad.placements || [ad.placement],
+        isActive: ad.isActive,
+      },
     });
 
     return res.json({ success: true, advertisement: ad });
@@ -1268,14 +1375,21 @@ router.delete("/advertisements/:id", requireSuperAdminAuth, async (req, res) => 
     if (!ad) {
       return res.status(404).json({ success: false, message: "Advertisement not found" });
     }
+    const surfaces = ad.placements || [ad.placement].filter(Boolean);
     await ad.deleteOne();
     clearPublicConfigCache();
+    broadcastPublicConfigEvent({
+      type: "ads.updated",
+      surfaces,
+      platforms: [],
+      reason: "SUPERADMIN_ADVERTISEMENT_DELETED",
+    });
 
     await logActivity(req, {
       action: "DELETE_ADVERTISEMENT",
       targetType: "ADVERTISEMENT",
       targetId: req.params.id,
-      details: { title: ad.title },
+      details: { title: ad.title, placements: surfaces },
     });
 
     return res.json({ success: true, message: "Advertisement deleted" });
@@ -1429,13 +1543,14 @@ router.get("/ui-config", requireSuperAdminAuth, async (req, res) => {
 router.put("/ui-config", requireSuperAdminAuth, async (req, res) => {
   try {
     const payload = {};
+    const hasDashboardAlerts = Array.isArray(req.body.dashboardAlerts);
     if (req.body.buttonColor != null) payload.buttonColor = String(req.body.buttonColor).trim();
     if (req.body.iconColor != null) payload.iconColor = String(req.body.iconColor).trim();
     if (req.body.cardStyle != null) payload.cardStyle = String(req.body.cardStyle).trim().toUpperCase();
     if (req.body.themeMode != null) payload.themeMode = String(req.body.themeMode).trim().toUpperCase();
     if (Array.isArray(req.body.qrActions)) payload.qrActions = req.body.qrActions;
     if (Array.isArray(req.body.dashboardCards)) payload.dashboardCards = req.body.dashboardCards;
-    if (Array.isArray(req.body.dashboardAlerts)) payload.dashboardAlerts = req.body.dashboardAlerts;
+    if (hasDashboardAlerts) payload.dashboardAlerts = req.body.dashboardAlerts;
     payload.updatedBy = req.superAdmin.email;
 
     const config = await UIConfig.findOneAndUpdate(
@@ -1445,6 +1560,20 @@ router.put("/ui-config", requireSuperAdminAuth, async (req, res) => {
     ).lean();
 
     clearPublicConfigCache();
+    if (hasDashboardAlerts) {
+      broadcastPublicConfigEvent({
+        type: "alerts.updated",
+        platforms: [...PUBLIC_ALERT_PLATFORMS],
+        surfaces: [],
+        reason: "UI_CONFIG_ALERTS_UPDATED",
+      });
+    }
+    broadcastPublicConfigEvent({
+      type: "ui-config.updated",
+      platforms: [...PUBLIC_ALERT_PLATFORMS],
+      surfaces: [...AD_SURFACES],
+      reason: "UI_CONFIG_UPDATED",
+    });
     await logActivity(req, {
       action: "UPDATE_UI_CONFIG",
       targetType: "UI_CONFIG",
