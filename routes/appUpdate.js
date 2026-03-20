@@ -61,7 +61,8 @@ function loadUpdateConfig() {
   let parsed;
   try {
     const raw = fs.readFileSync(updateConfigPath, "utf-8");
-    parsed = JSON.parse(raw);
+    const normalizedRaw = raw.replace(/^\uFEFF/, "").trim();
+    parsed = JSON.parse(normalizedRaw);
   } catch (error) {
     throw new Error("Invalid app-update.json content");
   }
