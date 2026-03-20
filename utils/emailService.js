@@ -10,7 +10,12 @@ const MAIL_FROM_RESEND = process.env.MAIL_FROM_RESEND || "onboarding@resend.dev"
 // SMTP or generic mail-from (used by nodemailer paths elsewhere)
 const MAIL_FROM = process.env.MAIL_FROM || process.env.SMTP_USER || "no-reply@medicalvault.app";
 const APP_BASE_URL = process.env.APP_BASE_URL || "https://backend-medicalvault.onrender.com";
-const APP_WEB_URL = process.env.FRONTEND_URL || process.env.APP_WEB_URL || "https://health-vault-web.vercel.app";
+const APP_WEB_URL =
+  process.env.FRONTEND_URL ||
+  process.env.APP_WEB_URL ||
+  (process.env.NODE_ENV === "production"
+    ? "https://health-vault-web.vercel.app"
+    : "http://localhost:5173");
 const APP_DEEP_LINK = process.env.APP_DEEP_LINK || "aially";
 
 // Optional SMTP fallback (Gmail 465/587)

@@ -177,3 +177,20 @@ export const optionalAuth = async (req, res, next) => {
     next(); // continue without authentication
   }
 };
+
+// Role guards (used by some route modules)
+export const requireDoctor = (req, res, next) => {
+  const role = req.auth?.role;
+  if (role !== "doctor") {
+    return res.status(403).json({ success: false, message: "Doctor access required" });
+  }
+  next();
+};
+
+export const requirePatient = (req, res, next) => {
+  const role = req.auth?.role;
+  if (role !== "patient") {
+    return res.status(403).json({ success: false, message: "Patient access required" });
+  }
+  next();
+};

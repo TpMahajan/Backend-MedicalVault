@@ -7,6 +7,7 @@ import { Document } from "../models/File.js";
 import { Appointment } from "../models/Appointment.js";
 import { AIChat } from "../models/AIChat.js";
 import DocumentReader from "../services/documentReader.js";
+import { ok, fail } from "../utils/apiResponse.js";
 
 const router = express.Router();
 const documentReader = new DocumentReader();
@@ -1386,6 +1387,138 @@ router.delete("/chat", auth, async (req, res) => {
   } catch (error) {
     console.error('Chat clear error:', error);
     res.status(500).json({ success: false, message: 'Failed to clear chat' });
+  }
+});
+
+// POST /api/ai/appointment-summary - Generate AI summary for a completed appointment
+// (Flutter calls this endpoint when user taps "Generate AI Summary" on appointment detail)
+router.post("/appointment-summary", auth, async (req, res) => {
+  try {
+    const { appointmentId } = req.body || {};
+    if (!appointmentId) {
+      return fail(res, { status: 400, message: "appointmentId is required" });
+    }
+
+    const appointment = await Appointment.findById(appointmentId).lean();
+    if (!appointment) {
+      return fail(res, { status: 404, message: "Appointment not found" });
+    }
+    if (appointment.status !== "completed") {
+      return fail(res, {
+        status: 400,
+        message: "Only completed appointments can be summarized",
+      });
+    }
+
+    const patientId = appointment.patientId?.toString();
+    const doctorId = appointment.doctorId?.toString();
+    const isPatient =
+      req.auth?.role !== "doctor" && req.user?._id?.toString() === patientId;
+    const isDoctor =
+      req.auth?.role === "doctor" && req.doctor?._id?.toString() === doctorId;
+
+    if (!isPatient && !isDoctor) {
+      return fail(res, { status: 403, message: "Access denied" });
+    }
+
+    const linkedDocs = await Document.find({
+      userId: patientId,
+      appointmentId: appointment._id,
+    }).lean();
+
+    const notesShared = (appointment.doctorNotesShared || "").trim();
+    const reason = (appointment.reason || "").trim();
+
+    let docContext = "";
+    if (linkedDocs.length > 0) {
+      docContext = linkedDocs
+        .map(
+          (d) =>
+            `- ${d.type || d.category}: ${d.title || d.originalName || "Document"}`
+        )
+        .join("\n");
+    }
+
+    const prompt = `You are a medical assistant. Summarize this doctor visit for the patient in simple, non-medical language.
+
+Visit details:
+- Reason for visit: ${reason}
+- Doctor notes (shared with patient): ${notesShared || "None"}
+${docContext ? `- Documents from this visit:\n${docContext}` : ""}
+
+Provide:
+1. A 2-3 sentence summary of what happened in this visit.
+2. A "What happened" explanation in 3-4 bullet points using very simple language a patient can understand.
+3. If relevant, suggest a follow-up timeline in days (e.g., "Consider a follow-up in 7-14 days") or write "No specific follow-up suggested."
+
+Format your response as JSON:
+{
+  "summary": "2-3 sentence summary",
+  "visitExplanation": "Bullet 1\\nBullet 2\\nBullet 3",
+  "suggestedFollowUpDays": 7 or null
+}`;
+
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!openaiKey) {
+      // Backward-compatible fields used by Flutter when success=true
+      return fail(res, {
+        status: 503,
+        message: "AI service not configured",
+        legacy: {
+          summary: "No clinical notes recorded for this visit.",
+          visitExplanation: "Unable to generate AI summary at this time.",
+          suggestedFollowUpDays: null,
+        },
+      });
+    }
+
+    const axios = (await import("axios")).default;
+    const completion = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.3,
+      },
+      { headers: { Authorization: `Bearer ${openaiKey}` } }
+    );
+
+    const content = completion.data?.choices?.[0]?.message?.content || "";
+    let summary = "";
+    let visitExplanation = "";
+    let suggestedFollowUpDays = null;
+    try {
+      const parsed = JSON.parse(
+        content.replace(/```json\n?|\n?```/g, "").trim()
+      );
+      summary = parsed.summary || "";
+      visitExplanation = parsed.visitExplanation || "";
+      suggestedFollowUpDays = parsed.suggestedFollowUpDays ?? null;
+    } catch (_) {
+      summary = content.slice(0, 500);
+    }
+
+    const { AppointmentAIInsight } = await import(
+      "../models/AppointmentAIInsight.js"
+    );
+    await AppointmentAIInsight.findOneAndUpdate(
+      { appointmentId: appointment._id },
+      { appointmentId: appointment._id, summary, visitExplanation, suggestedFollowUpDays },
+      { upsert: true, new: true }
+    );
+
+    return ok(res, {
+      message: "Appointment summary generated",
+      data: { summary, visitExplanation, suggestedFollowUpDays },
+      // Flutter reads these top-level keys directly
+      legacy: { summary, visitExplanation, suggestedFollowUpDays },
+    });
+  } catch (error) {
+    console.error("Appointment summary error:", error);
+    return fail(res, {
+      status: 500,
+      message: error.message || "Failed to generate summary",
+    });
   }
 });
 

@@ -27,6 +27,7 @@ import notificationRoutes from "./routes/notifications.js"; // notifications
 import profileRoutes from "./routes/profiles.js";       // profile switching
 import aiAssistantRoutes from "./routes/aiAssistant.js"; // AI assistant ✅
 import sosRoutes from "./routes/sosRoutes.js";          // SOS messages
+import appUpdateRoutes from "./routes/appUpdate.js";
 import adminAuthRoutes from "./routes/adminAuth.js";    // admin auth
 import lostFoundRoutes from "./routes/lostFound.js";    // lost & found (user)
 import adminLostFoundRoutes from "./routes/adminLostFound.js"; // lost & found admin
@@ -34,6 +35,7 @@ import adminInventoryRoutes from "./routes/adminInventory.js"; // admin inventor
 import inventoryRoutes from "./routes/inventory.js";           // public inventory (checkout)
 import { Session } from "./models/Session.js";
 import { checkEmailConfig } from "./utils/emailService.js";
+import patientAppointmentRoutes from "./routes/patientAppointments.js"; // patient appointments (Flutter)
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -49,7 +51,37 @@ app.use(
     crossOriginResourcePolicy: false, // Allow images to be loaded from different origins
   })
 );
-app.use(cors({ origin: "*", credentials: true }));
+
+const defaultCorsOrigins = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "https://health-vault-web.vercel.app",
+];
+
+const envCorsOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const allowedCorsOrigins = new Set([
+  ...defaultCorsOrigins,
+  ...envCorsOrigins,
+]);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedCorsOrigins.has(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error(`Not allowed by CORS: ${origin}`));
+    },
+    credentials: true,
+  })
+);
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(compression({
@@ -84,6 +116,7 @@ app.use("/api/auth", authRoutes);             // patients
 app.use("/api/doctors", doctorAuthRoutes);    // doctors ✅
 app.use("/api/files", documentRoutes);        // documents
 app.use("/api/appointments", appointmentRoutes); // appointments ✅
+app.use("/api/patient", patientAppointmentRoutes); // patient appointments (Flutter) ✅
 app.use("/api/qr", qrRoutes);                 // QR
 app.use("/api/users", userRoutes);            // user management
 app.use("/api/sessions", sessionRoutes);      // session requests
@@ -91,6 +124,7 @@ app.use("/api/notifications", notificationRoutes); // notifications
 app.use("/api/profiles", profileRoutes);      // profile switching
 app.use("/api/ai", aiAssistantRoutes);        // AI assistant ✅
 app.use("/api/sos", sosRoutes);               // SOS
+app.use("/api/app", appUpdateRoutes);
 app.use("/api/admin", adminAuthRoutes);       // admin auth
 app.use("/api/lost-found", lostFoundRoutes);  // lost & found
 app.use("/api/admin/lost-found", adminLostFoundRoutes); // admin lost & found
@@ -115,6 +149,7 @@ app.get("/health", (req, res) =>
       "/api/notifications",
       "/api/profiles",
       "/api/ai",
+      "/api/app",
       "/api/admin",
     ],
   })
@@ -167,4 +202,5 @@ process.on("uncaughtException", (err) => {
 });
 
 startServer();
+
 

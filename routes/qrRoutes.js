@@ -4,6 +4,7 @@ import jwt from "jsonwebtoken";
 import { auth } from "../middleware/auth.js";
 import { User } from "../models/User.js";
 import QRCode from "../models/QRCode.js"; // <-- new model
+import { ok, fail } from "../utils/apiResponse.js";
 
 const router = express.Router();
 
@@ -54,15 +55,20 @@ router.post("/generate", auth, async (req, res) => {
     // Build Web URL for anonymous access via Vercel-hosted web app
     const qrUrl = `https://health-vault-web.vercel.app/patient-details/${req.user._id.toString()}?token=${encodeURIComponent(token)}`;
 
-    return res.json({
-      ok: true,
-      token,
-      qrUrl,
-      expiresAt: qrDoc.expiresAt,
+    return ok(res, {
+      message: "QR generated",
+      data: { token, qrUrl, expiresAt: qrDoc.expiresAt },
+      // Backward-compatible fields (older clients / existing web)
+      legacy: { ok: true, token, qrUrl, expiresAt: qrDoc.expiresAt },
     });
   } catch (err) {
     console.error("QR generate error:", err);
-    return res.status(500).json({ ok: false, msg: "QR generation failed" });
+    return fail(res, {
+      status: 500,
+      message: "QR generation failed",
+      legacy: { ok: false, msg: "QR generation failed" },
+      error: err.message,
+    });
   }
 });
 
@@ -90,28 +96,38 @@ router.get("/resolve/:token", async (req, res) => {
     // Fetch user's grouped documents
     const { Document } = await import("../models/File.js");
     const targetUid = decoded.uid || decoded.userId;
-    const docs = await Document.find({ patientId: targetUid });
+    const docs = await Document.find({ userId: String(targetUid) });
 
     const grouped = {
-      reports: docs.filter(d => d.type?.toLowerCase() === "lab report" || d.type?.toLowerCase() === "imaging"),
-      prescriptions: docs.filter(d => d.type?.toLowerCase() === "prescription"),
-      bills: docs.filter(d => d.type?.toLowerCase() === "bill"),
-      insurance: docs.filter(d => d.type?.toLowerCase() === "insurance"),
+      reports: docs.filter(d => d.category?.toLowerCase() === "report"),
+      prescriptions: docs.filter(d => d.category?.toLowerCase() === "prescription"),
+      bills: docs.filter(d => d.category?.toLowerCase() === "bill"),
+      insurance: docs.filter(d => d.category?.toLowerCase() === "insurance"),
       others: docs.filter(d =>
-        !["lab report", "imaging", "prescription", "bill", "insurance"].includes(d.type?.toLowerCase())
+        !["report", "prescription", "bill", "insurance"].includes(d.category?.toLowerCase())
       ),
     };
 
-    return res.json({
-      success: true,
-      patientId: targetUid,
-      counts: Object.fromEntries(Object.entries(grouped).map(([k, v]) => [k, v.length])),
-      records: grouped,
+    return ok(res, {
+      message: "QR resolved",
+      data: {
+        patientId: targetUid,
+        counts: Object.fromEntries(Object.entries(grouped).map(([k, v]) => [k, v.length])),
+        records: grouped,
+      },
+      legacy: {
+        patientId: targetUid,
+        counts: Object.fromEntries(Object.entries(grouped).map(([k, v]) => [k, v.length])),
+        records: grouped,
+      },
     });
   } catch (e) {
-    return res
-      .status(400)
-      .json({ success: false, msg: "Invalid/expired token", error: e.message });
+    return fail(res, {
+      status: 400,
+      message: "Invalid/expired token",
+      legacy: { msg: "Invalid/expired token" },
+      error: e.message,
+    });
   }
 });
 

@@ -834,7 +834,12 @@ router.post("/forgot-password", emailLimiter, async (req, res) => {
     user.resetTokenExpiry = expiryDate;
     await user.save();
 
-    const frontendUrl = process.env.FRONTEND_URL || process.env.APP_WEB_URL || "https://health-vault-web.vercel.app";
+    const frontendUrl =
+      process.env.FRONTEND_URL ||
+      process.env.APP_WEB_URL ||
+      (process.env.NODE_ENV === "production"
+        ? "https://health-vault-web.vercel.app"
+        : "http://localhost:5173");
     const resetLink = `${frontendUrl}/reset-password?token=${encodeURIComponent(resetToken)}`;
 
     // Send email using Resend (preferred) or SMTP fallback

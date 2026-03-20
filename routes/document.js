@@ -332,6 +332,62 @@ router.get("/user/:userId/grouped", auth, checkSession, async (req, res) => {
   }
 });
 
+// ---------------- Grouped Files (patient alias for web compatibility) ----------------
+// GET /api/files/patient/:patientId/grouped
+router.get("/patient/:patientId/grouped", auth, checkSession, async (req, res) => {
+  try {
+    // Delegate to the canonical user grouping logic
+    const userId = req.params.patientId;
+    const docs = await Document.find({ userId });
+
+    const grouped = {
+      reports: docs.filter((d) => d.category?.toLowerCase() === "report"),
+      prescriptions: docs.filter((d) => d.category?.toLowerCase() === "prescription"),
+      bills: docs.filter((d) => d.category?.toLowerCase() === "bill"),
+      insurance: docs.filter((d) => d.category?.toLowerCase() === "insurance"),
+    };
+
+    const groupedWithUrl = Object.fromEntries(
+      await Promise.all(
+        Object.entries(grouped).map(async ([key, docs]) => [
+          key,
+          await Promise.all(
+            docs.map(async (doc) => {
+              try {
+                const signedUrl = await generateSignedUrl(doc.s3Key, doc.s3Bucket);
+                return {
+                  ...doc.toObject(),
+                  url: signedUrl,
+                };
+              } catch (error) {
+                console.error(`Error generating URL for doc ${doc._id}:`, error);
+                return {
+                  ...doc.toObject(),
+                  url: null,
+                  error: "Failed to generate access URL",
+                };
+              }
+            })
+          ),
+        ])
+      )
+    );
+
+    res.json({
+      success: true,
+      userId,
+      counts: Object.fromEntries(
+        Object.entries(groupedWithUrl).map(([k, v]) => [k, v.length])
+      ),
+      records: groupedWithUrl,
+    });
+  } catch (err) {
+    res
+      .status(500)
+      .json({ success: false, msg: "Error grouping files", error: err.message });
+  }
+});
+
 // ---------------- Grouped by Email ----------------
 router.get("/grouped/:email", auth, checkSessionByEmail, async (req, res) => {
   try {
