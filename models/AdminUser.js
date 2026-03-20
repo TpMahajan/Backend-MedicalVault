@@ -18,6 +18,37 @@ const AdminUserSchema = new mongoose.Schema(
     password: { type: String, required: true, minlength: 6 },
     lastLogin: { type: Date, default: null },
     isActive: { type: Boolean, default: true },
+    role: {
+      type: String,
+      enum: ["ADMIN"],
+      default: "ADMIN",
+      uppercase: true,
+      trim: true,
+    },
+    status: {
+      type: String,
+      enum: ["ACTIVE", "BLOCKED"],
+      default: "ACTIVE",
+      uppercase: true,
+      trim: true,
+    },
+    assignedBy: {
+      type: String,
+      default: "superadmin@medicalvault.in",
+      lowercase: true,
+      trim: true,
+    },
+    permissions: {
+      type: [String],
+      default: ["MANAGE_USERS"],
+      enum: [
+        "MANAGE_USERS",
+        "MANAGE_ADS",
+        "MANAGE_PRODUCTS",
+        "MANAGE_ALERTS",
+        "MANAGE_NOTIFICATIONS",
+      ],
+    },
   },
   {
     timestamps: true,
@@ -30,6 +61,15 @@ const AdminUserSchema = new mongoose.Schema(
     },
   }
 );
+
+AdminUserSchema.pre("save", function (next) {
+  if (this.isModified("status")) {
+    this.isActive = this.status !== "BLOCKED";
+  } else if (this.isModified("isActive")) {
+    this.status = this.isActive === false ? "BLOCKED" : "ACTIVE";
+  }
+  next();
+});
 
 AdminUserSchema.pre("save", async function (next) {
   if (!this.isModified("password")) return next();

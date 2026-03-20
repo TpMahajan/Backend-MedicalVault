@@ -89,10 +89,29 @@ const doctorUserSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
   isActive: { type: Boolean, default: true },
+  role: {
+    type: String,
+    enum: ["DOCTOR"],
+    default: "DOCTOR",
+    uppercase: true,
+    trim: true,
+  },
+  status: {
+    type: String,
+    enum: ["ACTIVE", "BLOCKED"],
+    default: "ACTIVE",
+    uppercase: true,
+    trim: true,
+  },
 });
 
 // Update updatedAt before saving
 doctorUserSchema.pre("save", function (next) {
+  if (this.isModified("status")) {
+    this.isActive = this.status !== "BLOCKED";
+  } else if (this.isModified("isActive")) {
+    this.status = this.isActive === false ? "BLOCKED" : "ACTIVE";
+  }
   this.updatedAt = new Date();
   next();
 });

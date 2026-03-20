@@ -87,6 +87,38 @@ A secure, production-ready Node.js backend with MongoDB, JWT authentication, and
 http://localhost:5000/api
 ```
 
+### SuperAdmin API
+
+SuperAdmin auth and management APIs are available under:
+
+```
+/superadmin/*
+```
+
+Default login (can be overridden via `.env`):
+
+```env
+SUPERADMIN_EMAIL=superadmin@medicalvault.in
+SUPERADMIN_PASSWORD=111111
+```
+
+Key routes:
+
+- `POST /superadmin/auth/login`
+- `GET /superadmin/auth/me`
+- `GET /superadmin/dashboard/stats`
+- `GET /superadmin/users`, `POST /superadmin/users`, `PUT /superadmin/users/:role/:id`, `PATCH /superadmin/users/:role/:id/status`, `DELETE /superadmin/users/:role/:id`
+- `GET /superadmin/admins`, `POST /superadmin/admins`, `PATCH /superadmin/admins/:id/permissions`, `PATCH /superadmin/admins/:id/status`
+- `GET /superadmin/advertisements`, `POST /superadmin/advertisements`, `PUT /superadmin/advertisements/:id`, `DELETE /superadmin/advertisements/:id`
+- `GET /superadmin/products`, `POST /superadmin/products`, `PUT /superadmin/products/:id`, `DELETE /superadmin/products/:id`
+- `GET /superadmin/ui-config`, `PUT /superadmin/ui-config`
+
+Public dynamic config routes (for Flutter app + web landing):
+
+- `GET /public/ads?placement=APP_DASHBOARD|QR_PAGE|WEB_LANDING`
+- `GET /public/products`
+- `GET /public/ui-config`
+
 ### Authentication Endpoints
 
 #### Register User

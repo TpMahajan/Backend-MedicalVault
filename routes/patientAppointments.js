@@ -14,6 +14,40 @@ const getPatientId = (req) => {
   return req.user?._id?.toString() || req.user?.id?.toString();
 };
 
+const normalizeAppointmentDoctor = (appointment) => {
+  if (!appointment || typeof appointment !== "object") return appointment;
+  const doctor = appointment.doctorId;
+  if (!doctor || typeof doctor !== "object" || Array.isArray(doctor)) {
+    return appointment;
+  }
+
+  const profilePictureUrl =
+    doctor.profilePictureUrl ||
+    doctor.profilePicture ||
+    doctor.avatarUrl ||
+    doctor.avatar ||
+    null;
+  const specialization =
+    doctor.specialization ||
+    doctor.specialty ||
+    appointment.doctorSpecialization ||
+    "";
+
+  return {
+    ...appointment,
+    doctorId: {
+      ...doctor,
+      profilePictureUrl,
+      profilePicture: profilePictureUrl,
+      avatarUrl: doctor.avatarUrl || profilePictureUrl,
+      specialization,
+      specialty: doctor.specialty || specialization,
+    },
+    doctorProfilePicture: appointment.doctorProfilePicture || profilePictureUrl,
+    doctorSpecialization: appointment.doctorSpecialization || specialization,
+  };
+};
+
 // POST /api/patient/appointments/request - Patient requests appointment (for self or linked family member)
 router.post("/appointments/request", async (req, res) => {
   try {
@@ -135,7 +169,10 @@ router.get("/appointments/upcoming", async (req, res) => {
       patientId,
       status: { $in: ["scheduled", "confirmed", "pending"] },
     })
-      .populate("doctorId", "name specialty location")
+      .populate(
+        "doctorId",
+        "name specialty specialization location avatar avatarUrl profilePicture profilePictureUrl"
+      )
       .sort({ appointmentDate: 1, appointmentTime: 1 })
       .lean();
 
@@ -148,10 +185,12 @@ router.get("/appointments/upcoming", async (req, res) => {
       return aptDate > now;
     });
 
+    const normalizedUpcoming = upcoming.map(normalizeAppointmentDoctor);
+
     res.json({
       success: true,
-      appointments: upcoming,
-      count: upcoming.length,
+      appointments: normalizedUpcoming,
+      count: normalizedUpcoming.length,
     });
   } catch (error) {
     res.status(500).json({
@@ -180,7 +219,10 @@ router.get("/appointments/past", async (req, res) => {
         ],
       },
     })
-      .populate("doctorId", "name specialty location")
+      .populate(
+        "doctorId",
+        "name specialty specialization location avatar avatarUrl profilePicture profilePictureUrl"
+      )
       .sort({ appointmentDate: -1, appointmentTime: -1 })
       .lean();
 
@@ -188,7 +230,10 @@ router.get("/appointments/past", async (req, res) => {
       patientId,
       status: { $in: ["scheduled", "confirmed"] },
     })
-      .populate("doctorId", "name specialty location")
+      .populate(
+        "doctorId",
+        "name specialty specialization location avatar avatarUrl profilePicture profilePictureUrl"
+      )
       .sort({ appointmentDate: -1, appointmentTime: -1 })
       .lean();
 
@@ -224,10 +269,12 @@ router.get("/appointments/past", async (req, res) => {
         return db - da;
       });
 
+    const normalizedPast = past.map(normalizeAppointmentDoctor);
+
     res.json({
       success: true,
-      appointments: past,
-      count: past.length,
+      appointments: normalizedPast,
+      count: normalizedPast.length,
     });
   } catch (error) {
     res.status(500).json({
@@ -248,7 +295,10 @@ router.get("/appointments/:id", async (req, res) => {
       _id: id,
       patientId,
     })
-      .populate("doctorId", "name specialty location email mobile")
+      .populate(
+        "doctorId",
+        "name specialty specialization location email mobile avatar avatarUrl profilePicture profilePictureUrl"
+      )
       .lean();
 
     if (!appointment) {
@@ -265,10 +315,12 @@ router.get("/appointments/:id", async (req, res) => {
       .select("title type category date url s3Key _id")
       .lean();
 
+    const normalizedAppointment = normalizeAppointmentDoctor(appointment);
+
     res.json({
       success: true,
       appointment: {
-        ...appointment,
+        ...normalizedAppointment,
         linkedDocuments: linkedDocs,
       },
     });

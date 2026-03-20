@@ -3,10 +3,86 @@ import { auth, optionalAuth } from "../middleware/auth.js";
 import { Session } from "../models/Session.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
+import { Appointment } from "../models/Appointment.js";
 import { sendNotification, sendNotificationToDoctor } from "../utils/notifications.js";
 import { persistSessionHistory } from "../services/sessionHistoryPersistence.js";
+import { BUCKET_NAME } from "../config/s3.js";
+import { generateSignedUrl } from "../utils/s3Utils.js";
 
 const router = express.Router();
+const hasAWSCredentials =
+  !!process.env.AWS_ACCESS_KEY_ID && !!process.env.AWS_SECRET_ACCESS_KEY;
+
+const asText = (value) => (value == null ? "" : String(value).trim());
+
+const resolveDoctorSpecialization = (doctor) =>
+  asText(doctor?.specialization || doctor?.specialty);
+
+const resolveDoctorAvatarUrl = async (doctor) => {
+  const raw =
+    asText(
+      doctor?.profilePictureUrl ||
+        doctor?.profilePicture ||
+        doctor?.avatarUrl ||
+        doctor?.avatar
+    ) || "";
+  if (!raw) return "";
+
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (raw.startsWith("/uploads/")) {
+    const baseUrl = process.env.API_BASE_URL || "http://localhost:5000";
+    return `${baseUrl}${raw}`;
+  }
+
+  if (!hasAWSCredentials) return "";
+  try {
+    return await generateSignedUrl(raw, BUCKET_NAME);
+  } catch {
+    return "";
+  }
+};
+
+const buildDoctorSummary = async (doctor) => {
+  if (!doctor) {
+    return {
+      _id: null,
+      name: "Doctor",
+      email: "",
+      mobile: "",
+      profilePicture: null,
+      profilePictureUrl: null,
+      avatar: "",
+      avatarUrl: null,
+      experience: "",
+      specialization: "",
+      specialty: "",
+      memberSince: null,
+      chatUrl: "",
+    };
+  }
+
+  const avatarUrl = await resolveDoctorAvatarUrl(doctor);
+  const specialization = resolveDoctorSpecialization(doctor);
+  const rawAvatar =
+    asText(doctor.profilePicture || doctor.profilePictureUrl || doctor.avatar) ||
+    "";
+
+  return {
+    _id: doctor._id ?? null,
+    name: asText(doctor.name) || "Doctor",
+    email: asText(doctor.email),
+    mobile: asText(doctor.mobile || doctor.phone),
+    profilePicture: avatarUrl || rawAvatar || null,
+    profilePictureUrl: avatarUrl || rawAvatar || null,
+    avatar: rawAvatar,
+    avatarUrl: avatarUrl || null,
+    experience: asText(doctor.experience),
+    specialization,
+    specialty: specialization,
+    memberSince: doctor.createdAt || null,
+    chatUrl: asText(doctor.chatUrl || doctor.chatDeepLink),
+  };
+};
 
 // Health check endpoint (no auth required)
 router.get("/health", (req, res) => {
@@ -203,7 +279,10 @@ router.post("/request", optionalAuth, async (req, res) => {
     // Populate doctor info for response if exists
     if (session.doctorId) {
       console.log('🔄 Populating doctor info...');
-      await session.populate('doctorId', 'name email profilePicture experience specialization');
+      await session.populate(
+        "doctorId",
+        "name email mobile avatar profilePicture profilePictureUrl experience specialty specialization createdAt chatUrl chatDeepLink"
+      );
       console.log(`📋 New session request: Dr. ${session.doctorId.name} → Patient ${patientId}`);
     } else {
       console.log(`📋 New session request: Anonymous Doctor → Patient ${patientId}`);
@@ -279,7 +358,10 @@ router.get("/:id/status", optionalAuth, async (req, res) => {
     const sessionId = req.params.id;
 
     const session = await Session.findById(sessionId)
-      .populate('doctorId', 'name email profilePicture experience specialization')
+      .populate(
+        "doctorId",
+        "name email mobile avatar profilePicture profilePictureUrl experience specialty specialization createdAt chatUrl chatDeepLink"
+      )
       .populate('patientId', 'name email');
 
     if (!session) {
@@ -304,6 +386,9 @@ router.get("/:id/status", optionalAuth, async (req, res) => {
     // Check if session has expired
     const isExpired = session.expiresAt <= new Date();
     const actualStatus = isExpired ? "expired" : session.status;
+    const doctorSummary = session.doctorId
+      ? await buildDoctorSummary(session.doctorId)
+      : null;
 
     res.json({
       success: true,
@@ -315,13 +400,7 @@ router.get("/:id/status", optionalAuth, async (req, res) => {
         respondedAt: session.respondedAt,
         isExpired: isExpired,
         timeRemaining: isExpired ? 0 : Math.max(0, Math.floor((session.expiresAt - new Date()) / 1000)),
-        doctor: session.doctorId ? {
-          name: session.doctorId.name,
-          email: session.doctorId.email,
-          profilePicture: session.doctorId.profilePicture,
-          experience: session.doctorId.experience,
-          specialization: session.doctorId.specialization
-        } : null,
+        doctor: doctorSummary,
         patient: {
           name: session.patientId.name,
           email: session.patientId.email
@@ -341,6 +420,135 @@ router.get("/:id/status", optionalAuth, async (req, res) => {
 
 // All other routes require authentication
 router.use(auth);
+
+// ---------------- Patient Sends Message To Doctor ----------------
+// POST /api/sessions/chat-doctor
+router.post("/chat-doctor", async (req, res) => {
+  try {
+    if (req.auth?.role !== "patient") {
+      return res.status(403).json({
+        success: false,
+        message: "Only patients can send doctor messages",
+      });
+    }
+
+    const doctorId = asText(req.body.doctorId);
+    const doctorName = asText(req.body.doctorName);
+    const message = asText(req.body.message);
+    const sessionId = asText(req.body.sessionId);
+
+    if (!doctorId || !message) {
+      return res.status(400).json({
+        success: false,
+        message: "doctorId and message are required",
+      });
+    }
+
+    const doctor = await DoctorUser.findById(doctorId)
+      .select("name email fcmToken avatar profilePicture profilePictureUrl specialty experience mobile createdAt")
+      .lean();
+    if (!doctor) {
+      return res.status(404).json({
+        success: false,
+        message: "Doctor not found",
+      });
+    }
+
+    // Ensure patient has connected with doctor earlier.
+    // Accept either an earlier session link or an appointment link.
+    const linkedSession = await Session.findOne({
+      doctorId,
+      patientId: req.auth.id,
+      status: { $in: ["accepted", "ended", "declined"] },
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const linkedAppointment = linkedSession
+      ? null
+      : await Appointment.findOne({
+          doctorId,
+          patientId: req.auth.id,
+        })
+          .sort({ appointmentDate: -1, createdAt: -1 })
+          .lean();
+
+    if (!linkedSession && !linkedAppointment) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "You can message only doctors connected through prior sessions or appointments.",
+      });
+    }
+
+    const resolvedSessionId =
+      sessionId ||
+      linkedSession?._id?.toString() ||
+      linkedAppointment?._id?.toString() ||
+      "";
+    const relationType = linkedSession ? "session" : "appointment";
+
+    const { Notification } = await import("../models/Notification.js");
+    const { broadcastNotification } = await import(
+      "../controllers/notificationController.js"
+    );
+    const { sendPushNotification } = await import("../config/firebase.js");
+
+    const senderName =
+      asText(req.user?.name) || asText(req.user?.email) || "Patient";
+    const resolvedDoctorName = asText(doctor.name) || doctorName || "Doctor";
+
+    const notification = await Notification.create({
+      title: `Message from ${senderName}`,
+      body: message,
+      type: "session",
+      data: {
+        type: "PATIENT_MESSAGE",
+        doctorId,
+        sessionId: resolvedSessionId,
+        relationType,
+        patientId: req.auth.id.toString(),
+        doctorName: resolvedDoctorName,
+      },
+      recipientId: doctorId,
+      recipientRole: "doctor",
+      senderId: req.auth.id,
+      senderRole: "patient",
+    });
+
+    if (doctor.fcmToken) {
+      await sendPushNotification(
+        doctor.fcmToken,
+        {
+          title: `New message from ${senderName}`,
+          body: message,
+        },
+        {
+          type: "PATIENT_MESSAGE",
+          doctorId,
+          patientId: req.auth.id.toString(),
+          sessionId: resolvedSessionId,
+          relationType,
+        }
+      );
+    }
+
+    await broadcastNotification(notification);
+
+    return res.json({
+      success: true,
+      message: `Message sent to Dr. ${resolvedDoctorName}`,
+      notificationId: notification._id,
+    });
+  } catch (error) {
+    console.error("Chat doctor error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to send message to doctor",
+      error: error.message,
+    });
+  }
+});
 
 // ---------------- Patient Fetches Pending Requests ----------------
 // GET /api/sessions/requests
@@ -363,38 +571,29 @@ router.get("/requests", async (req, res) => {
       status: "pending",
       expiresAt: { $gt: new Date() }
     })
-      .populate('doctorId', 'name email profilePicture experience specialization createdAt')
+      .populate(
+        "doctorId",
+        "name email mobile avatar profilePicture profilePictureUrl experience specialty specialization createdAt chatUrl chatDeepLink"
+      )
       .sort({ createdAt: -1 }); // Most recent first
 
     console.log(`📋 Found ${requests.length} pending requests for patient ${req.auth.id}`);
 
-    res.json({
-      success: true,
-      count: requests.length,
-      requests: requests.map(session => ({
+    const requestPayload = await Promise.all(
+      requests.map(async (session) => ({
         _id: session._id,
-        doctor: session.doctorId ? {
-          _id: session.doctorId._id,
-          name: session.doctorId.name,
-          email: session.doctorId.email,
-          profilePicture: session.doctorId.profilePicture,
-          experience: session.doctorId.experience,
-          specialization: session.doctorId.specialization,
-          memberSince: session.doctorId.createdAt
-        } : {
-          _id: null,
-          name: "Doctor",
-          email: "",
-          profilePicture: null,
-          experience: "",
-          specialization: "",
-          memberSince: null
-        },
+        doctor: await buildDoctorSummary(session.doctorId),
         requestMessage: session.requestMessage,
         createdAt: session.createdAt,
         expiresAt: session.expiresAt,
-        status: session.status
+        status: session.status,
       }))
+    );
+
+    res.json({
+      success: true,
+      count: requests.length,
+      requests: requestPayload,
     });
 
   } catch (error) {
@@ -424,7 +623,10 @@ router.post("/:id/respond", async (req, res) => {
 
     // Find the session
     const session = await Session.findById(sessionId)
-      .populate('doctorId', 'name email profilePicture experience specialization');
+      .populate(
+        "doctorId",
+        "name email mobile avatar profilePicture profilePictureUrl experience specialty specialization createdAt chatUrl chatDeepLink"
+      );
 
     if (!session) {
       return res.status(404).json({
@@ -573,15 +775,14 @@ router.post("/:id/respond", async (req, res) => {
       isStillActive: verifySession?.expiresAt > new Date()
     });
 
+    const doctorSummary = await buildDoctorSummary(session.doctorId);
+
     res.json({
       success: true,
       message: `Session request ${status} successfully`,
       session: {
         _id: session._id,
-        doctor: {
-          name: session.doctorId?.name || "Doctor",
-          email: session.doctorId?.email || ""
-        },
+        doctor: doctorSummary,
         status: session.status,
         expiresAt: session.expiresAt,
         respondedAt: session.respondedAt
@@ -945,7 +1146,10 @@ router.get("/patient/:patientId", async (req, res) => {
       patientId: patientId,
       status: { $in: ["accepted", "ended", "declined"] }
     })
-      .populate('doctorId', 'name email profilePicture specialization')
+      .populate(
+        "doctorId",
+        "name email mobile avatar profilePicture profilePictureUrl specialty specialization chatUrl chatDeepLink"
+      )
       .sort({ createdAt: -1 });
 
     const processedHistory = sessions.map(session => {
@@ -959,7 +1163,9 @@ router.get("/patient/:patientId", async (req, res) => {
         sessionId: session._id,
         doctorId: doctor ? doctor._id : null,
         doctorName: doctor ? doctor.name : (session.requestMessage && session.requestMessage.includes('Anonymous') ? 'Anonymous Doctor' : 'Unknown Doctor'),
-        doctorSpecialization: doctor ? doctor.specialization : 'Medical Practice',
+        doctorSpecialization: doctor
+          ? (doctor.specialization || doctor.specialty || "Medical Practice")
+          : 'Medical Practice',
         date: startTime.toLocaleDateString(),
         time: startTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         duration: durationMinutes,
@@ -1004,7 +1210,10 @@ router.get("/active", async (req, res) => {
     }
 
     const activeSessions = await Session.find(query)
-      .populate('doctorId', 'name email profilePicture experience specialization')
+      .populate(
+        "doctorId",
+        "name email mobile avatar profilePicture profilePictureUrl experience specialty specialization createdAt chatUrl chatDeepLink"
+      )
       .populate('patientId', 'name email profilePicture age gender')
       .sort({ createdAt: -1 });
 
@@ -1366,7 +1575,10 @@ router.get("/all-sessions", async (req, res) => {
       doctorId: req.auth.id
     })
       .populate('patientId', 'name email mobile profilePicture age gender bloodType dateOfBirth sessionCount')
-      .populate('doctorId', 'name email')
+      .populate(
+        "doctorId",
+        "name email mobile avatar profilePicture profilePictureUrl experience specialty specialization createdAt chatUrl chatDeepLink"
+      )
       .sort({ createdAt: -1 });
 
     const now = new Date();

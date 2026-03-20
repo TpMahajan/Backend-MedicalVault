@@ -22,6 +22,20 @@ const UserSchema = new mongoose.Schema(
     loginType: { type: String, enum: ["email", "google"], default: "email" }, // Track login method
     emailVerified: { type: Boolean, default: false }, // Email verification status
     aadhaar: { type: String, default: null },
+    role: {
+      type: String,
+      enum: ["PATIENT", "DOCTOR", "ADMIN", "SUPERADMIN"],
+      default: "PATIENT",
+      uppercase: true,
+      trim: true,
+    },
+    status: {
+      type: String,
+      enum: ["ACTIVE", "BLOCKED"],
+      default: "ACTIVE",
+      uppercase: true,
+      trim: true,
+    },
 
     // 🔹 Profile update fields
     dateOfBirth: { type: String, default: null }, // format: YYYY-MM-DD
@@ -90,6 +104,15 @@ const UserSchema = new mongoose.Schema(
 );
 
 // 🔐 Hash password before saving
+UserSchema.pre("save", function (next) {
+  if (this.isModified("status")) {
+    this.isActive = this.status !== "BLOCKED";
+  } else if (this.isModified("isActive")) {
+    this.status = this.isActive === false ? "BLOCKED" : "ACTIVE";
+  }
+  next();
+});
+
 UserSchema.pre("save", async function (next) {
   if (!this.isModified("password")) return next();
   try {

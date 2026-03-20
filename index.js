@@ -29,6 +29,8 @@ import aiAssistantRoutes from "./routes/aiAssistant.js"; // AI assistant ✅
 import sosRoutes from "./routes/sosRoutes.js";          // SOS messages
 import appUpdateRoutes from "./routes/appUpdate.js";
 import adminAuthRoutes from "./routes/adminAuth.js";    // admin auth
+import superAdminRoutes from "./routes/superAdmin.js";
+import publicConfigRoutes from "./routes/publicConfig.js";
 import lostFoundRoutes from "./routes/lostFound.js";    // lost & found (user)
 import adminLostFoundRoutes from "./routes/adminLostFound.js"; // lost & found admin
 import adminInventoryRoutes from "./routes/adminInventory.js"; // admin inventory
@@ -126,6 +128,8 @@ app.use("/api/ai", aiAssistantRoutes);        // AI assistant ✅
 app.use("/api/sos", sosRoutes);               // SOS
 app.use("/api/app", appUpdateRoutes);
 app.use("/api/admin", adminAuthRoutes);       // admin auth
+app.use("/api/superadmin", superAdminRoutes);
+app.use("/api/public", publicConfigRoutes);
 app.use("/api/lost-found", lostFoundRoutes);  // lost & found
 app.use("/api/admin/lost-found", adminLostFoundRoutes); // admin lost & found
 app.use("/api/admin/inventory", adminInventoryRoutes);  // admin inventory ✅
@@ -151,6 +155,8 @@ app.get("/health", (req, res) =>
       "/api/ai",
       "/api/app",
       "/api/admin",
+      "/api/superadmin",
+      "/api/public",
     ],
   })
 );
