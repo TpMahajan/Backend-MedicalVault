@@ -8,6 +8,7 @@ import { Appointment } from "../models/Appointment.js";
 import { AIChat } from "../models/AIChat.js";
 import DocumentReader from "../services/documentReader.js";
 import { ok, fail } from "../utils/apiResponse.js";
+import { canDoctorAccessPatient } from "../services/accessControl.js";
 
 const router = express.Router();
 const documentReader = new DocumentReader();
@@ -1522,16 +1523,29 @@ Format your response as JSON:
   }
 });
 
-export default router;
-
 // Additional endpoint: analyze patient's documents and return extracted summaries
 // GET /api/ai/patient/:patientId/analyze
 router.get('/patient/:patientId/analyze', auth, async (req, res) => {
   try {
     const { patientId } = req.params;
-    // Doctor must specify a patient they have context for
-    if (req.auth?.role === 'doctor' && !patientId) {
+    const role = String(req.auth?.role || "").toLowerCase();
+    const requesterId = String(req.auth?.id || "");
+
+    if (!patientId) {
       return res.status(400).json({ success: false, message: 'patientId is required' });
+    }
+
+    if (role === "patient" && requesterId !== String(patientId)) {
+      return res.status(403).json({ success: false, message: "Access denied" });
+    }
+    if (role === "doctor") {
+      const allowed = await canDoctorAccessPatient(requesterId, String(patientId));
+      if (!allowed) {
+        return res.status(403).json({ success: false, message: "No active doctor-patient relationship" });
+      }
+    }
+    if (!["patient", "doctor", "admin", "superadmin"].includes(role)) {
+      return res.status(403).json({ success: false, message: "Access denied" });
     }
 
     // Fetch recent documents for the patient
@@ -1567,3 +1581,5 @@ router.get('/patient/:patientId/analyze', auth, async (req, res) => {
     res.status(500).json({ success: false, message: 'Failed to analyze patient documents' });
   }
 });
+
+export default router;

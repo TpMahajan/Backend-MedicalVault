@@ -98,8 +98,8 @@ SuperAdmin auth and management APIs are available under:
 Default login (can be overridden via `.env`):
 
 ```env
-SUPERADMIN_EMAIL=superadmin@medicalvault.in
-SUPERADMIN_PASSWORD=111111
+SUPERADMIN_EMAIL=superadmin@example.com
+SUPERADMIN_BOOTSTRAP_PASSWORD=replace-with-strong-bootstrap-password
 ```
 
 Key routes:

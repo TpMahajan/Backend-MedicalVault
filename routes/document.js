@@ -10,12 +10,68 @@ import { Document } from "../models/File.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { checkSession, checkSessionByEmail } from "../middleware/checkSession.js";
-import { Session } from "../models/Session.js";
 import s3Client, { BUCKET_NAME, REGION } from "../config/s3.js";
 import { generateSignedUrl, generatePreviewUrl, generateDownloadUrl } from "../utils/s3Utils.js";
 import { sendNotification } from "../utils/notifications.js";
+import { canDoctorAccessPatient } from "../services/accessControl.js";
+import { writeAuditLog } from "../middleware/auditLogger.js";
 
 const router = express.Router();
+
+const privilegedRoles = new Set(["admin", "superadmin"]);
+const MALWARE_SCAN_API_URL = String(process.env.MALWARE_SCAN_API_URL || "").trim();
+const MALWARE_SCAN_FAIL_CLOSED =
+  String(process.env.MALWARE_SCAN_FAIL_CLOSED || "false").toLowerCase() === "true";
+const allowedMimeTypes = new Set([
+  "application/pdf",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+]);
+
+const validateUploadFilename = (name = "") => {
+  const normalized = String(name || "").toLowerCase();
+  return /\.(pdf|jpg|jpeg|png|webp|doc|docx)$/.test(normalized);
+};
+
+const isRole = (req, role) => String(req.auth?.role || "").toLowerCase() === role;
+
+const canAccessDocument = async (req, doc) => {
+  const role = String(req.auth?.role || "").toLowerCase();
+  const requesterId = String(req.auth?.id || "");
+  const patientId = String(doc.userId || "");
+
+  if (privilegedRoles.has(role)) return true;
+  if (role === "patient") return requesterId === patientId;
+  if (role === "doctor") {
+    return canDoctorAccessPatient(requesterId, patientId);
+  }
+  return false;
+};
+
+const runMalwareScan = async ({ bucket, key, mimeType, size }) => {
+  if (!MALWARE_SCAN_API_URL) {
+    if (MALWARE_SCAN_FAIL_CLOSED) {
+      throw new Error("Malware scan service is not configured");
+    }
+    return { status: "skipped", clean: true };
+  }
+
+  const response = await axios.post(
+    MALWARE_SCAN_API_URL,
+    { bucket, key, mimeType, size },
+    { timeout: Number(process.env.MALWARE_SCAN_TIMEOUT_MS || 15000) }
+  );
+
+  const clean = response?.data?.clean === true;
+  if (!clean) {
+    throw new Error(response?.data?.message || "Malware scan failed");
+  }
+
+  return { status: "passed", clean: true };
+};
 
 // ---------------- AWS S3 Storage ----------------
 const storage = multerS3({
@@ -37,7 +93,19 @@ const storage = multerS3({
   }
 });
 
-const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
+const upload = multer({
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!allowedMimeTypes.has(String(file.mimetype || "").toLowerCase())) {
+      return cb(new Error("Unsupported file type"), false);
+    }
+    if (!validateUploadFilename(file.originalname)) {
+      return cb(new Error("Unsupported file extension"), false);
+    }
+    return cb(null, true);
+  },
+});
 
 // ---------------- Upload ----------------
 router.post("/upload", auth, requireVerified, upload.single("file"), async (req, res) => {
@@ -83,7 +151,63 @@ router.post("/upload", auth, requireVerified, upload.single("file"), async (req,
     const s3Bucket = req.file.bucket;
 
     // ✅ Support both doctor uploads (userId from req.body) and patient uploads (userId from req.auth.id)
-    const targetUserId = req.body.userId || req.auth.id;
+    const requesterRole = String(req.auth?.role || "").toLowerCase();
+    const requesterId = String(req.auth?.id || "");
+    const requestedTargetId = String(req.body.userId || "").trim();
+    let targetUserId = requesterId;
+
+    if (requesterRole === "patient") {
+      if (requestedTargetId && requestedTargetId !== requesterId) {
+        return res.status(403).json({ success: false, msg: "Patients can only upload to their own records" });
+      }
+      targetUserId = requesterId;
+    } else if (requesterRole === "doctor") {
+      targetUserId = requestedTargetId || "";
+      if (!targetUserId) {
+        return res.status(400).json({ success: false, msg: "Doctors must provide target patient userId" });
+      }
+      const allowed = await canDoctorAccessPatient(requesterId, targetUserId);
+      if (!allowed) {
+        return res.status(403).json({ success: false, msg: "No active doctor-patient relationship" });
+      }
+    } else if (privilegedRoles.has(requesterRole)) {
+      targetUserId = requestedTargetId || "";
+      if (!targetUserId) {
+        return res.status(400).json({ success: false, msg: "target userId is required" });
+      }
+    } else {
+      return res.status(403).json({ success: false, msg: "Unauthorized role for upload" });
+    }
+
+    const targetUser = await User.findById(targetUserId).select("_id").lean();
+    if (!targetUser) {
+      return res.status(404).json({ success: false, msg: "Target user not found" });
+    }
+
+    try {
+      await runMalwareScan({
+        bucket: s3Bucket,
+        key: s3Key,
+        mimeType: req.file.mimetype,
+        size: req.file.size,
+      });
+    } catch (scanError) {
+      try {
+        await s3Client.send(
+          new DeleteObjectCommand({
+            Bucket: s3Bucket,
+            Key: s3Key,
+          })
+        );
+      } catch (cleanupError) {
+        console.error("Failed to cleanup untrusted upload:", cleanupError.message);
+      }
+
+      return res.status(400).json({
+        success: false,
+        msg: "Uploaded file failed security checks",
+      });
+    }
 
     console.log('🎯 Target userId determined:', {
       fromBody: req.body.userId,
@@ -191,6 +315,16 @@ router.post("/upload", auth, requireVerified, upload.single("file"), async (req,
         // Don't fail the upload if notification fails
       }
     }
+
+    await writeAuditLog({
+      req,
+      action: "UPLOAD_DOCUMENT",
+      resourceType: "DOCUMENT",
+      resourceId: doc._id?.toString(),
+      patientId: targetUserId,
+      statusCode: 200,
+      metadata: { category: chosenCategory, mimeType: req.file.mimetype },
+    });
 
     res.json({ success: true, document: doc });
   } catch (err) {
@@ -477,27 +611,21 @@ router.get("/:id/preview", auth, checkSession, async (req, res) => {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
-    // Check if user owns this document or has active doctor-patient session
-    const isOwner = doc.userId.toString() === req.auth.id.toString();
-    let hasSessionAccess = false;
-    if (!isOwner && req.auth?.role === "doctor") {
-      // Validate active session explicitly in case middleware didn't populate req.session
-      await Session.cleanExpiredSessions();
-      const activeSession = await Session.findOne({
-        doctorId: req.auth.id,
-        patientId: doc.userId.toString(),
-        status: "accepted",
-        expiresAt: { $gt: new Date() },
-      });
-      hasSessionAccess = !!activeSession;
-    }
-
-    if (!isOwner && !hasSessionAccess && req.auth?.role !== 'anonymous') {
+    const allowed = await canAccessDocument(req, doc);
+    if (!allowed) {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
     const previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket, doc.mimeType);
-    const mode = req.auth?.role === 'anonymous' ? 'anonymous' : (req.auth?.role === 'doctor' ? 'doctor' : (isOwner ? 'patient' : 'unknown'));
+    const mode = String(req.auth?.role || "patient").toLowerCase();
+    await writeAuditLog({
+      req,
+      action: "PREVIEW_DOCUMENT",
+      resourceType: "DOCUMENT",
+      resourceId: doc._id?.toString(),
+      patientId: doc.userId?.toString?.() || "",
+      statusCode: 200,
+    });
     res.json({ success: true, signedUrl: previewUrl, mode });
   } catch (err) {
     res.status(500).json({ msg: "Preview failed", error: err.message });
@@ -510,21 +638,8 @@ router.get("/:id/download", auth, checkSession, async (req, res) => {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
-    // Check if user owns this document or has active doctor-patient session
-    const isOwner = doc.userId.toString() === req.auth.id.toString();
-    let hasSessionAccess = false;
-    if (!isOwner && req.auth?.role === "doctor") {
-      await Session.cleanExpiredSessions();
-      const activeSession = await Session.findOne({
-        doctorId: req.auth.id,
-        patientId: doc.userId.toString(),
-        status: "accepted",
-        expiresAt: { $gt: new Date() },
-      });
-      hasSessionAccess = !!activeSession;
-    }
-
-    if (!isOwner && !hasSessionAccess && req.auth?.role !== 'anonymous') {
+    const allowed = await canAccessDocument(req, doc);
+    if (!allowed) {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
@@ -538,11 +653,27 @@ router.get("/:id/download", auth, checkSession, async (req, res) => {
     // If client prefers JSON (e.g., web app), return the URL instead of redirecting
     const acceptHeader = String(req.headers["accept"] || "").toLowerCase();
     if (acceptHeader.includes("application/json") || req.query.json === "true") {
-      const mode = req.auth?.role === 'anonymous' ? 'anonymous' : (req.auth?.role === 'doctor' ? 'doctor' : (isOwner ? 'patient' : 'unknown'));
+      const mode = String(req.auth?.role || "patient").toLowerCase();
+      await writeAuditLog({
+        req,
+        action: "DOWNLOAD_DOCUMENT",
+        resourceType: "DOCUMENT",
+        resourceId: doc._id?.toString(),
+        patientId: doc.userId?.toString?.() || "",
+        statusCode: 200,
+      });
       return res.json({ success: true, signedUrl: downloadUrl, mode });
     }
 
     // Default behavior: redirect (good for mobile clients following redirects)
+    await writeAuditLog({
+      req,
+      action: "DOWNLOAD_DOCUMENT",
+      resourceType: "DOCUMENT",
+      resourceId: doc._id?.toString(),
+      patientId: doc.userId?.toString?.() || "",
+      statusCode: 302,
+    });
     res.redirect(downloadUrl);
   } catch (err) {
     console.error("Download error:", err);
@@ -556,11 +687,8 @@ router.get("/:id/proxy", auth, checkSession, async (req, res) => {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
-    // Check if user owns this document or has session access
-    const isOwner = doc.userId.toString() === req.auth.id.toString();
-    const hasSessionAccess = req.session && req.session.status === 'accepted';
-
-    if (!isOwner && !hasSessionAccess) {
+    const allowed = await canAccessDocument(req, doc);
+    if (!allowed) {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
@@ -578,6 +706,14 @@ router.get("/:id/proxy", auth, checkSession, async (req, res) => {
 
     res.setHeader("Content-Type", doc.fileType || "application/octet-stream");
     res.setHeader("Cache-Control", "public, max-age=3600"); // Cache for 1 hour
+    await writeAuditLog({
+      req,
+      action: "PROXY_DOCUMENT",
+      resourceType: "DOCUMENT",
+      resourceId: doc._id?.toString(),
+      patientId: doc.userId?.toString?.() || "",
+      statusCode: 200,
+    });
     res.send(response.data);
   } catch (err) {
     console.error("Proxy error:", err);
@@ -586,13 +722,13 @@ router.get("/:id/proxy", auth, checkSession, async (req, res) => {
 });
 
 // ---------------- Update Document ----------------
-router.put("/:id", auth, requireVerified, async (req, res) => {
+router.put("/:id", auth, requireVerified, checkSession, async (req, res) => {
   try {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ success: false, msg: "File not found" });
 
-    // Check if user owns this document
-    if (doc.userId.toString() !== req.auth.id.toString()) {
+    const allowed = await canAccessDocument(req, doc);
+    if (!allowed) {
       return res.status(403).json({ success: false, msg: "Unauthorized access" });
     }
 
@@ -667,13 +803,13 @@ router.put("/:id", auth, requireVerified, async (req, res) => {
 });
 
 // ---------------- Delete ----------------
-router.delete("/:id", auth, requireVerified, async (req, res) => {
+router.delete("/:id", auth, requireVerified, checkSession, async (req, res) => {
   try {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
-    // Check if user owns this document or is authorized to delete it
-    if (doc.userId.toString() !== req.auth.id.toString()) {
+    const allowed = await canAccessDocument(req, doc);
+    if (!allowed) {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 

@@ -1,5 +1,4 @@
 import express from "express";
-import jwt from "jsonwebtoken";
 import multer from "multer";
 import multerS3 from "multer-s3";
 import path from "path";
@@ -7,9 +6,19 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { auth } from "../middleware/auth.js";
+import { authLimiter } from "../middleware/rateLimit.js";
 import s3Client, { BUCKET_NAME, REGION } from "../config/s3.js";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { generateSignedUrl } from "../utils/s3Utils.js";
+import {
+  clearAuthCookies,
+  hashToken,
+  issueAuthTokenSet,
+  parseCookies,
+  setAuthCookies,
+  verifyRefreshToken,
+} from "../services/tokenService.js";
+import { RefreshToken } from "../models/RefreshToken.js";
 
 // Helper: build avatar URL (handles both S3 keys and local paths)
 const buildSignedAvatarUrl = async (avatarValue) => {
@@ -93,6 +102,21 @@ console.log(`📸 Avatar upload configured: ${hasAWSCredentials ? 'AWS S3' : 'Lo
 
 const router = express.Router();
 
+const persistRefreshToken = async (req, doctorId, refreshToken, refreshMeta) => {
+  const decoded = verifyRefreshToken(refreshToken);
+  const expiresAt = new Date((decoded.exp || 0) * 1000);
+  await RefreshToken.create({
+    principalId: String(doctorId),
+    role: "doctor",
+    tokenHash: hashToken(refreshToken),
+    familyId: refreshMeta.familyId,
+    jti: refreshMeta.jti,
+    expiresAt,
+    createdByIp: req.ip || "",
+    userAgent: req.headers["user-agent"] || "",
+  });
+};
+
 // ================= Signup =================
 router.post("/signup", async (req, res) => {
   try {
@@ -122,11 +146,13 @@ router.post("/signup", async (req, res) => {
 
     await doctor.save();
 
-    const token = jwt.sign(
-      { userId: doctor._id, role: "doctor" },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
-    );
+    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
+      principalId: doctor._id.toString(),
+      role: "doctor",
+      email: doctor.email,
+    });
+    await persistRefreshToken(req, doctor._id, refreshToken, refreshMeta);
+    setAuthCookies(res, { accessToken, refreshToken });
 
     res.status(201).json({
       success: true,
@@ -140,7 +166,8 @@ router.post("/signup", async (req, res) => {
         avatarUrl: null,
         specialty: doctor.specialty,
       },
-      token,
+      token: accessToken,
+      refreshToken,
     });
   } catch (error) {
     console.error("Signup error:", error);
@@ -152,7 +179,7 @@ router.post("/signup", async (req, res) => {
 });
 
 // ================= Login =================
-router.post("/login", async (req, res) => {
+router.post("/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -173,11 +200,13 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ success: false, message: "Invalid email or password." });
     }
 
-    const token = jwt.sign(
-      { userId: doctor._id, role: "doctor" },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
-    );
+    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
+      principalId: doctor._id.toString(),
+      role: "doctor",
+      email: doctor.email,
+    });
+    await persistRefreshToken(req, doctor._id, refreshToken, refreshMeta);
+    setAuthCookies(res, { accessToken, refreshToken });
 
     // Build signed avatar URL for convenience
     const avatarUrl = await buildSignedAvatarUrl(doctor.avatar);
@@ -185,7 +214,8 @@ router.post("/login", async (req, res) => {
     res.json({
       success: true,
       message: "Login successful.",
-      token,
+      token: accessToken,
+      refreshToken,
       doctor: {
         id: doctor._id,
         name: doctor.name,
@@ -204,6 +234,69 @@ router.post("/login", async (req, res) => {
       success: false,
       message: "Internal server error during login.",
     });
+  }
+});
+
+router.post("/refresh", async (req, res) => {
+  try {
+    const cookies = parseCookies(req);
+    const provided = String(req.body?.refreshToken || cookies.mv_rt || "").trim();
+    if (!provided) {
+      return res.status(401).json({ success: false, message: "Refresh token required." });
+    }
+
+    const decoded = verifyRefreshToken(provided);
+    if (String(decoded.role || "").toLowerCase() !== "doctor") {
+      return res.status(403).json({ success: false, message: "Invalid refresh token role." });
+    }
+
+    const existing = await RefreshToken.findOne({
+      tokenHash: hashToken(provided),
+      revokedAt: null,
+    });
+    if (!existing || existing.expiresAt <= new Date()) {
+      return res.status(401).json({ success: false, message: "Refresh token expired or revoked." });
+    }
+
+    const doctor = await DoctorUser.findById(existing.principalId);
+    if (!doctor || doctor.isActive === false || doctor.status === "BLOCKED") {
+      return res.status(403).json({ success: false, message: "Doctor account inactive." });
+    }
+
+    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
+      principalId: doctor._id.toString(),
+      role: "doctor",
+      email: doctor.email,
+      familyId: decoded.familyId,
+    });
+
+    existing.revokedAt = new Date();
+    existing.revokedReason = "rotated";
+    existing.replacedByTokenHash = hashToken(refreshToken);
+    await existing.save();
+    await persistRefreshToken(req, doctor._id, refreshToken, refreshMeta);
+
+    setAuthCookies(res, { accessToken, refreshToken });
+    return res.json({ success: true, token: accessToken, refreshToken });
+  } catch {
+    return res.status(401).json({ success: false, message: "Invalid refresh token." });
+  }
+});
+
+router.post("/logout", auth, async (req, res) => {
+  try {
+    const cookies = parseCookies(req);
+    const provided = String(req.body?.refreshToken || cookies.mv_rt || "").trim();
+    if (provided) {
+      await RefreshToken.updateOne(
+        { tokenHash: hashToken(provided), revokedAt: null },
+        { $set: { revokedAt: new Date(), revokedReason: "logout" } }
+      );
+    }
+    clearAuthCookies(res);
+    return res.json({ success: true, message: "Logged out successfully." });
+  } catch {
+    return res.status(500).json({ success: false, message: "Logout failed." });
   }
 });
 

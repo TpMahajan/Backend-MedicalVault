@@ -1,6 +1,6 @@
 import express from "express";
 import mongoose from "mongoose";
-import { auth, optionalAuth } from "../middleware/auth.js";
+import { auth } from "../middleware/auth.js";
 import { Session } from "../models/Session.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
@@ -12,6 +12,8 @@ import { BUCKET_NAME } from "../config/s3.js";
 import { generateSignedUrl } from "../utils/s3Utils.js";
 
 const router = express.Router();
+const ENABLE_DEBUG_ROUTES =
+  String(process.env.ENABLE_DEBUG_ROUTES || "false").toLowerCase() === "true";
 const hasAWSCredentials =
   !!process.env.AWS_ACCESS_KEY_ID && !!process.env.AWS_SECRET_ACCESS_KEY;
 
@@ -338,8 +340,11 @@ router.get("/health", (req, res) => {
   });
 });
 
-// Test database connection (no auth required)
+// Test database connection (debug-only)
 router.get("/db-test", async (req, res) => {
+  if (!ENABLE_DEBUG_ROUTES) {
+    return res.status(404).json({ success: false, message: "Not found" });
+  }
   try {
     // Test if we can create a simple session object (without saving)
     const testSessionData = {
@@ -374,8 +379,8 @@ router.get("/db-test", async (req, res) => {
 });
 
 // ---------------- Doctor Requests Access ----------------
-// POST /api/sessions/request (allows anonymous access)
-router.post("/request", optionalAuth, async (req, res) => {
+// POST /api/sessions/request
+router.post("/request", auth, async (req, res) => {
   try {
     console.log('📋 Session request received:', {
       body: req.body,
@@ -388,8 +393,7 @@ router.post("/request", optionalAuth, async (req, res) => {
 
     const { patientId, requestMessage } = req.body;
 
-    // Allow logged-in doctor; anonymous may initiate placeholder request label (no doctorId)
-    if (!req.auth || (req.auth.role !== "doctor" && req.auth.role !== "anonymous")) {
+    if (!req.auth || req.auth.role !== "doctor") {
       console.log('🚫 Session request denied - invalid role or no auth:', {
         hasAuth: !!req.auth,
         role: req.auth?.role,
@@ -397,25 +401,17 @@ router.post("/request", optionalAuth, async (req, res) => {
       });
       return res.status(403).json({
         success: false,
-        message: "Only doctors or anonymous QR can request access",
-        debug: {
-          hasAuth: !!req.auth,
-          providedRole: req.auth?.role,
-          requiredRole: "doctor|anonymous"
-        }
+        message: "Only doctors can request access",
       });
     }
 
-    // Check if doctor is active (only for logged-in doctors, not anonymous)
-    if (req.auth.role === "doctor") {
-      const doctor = await DoctorUser.findById(req.auth.id);
-      if (doctor && doctor.isActive === false) {
-        console.log('🚫 Session request denied - doctor profile is inactive:', req.auth.id);
-        return res.status(403).json({
-          success: false,
-          message: "Your profile is currently inactive. Please activate your profile in Settings to attend sessions."
-        });
-      }
+    const doctor = await DoctorUser.findById(req.auth.id);
+    if (doctor && doctor.isActive === false) {
+      console.log('🚫 Session request denied - doctor profile is inactive:', req.auth.id);
+      return res.status(403).json({
+        success: false,
+        message: "Your profile is currently inactive. Please activate your profile in Settings to attend sessions."
+      });
     }
 
     // Validate required fields
@@ -445,16 +441,14 @@ router.post("/request", optionalAuth, async (req, res) => {
     console.log('✅ Patient found:', patient.name, patient.email);
 
     // Persist doctor-patient relationship so Patient Manager keeps historical records.
-    if (req.auth.role === "doctor") {
-      try {
-        await DoctorUser.findByIdAndUpdate(
-          req.auth.id,
-          { $addToSet: { linkedPatients: patientId } },
-          { new: false }
-        );
-      } catch (linkError) {
-        console.error("⚠️ Failed to persist doctor-patient link:", linkError.message);
-      }
+    try {
+      await DoctorUser.findByIdAndUpdate(
+        req.auth.id,
+        { $addToSet: { linkedPatients: patientId } },
+        { new: false }
+      );
+    } catch (linkError) {
+      console.error("⚠️ Failed to persist doctor-patient link:", linkError.message);
     }
 
     // Archive any existing active/pending sessions for the same doctor-patient pair.
@@ -464,52 +458,48 @@ router.post("/request", optionalAuth, async (req, res) => {
     // IMPORTANT: We NEVER delete sessions. We set status="ended" so they appear
     // in Session History. All existing diagnosis/notes are PRESERVED as-is.
     // ─────────────────────────────────────────────────────────────────────────
-    if (req.auth.role === 'doctor') {
-      console.log('🔍 Checking for existing sessions between doctor', req.auth.id, 'and patient', patientId);
-      const existingSessions = await Session.find({
-        doctorId: req.auth.id,
-        patientId: patientId,
-        status: { $in: ["pending", "accepted"] }
-      });
+    console.log('🔍 Checking for existing sessions between doctor', req.auth.id, 'and patient', patientId);
+    const existingSessions = await Session.find({
+      doctorId: req.auth.id,
+      patientId: patientId,
+      status: { $in: ["pending", "accepted"] }
+    });
 
-      if (existingSessions.length > 0) {
-        console.log(`📦 Archiving ${existingSessions.length} existing session(s) — data preserved, NOT deleted`);
-        const archiveTime = new Date();
-        for (const oldSession of existingSessions) {
-          const preservedDiagnosis =
-            oldSession.diagnosis && oldSession.diagnosis.trim() !== ""
-              ? oldSession.diagnosis
-              : "Previous Visit";
+    if (existingSessions.length > 0) {
+      console.log(`📦 Archiving ${existingSessions.length} existing session(s) — data preserved, NOT deleted`);
+      const archiveTime = new Date();
+      for (const oldSession of existingSessions) {
+        const preservedDiagnosis =
+          oldSession.diagnosis && oldSession.diagnosis.trim() !== ""
+            ? oldSession.diagnosis
+            : "Previous Visit";
 
-          await persistSessionHistory(Session, {
-            sessionId: oldSession._id,
-            doctorId: oldSession.doctorId,
-            patientId: oldSession.patientId,
-            diagnosis: preservedDiagnosis,
-            notes: oldSession.notes,
-            endedAt: oldSession.endedAt || archiveTime,
-          });
-          console.log(`  ✅ Archived session ${oldSession._id} | diagnosis preserved: "${preservedDiagnosis}"`);
-        }
+        await persistSessionHistory(Session, {
+          sessionId: oldSession._id,
+          doctorId: oldSession.doctorId,
+          patientId: oldSession.patientId,
+          diagnosis: preservedDiagnosis,
+          notes: oldSession.notes,
+          endedAt: oldSession.endedAt || archiveTime,
+        });
+        console.log(`  ✅ Archived session ${oldSession._id} | diagnosis preserved: "${preservedDiagnosis}"`);
       }
     }
 
     console.log('✅ Ready to create new session (old sessions safely archived if any)');
 
-    // Create new session request (anonymous doctor has null doctorId and a label)
-    const isAnon = req.auth.role === 'anonymous';
-    const doctorIdToSave = isAnon ? undefined : req.auth.id;
-    const requestLabel = isAnon ? (requestMessage || "Anonymous Doctor is requesting access") : (requestMessage || "");
+    // Create new session request
+    const requestLabel = requestMessage || "";
 
     console.log('🔄 Creating session with data:', {
-      doctorId: doctorIdToSave || null,
+      doctorId: req.auth.id,
       patientId: patientId,
       requestMessage: requestLabel,
       status: "pending"
     });
 
     const session = new Session({
-      ...(doctorIdToSave ? { doctorId: doctorIdToSave } : {}),
+      doctorId: req.auth.id,
       patientId: patientId,
       requestMessage: requestLabel,
       status: "pending",
@@ -521,21 +511,17 @@ router.post("/request", optionalAuth, async (req, res) => {
     console.log('✅ Session saved with ID:', session._id);
 
     // Populate doctor info for response if exists
-    if (session.doctorId) {
-      console.log('🔄 Populating doctor info...');
-      await session.populate(
-        "doctorId",
-        "name email mobile avatar profilePicture profilePictureUrl experience specialty specialization createdAt chatUrl chatDeepLink"
-      );
-      console.log(`📋 New session request: Dr. ${session.doctorId.name} → Patient ${patientId}`);
-    } else {
-      console.log(`📋 New session request: Anonymous Doctor → Patient ${patientId}`);
-    }
+    console.log('🔄 Populating doctor info...');
+    await session.populate(
+      "doctorId",
+      "name email mobile avatar profilePicture profilePictureUrl experience specialty specialization createdAt chatUrl chatDeepLink"
+    );
+    console.log(`📋 New session request: Dr. ${session.doctorId.name} → Patient ${patientId}`);
 
     // Send notification to patient about the new session request
     try {
-      const doctorName = session.doctorId ? session.doctorId.name : 'Anonymous Doctor';
-      const doctorIdForNotif = session.doctorId ? session.doctorId._id.toString() : null;
+      const doctorName = session.doctorId.name;
+      const doctorIdForNotif = session.doctorId._id.toString();
 
       // Create notification record in database
       const { Notification } = await import('../models/Notification.js');
@@ -550,8 +536,8 @@ router.post("/request", optionalAuth, async (req, res) => {
         },
         recipientId: patientId,
         recipientRole: "patient",
-        senderId: doctorIdForNotif || "system",
-        senderRole: doctorIdForNotif ? "doctor" : "system"
+        senderId: doctorIdForNotif,
+        senderRole: "doctor"
       });
       await notification.save();
 
@@ -582,7 +568,7 @@ router.post("/request", optionalAuth, async (req, res) => {
       success: true,
       message: "Access request sent successfully",
       session: session,
-      doctorLabel: session.doctorId ? `Dr. ${session.doctorId.name}` : 'Anonymous Doctor'
+      doctorLabel: `Dr. ${session.doctorId.name}`
     });
 
   } catch (error) {
@@ -596,8 +582,8 @@ router.post("/request", optionalAuth, async (req, res) => {
 });
 
 // ---------------- Get Session Status (for polling) ----------------
-// GET /api/sessions/:id/status (allows anonymous polling)
-router.get("/:id/status", optionalAuth, async (req, res) => {
+// GET /api/sessions/:id/status
+router.get("/:id/status", auth, async (req, res) => {
   try {
     const sessionId = req.params.id;
 
@@ -616,11 +602,17 @@ router.get("/:id/status", optionalAuth, async (req, res) => {
     }
 
     // Check if requester is authorized to view this session
-    const isDoctor = req.auth?.role === "doctor" && session.doctorId && session.doctorId._id.toString() === req.auth.id.toString();
-    const isPatient = req.auth?.role !== "doctor" && session.patientId._id.toString() === req.auth.id.toString();
-    const isAnonymous = req.auth?.role === "anonymous" && session.doctorId === null; // Anonymous sessions have no doctorId
+    const role = asText(req.auth?.role).toLowerCase();
+    const isDoctor =
+      role === "doctor" &&
+      session.doctorId &&
+      session.doctorId._id.toString() === req.auth.id.toString();
+    const isPatient =
+      role === "patient" &&
+      session.patientId._id.toString() === req.auth.id.toString();
+    const isPrivileged = role === "admin" || role === "superadmin";
 
-    if (!isDoctor && !isPatient && !isAnonymous) {
+    if (!isDoctor && !isPatient && !isPrivileged) {
       return res.status(403).json({
         success: false,
         message: "Unauthorized to view this session"
@@ -742,33 +734,33 @@ router.get("/chat/threads", async (req, res) => {
       counterpartDocs.map((entry) => [entry._id.toString(), entry])
     );
 
-    const threads = threadsRaw.map((thread) => {
-      const counterpartId = asText(thread?._id);
-      const counterpart = counterpartById.get(counterpartId) || {};
+    const threads = await Promise.all(
+      threadsRaw.map(async (thread) => {
+        const counterpartId = asText(thread?._id);
+        const counterpart = counterpartById.get(counterpartId) || {};
+        const counterpartAvatar = isDoctor
+          ? asText(counterpart?.profilePicture)
+          : await resolveDoctorAvatarUrl(counterpart);
 
-      return {
-        counterpartId,
-        counterpartRole: isDoctor ? "patient" : "doctor",
-        counterpartName: resolveParticipantName(
-          counterpart,
-          isDoctor ? "Patient" : "Doctor"
-        ),
-        counterpartEmail: asText(counterpart?.email),
-        counterpartMobile: asText(counterpart?.mobile),
-        counterpartAvatar:
-          asText(
-            counterpart?.profilePictureUrl ||
-              counterpart?.profilePicture ||
-              counterpart?.avatar
-          ) || "",
-        doctorId: asText(thread?.doctorId),
-        patientId: asText(thread?.patientId),
-        lastMessage: asText(thread?.lastMessage),
-        lastSenderRole: asText(thread?.lastSenderRole).toLowerCase(),
-        lastAt: thread?.lastAt || null,
-        unreadCount: Number(thread?.unreadCount || 0),
-      };
-    });
+        return {
+          counterpartId,
+          counterpartRole: isDoctor ? "patient" : "doctor",
+          counterpartName: resolveParticipantName(
+            counterpart,
+            isDoctor ? "Patient" : "Doctor"
+          ),
+          counterpartEmail: asText(counterpart?.email),
+          counterpartMobile: asText(counterpart?.mobile),
+          counterpartAvatar,
+          doctorId: asText(thread?.doctorId),
+          patientId: asText(thread?.patientId),
+          lastMessage: asText(thread?.lastMessage),
+          lastSenderRole: asText(thread?.lastSenderRole).toLowerCase(),
+          lastAt: thread?.lastAt || null,
+          unreadCount: Number(thread?.unreadCount || 0),
+        };
+      })
+    );
 
     return res.json({
       success: true,
@@ -1731,6 +1723,9 @@ router.get("/active", async (req, res) => {
 // ---------------- Debug endpoint ----------------
 // GET /api/sessions/debug
 router.get("/debug", auth, async (req, res) => {
+  if (!ENABLE_DEBUG_ROUTES) {
+    return res.status(404).json({ success: false, message: "Not found" });
+  }
   try {
     res.json({
       success: true,
@@ -1761,6 +1756,9 @@ router.get("/debug", auth, async (req, res) => {
 // ---------------- Debug specific doctor-patient session ----------------
 // GET /api/sessions/debug/:patientId
 router.get("/debug/:patientId", auth, async (req, res) => {
+  if (!ENABLE_DEBUG_ROUTES) {
+    return res.status(404).json({ success: false, message: "Not found" });
+  }
   try {
     const patientId = req.params.patientId;
 
@@ -1810,6 +1808,9 @@ router.get("/debug/:patientId", auth, async (req, res) => {
 // ---------------- Test session creation ----------------
 // POST /api/sessions/test-create
 router.post("/test-create", auth, async (req, res) => {
+  if (!ENABLE_DEBUG_ROUTES) {
+    return res.status(404).json({ success: false, message: "Not found" });
+  }
   try {
     console.log('🧪 Test session creation:', {
       authId: req.auth?.id,

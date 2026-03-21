@@ -1,196 +1,215 @@
-import jwt from "jsonwebtoken";
-import { User } from "../models/User.js";
+﻿import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
-import { Session } from "../models/Session.js";
-import { flushDoctorActiveSessions } from "../services/sessionHistoryPersistence.js";
+import { AdminUser } from "../models/AdminUser.js";
+import { parseBearerToken, parseCookies, verifyAccessToken } from "../services/tokenService.js";
+
+const normalizeRole = (role) => String(role || "").trim().toLowerCase();
+
+const extractPrincipalFromPayload = (payload) => {
+  if (!payload) return null;
+
+  const role = normalizeRole(payload.role || payload.typ);
+  const principalId =
+    payload.sub ||
+    payload.userId ||
+    payload.id ||
+    payload.doctorId ||
+    payload.adminId ||
+    payload.uid ||
+    "";
+
+  if (!role || !principalId) return null;
+
+  // Legacy vault_share compatibility maps to patient role.
+  const mappedRole = role === "vault_share" ? "patient" : role;
+
+  return {
+    role: mappedRole,
+    id: String(principalId),
+    email: payload.email ? String(payload.email).toLowerCase() : "",
+  };
+};
+
+const resolveTokenCandidates = (req) => {
+  const headerToken = parseBearerToken(req);
+  const cookies = parseCookies(req);
+  const cookieToken = cookies.mv_at || "";
+
+  return {
+    headerToken,
+    cookieToken,
+    ordered: [headerToken, cookieToken].filter(Boolean),
+  };
+};
+
+const hydratePrincipal = async (principal) => {
+  if (!principal) return null;
+
+  const { id, role, email } = principal;
+
+  if (role === "doctor") {
+    const doctor = await DoctorUser.findById(id).select("-password");
+    if (!doctor || doctor.isActive === false || doctor.status === "BLOCKED") {
+      return null;
+    }
+    return { auth: { id, role, email: doctor.email || email }, doctor };
+  }
+
+  if (role === "admin") {
+    const admin = await AdminUser.findById(id).select("-password");
+    if (!admin || admin.isActive === false || admin.status === "BLOCKED") {
+      return null;
+    }
+    return { auth: { id, role, email: admin.email || email }, admin };
+  }
+
+  if (role === "superadmin") {
+    const configuredEmail = String(process.env.SUPERADMIN_EMAIL || "").trim().toLowerCase();
+    const candidateEmail = String(email || "").trim().toLowerCase();
+    if (!configuredEmail || candidateEmail !== configuredEmail) {
+      return null;
+    }
+    return {
+      auth: { id: configuredEmail, role, email: configuredEmail },
+      superAdmin: { email: configuredEmail, role: "SUPERADMIN" },
+    };
+  }
+
+  // Treat unknown roles as patient for backward compatibility when role is omitted.
+  const patient = await User.findById(id).select("-password");
+  if (!patient || patient.isActive === false || patient.status === "BLOCKED") {
+    return null;
+  }
+
+  return { auth: { id, role: "patient", email: patient.email || email }, user: patient };
+};
+
+const applyPrincipalToRequest = (req, hydrated) => {
+  req.auth = hydrated.auth;
+  req.userId = hydrated.auth.id;
+
+  if (hydrated.user) req.user = hydrated.user;
+  if (hydrated.doctor) req.doctor = hydrated.doctor;
+  if (hydrated.admin) req.admin = hydrated.admin;
+  if (hydrated.superAdmin) req.superAdmin = hydrated.superAdmin;
+};
+
+const verifyTokenAndHydrate = async (req) => {
+  const { ordered } = resolveTokenCandidates(req);
+  if (!ordered.length) return { token: "", principal: null, hydrated: null };
+
+  let lastError = null;
+  for (const token of ordered) {
+    try {
+      const payload = verifyAccessToken(token);
+      const principal = extractPrincipalFromPayload(payload);
+      if (!principal) {
+        continue;
+      }
+
+      const hydrated = await hydratePrincipal(principal);
+      if (hydrated) {
+        return { token, principal, hydrated };
+      }
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+
+  return { token: "", principal: null, hydrated: null };
+};
 
 // Middleware for required authentication
 export const auth = async (req, res, next) => {
-  let token;
   try {
-    // Check for token in Authorization header first, then query parameter
-    token = req.header("Authorization")?.replace("Bearer ", "");
-    let tokenSource = "header";
-    if (!token) {
-      token = req.query.token;
-      tokenSource = token ? "query" : "none";
-    }
-    
-    if (!token) {
+    const { hydrated } = await verifyTokenAndHydrate(req);
+
+    if (!hydrated) {
       return res.status(401).json({
         success: false,
-        message: "Access denied. No token provided.",
+        message: "Access denied. Invalid or missing token.",
       });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    // Handle different token formats
-    let userId, role;
-    if (decoded.userId && decoded.role) {
-      // Standard/anon format: { userId, role }
-      userId = decoded.userId;
-      role = decoded.role;
-    } else if (decoded.uid && decoded.typ) {
-      // Legacy vault_share format: { uid, typ }
-      userId = decoded.uid;
-      role = decoded.typ === "vault_share" ? "patient" : decoded.typ;
-    } else {
-      return res.status(401).json({ success: false, message: "Invalid token format." });
-    }
-
-    console.log("[auth] tokenSource=", tokenSource, "role=", role, "userId=", userId, "path=", req.originalUrl);
-
-    let account;
-    if (role === "doctor") {
-      account = await DoctorUser.findById(userId).select("-password");
-      if (!account) {
-        return res.status(401).json({ success: false, message: "Doctor not found" });
-      }
-      req.doctor = account;
-    } else if (role === "anonymous") {
-      // For anonymous users, we don't need to fetch account data
-      // Just set the auth info and continue
-      req.auth = { id: userId, role: role };
-    } else {
-      account = await User.findById(userId).select("-password");
-      if (!account) {
-        return res.status(401).json({ success: false, message: "User not found" });
-      }
-      if (account.isActive === false) {
-        return res.status(401).json({ success: false, message: "Account is deactivated." });
-      }
-      req.user = account;
-    }
-
-    if (role !== "anonymous") {
-      req.auth = { id: userId, role: role };
-      req.userId = userId; // Set for requireVerified middleware
-    }
-
-    // If anonymous role, enforce allowlist at middleware level
-    if (role === "anonymous") {
-      const method = req.method.toUpperCase();
-      const path = req.path || "";
-
-      const allow = (
-        // Allow auth/me to return anonymous context
-        (method === "GET" && /^\/api\/auth\/me$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
-        // GET /users/:id
-        (method === "GET" && /^\/api\/users\/[a-f\d]{24}$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
-        // GET /users/:id/records
-        (method === "GET" && /^\/api\/users\/[a-f\d]{24}\/records$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
-        // POST /sessions/request (anonymous doctor can request access)
-        (method === "POST" && /^\/api\/sessions\/request$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
-        // GET /sessions/:id/status (allow polling)
-        (method === "GET" && /^\/api\/sessions\/[a-f\d]{24}\/status$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
-        // GET /files/user/:userId (list user's files)
-        (method === "GET" && /^\/api\/files\/user\/[a-f\d]{24}$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
-        // GET /files/patient/:patientId (alias)
-        (method === "GET" && /^\/api\/files\/patient\/[a-f\d]{24}$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
-        // GET /files/:id/preview
-        (method === "GET" && /^\/api\/files\/[a-f\d]{24}\/preview$/i.test(req.originalUrl.replace(/\?.*$/, ""))) ||
-        // GET /files/:id/download
-        (method === "GET" && /^\/api\/files\/[a-f\d]{24}\/download$/i.test(req.originalUrl.replace(/\?.*$/, "")))
-      );
-
-      if (!allow) {
-        console.log("[auth] anonymous blocked path:", req.originalUrl);
-      }
-      if (!allow) {
-        return res.status(403).json({ success: false, message: "Anonymous access not permitted for this endpoint" });
-      }
-    }
-    next();
+    applyPrincipalToRequest(req, hydrated);
+    return next();
   } catch (error) {
-    if (error.name === "JsonWebTokenError") {
-      return res.status(401).json({ success: false, message: "Invalid token." });
+    if (error.name === "JsonWebTokenError" || error.name === "TokenExpiredError") {
+      return res.status(401).json({ success: false, message: "Invalid or expired token." });
     }
-    if (error.name === "TokenExpiredError") {
-      try {
-        const decoded = jwt.decode(token || "");
-        const expiredDoctorId =
-          decoded?.role === "doctor" ? (decoded.userId || decoded.doctorId) : null;
 
-        if (expiredDoctorId) {
-          await flushDoctorActiveSessions(Session, {
-            doctorId: expiredDoctorId,
-            reason: "Authentication token expired",
-          });
-        }
-      } catch (flushError) {
-        console.error("Failed to flush sessions on token expiry:", flushError);
-      }
-
-      return res.status(401).json({ success: false, message: "Token expired." });
-    }
     console.error("Auth middleware error:", error);
-    res.status(500).json({ success: false, message: "Internal server error." });
+    return res.status(403).json({ success: false, message: "Access denied" });
   }
 };
 
 // Middleware for optional authentication
 export const optionalAuth = async (req, res, next) => {
   try {
-    let token = req.header("Authorization")?.replace("Bearer ", "");
-    let tokenSource = "header";
-    if (!token) {
-      token = req.query.token;
-      tokenSource = token ? "query" : "none";
+    const { ordered } = resolveTokenCandidates(req);
+    if (!ordered.length) {
+      return next();
     }
-    
-    if (token) {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      
-      // Handle different token formats
-      let userId, role;
-      if (decoded.userId && decoded.role) {
-        // Standard format: { userId, role }
-        userId = decoded.userId;
-        role = decoded.role;
-      } else if (decoded.uid && decoded.typ) {
-        // Vault share format: { uid, typ }
-        userId = decoded.uid;
-        role = decoded.typ === "vault_share" ? "patient" : decoded.typ;
-      } else {
-        console.warn("Invalid token format in optional auth");
-        next();
-        return;
-      }
-      
-      // Always set req.auth for valid tokens, regardless of database lookup
-      req.auth = { id: userId, role: role };
-      
-      if (role === "doctor") {
-        const doctor = await DoctorUser.findById(userId).select("-password");
-        if (doctor) req.doctor = doctor;
-      } else if (role === "anonymous") {
-        // For anonymous users, we don't need to fetch user data
-      } else {
-        const user = await User.findById(userId).select("-password");
-        if (user && user.isActive !== false) req.user = user;
+
+    for (const token of ordered) {
+      try {
+        const payload = verifyAccessToken(token);
+        const principal = extractPrincipalFromPayload(payload);
+        if (!principal) {
+          continue;
+        }
+
+        const hydrated = await hydratePrincipal(principal);
+        if (!hydrated) {
+          continue;
+        }
+
+        applyPrincipalToRequest(req, hydrated);
+        return next();
+      } catch (error) {
+        if (error.name === "JsonWebTokenError" || error.name === "TokenExpiredError") {
+          continue;
+        }
+        throw error;
       }
     }
-    next();
-  } catch (err) {
-    console.warn("❌ Optional auth failed:", err.message);
-    next(); // continue without authentication
+
+    return next();
+  } catch (error) {
+    console.error("Optional auth error:", error);
+    return res.status(403).json({ success: false, message: "Access denied" });
   }
 };
 
-// Role guards (used by some route modules)
+// Role guards (used by route modules)
 export const requireDoctor = (req, res, next) => {
-  const role = req.auth?.role;
-  if (role !== "doctor") {
+  if (normalizeRole(req.auth?.role) !== "doctor") {
     return res.status(403).json({ success: false, message: "Doctor access required" });
   }
-  next();
+  return next();
 };
 
 export const requirePatient = (req, res, next) => {
-  const role = req.auth?.role;
-  if (role !== "patient") {
+  if (normalizeRole(req.auth?.role) !== "patient") {
     return res.status(403).json({ success: false, message: "Patient access required" });
   }
-  next();
+  return next();
+};
+
+export const requireAdmin = (req, res, next) => {
+  if (normalizeRole(req.auth?.role) !== "admin") {
+    return res.status(403).json({ success: false, message: "Admin access required" });
+  }
+  return next();
+};
+
+export const requireSuperAdmin = (req, res, next) => {
+  if (normalizeRole(req.auth?.role) !== "superadmin") {
+    return res.status(403).json({ success: false, message: "SuperAdmin access required" });
+  }
+  return next();
 };

@@ -39,6 +39,7 @@ import { Session } from "./models/Session.js";
 import { checkEmailConfig } from "./utils/emailService.js";
 import patientAppointmentRoutes from "./routes/patientAppointments.js"; // patient appointments (Flutter)
 import { initPublicConfigRealtime } from "./services/publicConfigRealtime.js";
+import { apiLimiter } from "./middleware/rateLimit.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -49,9 +50,10 @@ const ENV = process.env.NODE_ENV || "development";
 app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS || 1));
 app.use(
   helmet({
-    contentSecurityPolicy: false,
-    crossOriginEmbedderPolicy: false,
-    crossOriginResourcePolicy: false, // Allow images to be loaded from different origins
+    hsts: ENV !== "development",
+    frameguard: { action: "deny" },
+    referrerPolicy: { policy: "no-referrer" },
+    crossOriginResourcePolicy: { policy: "same-site" },
   })
 );
 
@@ -85,6 +87,7 @@ app.use(
     credentials: true,
   })
 );
+app.use("/api", apiLimiter);
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(compression({
@@ -107,7 +110,10 @@ const __dirname = path.dirname(__filename);
 app.use(
   "/uploads",
   (req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    const requestOrigin = req.headers.origin;
+    if (requestOrigin && allowedCorsOrigins.has(requestOrigin)) {
+      res.setHeader("Access-Control-Allow-Origin", requestOrigin);
+    }
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     next();
   },

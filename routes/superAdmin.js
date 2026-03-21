@@ -1,11 +1,18 @@
 import express from "express";
-import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
+import bcrypt from "bcryptjs";
+import mongoose from "mongoose";
+import multer from "multer";
+import multerS3 from "multer-s3";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
 
 import { requireSuperAdminAuth } from "../middleware/superAdminAuth.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { AdminUser } from "../models/AdminUser.js";
+import { SuperAdminCredential } from "../models/SuperAdminCredential.js";
 import { Advertisement } from "../models/Advertisement.js";
 import { Product } from "../models/Product.js";
 import { UIConfig } from "../models/UIConfig.js";
@@ -14,6 +21,17 @@ import { SuperAdminActivityLog } from "../models/SuperAdminActivityLog.js";
 import { AdvertisementClickLog } from "../models/AdvertisementClickLog.js";
 import { clearPublicConfigCache } from "./publicConfig.js";
 import { initializeFirebase, sendPushNotification } from "../config/firebase.js";
+import s3Client, { BUCKET_NAME } from "../config/s3.js";
+import { generateSignedUrl } from "../utils/s3Utils.js";
+import {
+  parseCookies,
+  setAuthCookies,
+  clearAuthCookies,
+  verifyRefreshToken,
+  hashToken,
+  issueAuthTokenSet,
+} from "../services/tokenService.js";
+import { RefreshToken } from "../models/RefreshToken.js";
 import {
   PUBLIC_AD_SURFACES,
   PUBLIC_ALERT_PLATFORMS,
@@ -23,13 +41,11 @@ import {
 const router = express.Router();
 initializeFirebase();
 
-const SUPERADMIN_EMAIL = String(
-  process.env.SUPERADMIN_EMAIL || "superadmin@medicalvault.in"
-)
+const SUPERADMIN_EMAIL = String(process.env.SUPERADMIN_EMAIL || "")
   .trim()
   .toLowerCase();
-const SUPERADMIN_PASSWORD = String(
-  process.env.SUPERADMIN_PASSWORD || "111111"
+const SUPERADMIN_BOOTSTRAP_PASSWORD = String(
+  process.env.SUPERADMIN_BOOTSTRAP_PASSWORD || ""
 ).trim();
 
 const LOGIN_LIMITER = rateLimit({
@@ -50,6 +66,85 @@ const USER_ROLES = ["PATIENT", "DOCTOR", "ADMIN"];
 const ALERT_AUDIENCES = ["ALL", "PATIENT", "DOCTOR"];
 const ALERT_PLATFORMS = ["ALL", ...PUBLIC_ALERT_PLATFORMS];
 const AD_SURFACES = [...PUBLIC_AD_SURFACES];
+const hasAWSCredentials =
+  !!process.env.AWS_ACCESS_KEY_ID && !!process.env.AWS_SECRET_ACCESS_KEY;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+function parseCsvOrArray(value) {
+  const raw = Array.isArray(value) ? value : [value];
+  return raw
+    .flatMap((entry) =>
+      String(entry || "")
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean)
+    )
+    .map((entry) => entry.toUpperCase());
+}
+
+function normalizeGeoTargets(input = {}) {
+  const targetCountries = [...new Set(parseCsvOrArray(input.targetCountries || input.countries))];
+  const targetStates = [...new Set(parseCsvOrArray(input.targetStates || input.states))];
+  const targetRegions = [...new Set(parseCsvOrArray(input.targetRegions || input.regions))];
+  const hasTargets =
+    targetCountries.length > 0 ||
+    targetStates.length > 0 ||
+    targetRegions.length > 0;
+
+  return {
+    geoScope: hasTargets ? "TARGETED" : "GLOBAL",
+    targetCountries,
+    targetStates,
+    targetRegions,
+  };
+}
+
+function publicServerBaseUrl() {
+  const configured = String(
+    process.env.PUBLIC_SERVER_BASE_URL || process.env.API_BASE_URL || ""
+  ).trim();
+  if (!configured) return `http://localhost:${process.env.PORT || 5000}`;
+  return configured.replace(/\/api\/?$/i, "");
+}
+
+function toAbsoluteUploadsUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("data:image/")) return raw;
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (raw.startsWith("/uploads/")) return `${publicServerBaseUrl()}${raw}`;
+  if (raw.startsWith("uploads/")) return `${publicServerBaseUrl()}/${raw}`;
+  return "";
+}
+
+function safeImageName(value) {
+  const baseName = path.parse(String(value || "image")).name;
+  const cleaned = baseName.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+  return cleaned || "image";
+}
+
+async function resolveStoredMediaUrl({ imageUrl, imageKey }) {
+  const key = String(imageKey || "").trim();
+  if (key) {
+    const directFromKey = toAbsoluteUploadsUrl(key);
+    if (directFromKey) return directFromKey;
+    if (hasAWSCredentials) {
+      try {
+        return await generateSignedUrl(key, BUCKET_NAME);
+      } catch {
+        // Fall through to url fallback.
+      }
+    }
+  }
+
+  const directUrl = toAbsoluteUploadsUrl(imageUrl);
+  if (directUrl) return directUrl;
+
+  const rawUrl = String(imageUrl || "").trim();
+  if (rawUrl.startsWith("data:image/")) return rawUrl;
+  return /^https?:\/\//i.test(rawUrl) ? rawUrl : "";
+}
 
 function normalizeRole(value) {
   return String(value || "")
@@ -225,28 +320,65 @@ function mapAdmin(admin) {
     role: admin.role || "ADMIN",
     status: admin.status || (admin.isActive === false ? "BLOCKED" : "ACTIVE"),
     permissions: admin.permissions || [],
-    assignedBy: admin.assignedBy || SUPERADMIN_EMAIL,
+    assignedBy: admin.assignedBy || SUPERADMIN_EMAIL || "system",
     createdAt: admin.createdAt,
     updatedAt: admin.updatedAt,
     type: "ADMIN",
   };
 }
 
-function signSuperAdminToken() {
-  return jwt.sign(
-    {
-      role: "SUPERADMIN",
-      email: SUPERADMIN_EMAIL,
-    },
-    process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_EXPIRES_IN || "12h" }
-  );
+async function ensureSuperAdminCredential(targetEmail) {
+  const normalizedTargetEmail = String(targetEmail || "")
+    .trim()
+    .toLowerCase();
+  if (!normalizedTargetEmail) {
+    throw new Error("SuperAdmin email is required");
+  }
+
+  let credential = await SuperAdminCredential.findOne({
+    email: normalizedTargetEmail,
+  });
+  if (credential) return credential;
+
+  // Bootstrap is allowed only for configured primary SuperAdmin email.
+  if (!SUPERADMIN_EMAIL || normalizedTargetEmail !== SUPERADMIN_EMAIL) {
+    return null;
+  }
+
+  if (!SUPERADMIN_BOOTSTRAP_PASSWORD) {
+    throw new Error(
+      "SUPERADMIN_BOOTSTRAP_PASSWORD must be configured before first SuperAdmin login"
+    );
+  }
+
+  const passwordHash = await bcrypt.hash(SUPERADMIN_BOOTSTRAP_PASSWORD, 12);
+  credential = await SuperAdminCredential.create({
+    email: SUPERADMIN_EMAIL,
+    passwordHash,
+    mustChangePassword: false,
+  });
+  return credential;
+}
+
+async function persistRefreshTokenForSuperAdmin(req, principalEmail, refreshToken, refreshMeta) {
+  const decoded = verifyRefreshToken(refreshToken);
+  const expiresAt = new Date((decoded.exp || 0) * 1000);
+  await RefreshToken.create({
+    principalId: principalEmail,
+    role: "superadmin",
+    tokenHash: hashToken(refreshToken),
+    familyId: refreshMeta.familyId,
+    jti: refreshMeta.jti,
+    expiresAt,
+    createdByIp: req.ip || "",
+    userAgent: req.headers["user-agent"] || "",
+  });
 }
 
 async function logActivity(req, payload) {
   try {
     await SuperAdminActivityLog.create({
-      actorEmail: req.superAdmin?.email || SUPERADMIN_EMAIL,
+      actorEmail: req.superAdmin?.email || SUPERADMIN_EMAIL || "system",
       action: payload.action,
       targetType: payload.targetType || "",
       targetId: payload.targetId || "",
@@ -293,6 +425,53 @@ function applyLegacyStatusFilter(query, statusFilter) {
   return query;
 }
 
+const advertisementImageStorage = hasAWSCredentials
+  ? multerS3({
+      s3: s3Client,
+      bucket: BUCKET_NAME,
+      contentType: multerS3.AUTO_CONTENT_TYPE,
+      key: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        const base = safeImageName(file.originalname);
+        cb(null, `superadmin/advertisements/${Date.now()}-${base}${ext}`);
+      },
+      metadata: (req, file, cb) => {
+        cb(null, {
+          uploadedBy: req.superAdmin?.email || SUPERADMIN_EMAIL || "system",
+          fieldName: file.fieldname,
+        });
+      },
+    })
+  : multer.diskStorage({
+      destination: (req, file, cb) => {
+        const uploadDir = path.join(
+          __dirname,
+          "../uploads/superadmin/advertisements"
+        );
+        if (!fs.existsSync(uploadDir)) {
+          fs.mkdirSync(uploadDir, { recursive: true });
+        }
+        cb(null, uploadDir);
+      },
+      filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        const base = safeImageName(file.originalname);
+        cb(null, `${Date.now()}-${base}${ext}`);
+      },
+    });
+
+const advertisementImageUpload = multer({
+  storage: advertisementImageStorage,
+  limits: { fileSize: 8 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype?.startsWith("image/")) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error("Only image files are allowed"), false);
+  },
+});
+
 // ---------------- AUTH ----------------
 router.post("/auth/login", LOGIN_LIMITER, async (req, res) => {
   try {
@@ -308,19 +487,48 @@ router.post("/auth/login", LOGIN_LIMITER, async (req, res) => {
       });
     }
 
-    if (email !== SUPERADMIN_EMAIL || password !== SUPERADMIN_PASSWORD) {
+    const credential = await ensureSuperAdminCredential(email);
+    if (!credential) {
       return res
         .status(401)
         .json({ success: false, message: "Invalid SuperAdmin credentials" });
     }
 
-    const token = signSuperAdminToken();
+    const passwordMatches = await bcrypt.compare(password, credential.passwordHash);
+    if (!passwordMatches) {
+      return res
+        .status(401)
+        .json({ success: false, message: "Invalid SuperAdmin credentials" });
+    }
+
+    const principalEmail = String(credential.email || email)
+      .trim()
+      .toLowerCase();
+    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
+      principalId: principalEmail,
+      role: "superadmin",
+      email: principalEmail,
+    });
+
+    await persistRefreshTokenForSuperAdmin(
+      req,
+      principalEmail,
+      refreshToken,
+      refreshMeta
+    );
+    credential.lastLoginAt = new Date();
+    await credential.save();
+
+    setAuthCookies(res, { accessToken, refreshToken });
     return res.json({
       success: true,
-      token,
+      token: accessToken,
+      refreshToken,
+      mustChangePassword: credential.mustChangePassword === true,
       user: {
-        email: SUPERADMIN_EMAIL,
+        email: principalEmail,
         role: "SUPERADMIN",
+        mustChangePassword: credential.mustChangePassword === true,
       },
     });
   } catch (error) {
@@ -329,6 +537,146 @@ router.post("/auth/login", LOGIN_LIMITER, async (req, res) => {
       message: "SuperAdmin login failed",
       error: error.message,
     });
+  }
+});
+
+router.post("/auth/refresh", async (req, res) => {
+  try {
+    const cookies = parseCookies(req);
+    const providedRefreshToken = String(
+      req.body?.refreshToken || cookies.mv_rt || ""
+    ).trim();
+    if (!providedRefreshToken) {
+      return res.status(401).json({ success: false, message: "Refresh token is required" });
+    }
+
+    const decoded = verifyRefreshToken(providedRefreshToken);
+    if (String(decoded.role || "").toLowerCase() !== "superadmin") {
+      return res.status(403).json({ success: false, message: "Invalid refresh token role" });
+    }
+    const principalEmail = String(decoded.email || decoded.sub || "")
+      .trim()
+      .toLowerCase();
+    if (!principalEmail) {
+      return res.status(403).json({ success: false, message: "Invalid refresh token principal" });
+    }
+
+    const existing = await RefreshToken.findOne({
+      tokenHash: hashToken(providedRefreshToken),
+      revokedAt: null,
+    });
+    if (!existing || existing.expiresAt <= new Date()) {
+      return res.status(401).json({ success: false, message: "Refresh token is expired or revoked" });
+    }
+
+    const credential = await SuperAdminCredential.findOne({ email: principalEmail });
+    if (!credential) {
+      return res.status(401).json({ success: false, message: "Invalid refresh token principal" });
+    }
+    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
+      principalId: principalEmail,
+      role: "superadmin",
+      email: principalEmail,
+      familyId: decoded.familyId,
+    });
+
+    existing.revokedAt = new Date();
+    existing.revokedReason = "rotated";
+    existing.replacedByTokenHash = hashToken(refreshToken);
+    await existing.save();
+
+    await persistRefreshTokenForSuperAdmin(
+      req,
+      principalEmail,
+      refreshToken,
+      refreshMeta
+    );
+
+    setAuthCookies(res, { accessToken, refreshToken });
+    return res.json({
+      success: true,
+      token: accessToken,
+      refreshToken,
+      mustChangePassword: credential.mustChangePassword === true,
+    });
+  } catch (error) {
+    return res.status(401).json({ success: false, message: "Invalid refresh token" });
+  }
+});
+
+router.post("/auth/change-password", requireSuperAdminAuth, async (req, res) => {
+  try {
+    const currentPassword = String(req.body.currentPassword || "").trim();
+    const newPassword = String(req.body.newPassword || "").trim();
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: "Current password and new password are required",
+      });
+    }
+
+    if (newPassword.length < 12) {
+      return res.status(400).json({
+        success: false,
+        message: "New password must be at least 12 characters long",
+      });
+    }
+
+    const credential = await SuperAdminCredential.findOne({
+      email: req.superAdmin.email,
+    });
+    if (!credential) {
+      return res.status(404).json({
+        success: false,
+        message: "SuperAdmin credential not found",
+      });
+    }
+    const currentMatches = await bcrypt.compare(currentPassword, credential.passwordHash);
+    if (!currentMatches) {
+      return res.status(401).json({ success: false, message: "Current password is incorrect" });
+    }
+
+    credential.passwordHash = await bcrypt.hash(newPassword, 12);
+    credential.mustChangePassword = false;
+    credential.passwordChangedAt = new Date();
+    await credential.save();
+
+    await logActivity(req, {
+      action: "CHANGE_PASSWORD",
+      targetType: "SUPERADMIN",
+      targetId: credential._id?.toString(),
+      details: {},
+    });
+
+    return res.json({ success: true, message: "Password changed successfully" });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to change password",
+      error: error.message,
+    });
+  }
+});
+
+router.post("/auth/logout", requireSuperAdminAuth, async (req, res) => {
+  try {
+    const cookies = parseCookies(req);
+    const providedRefreshToken = String(
+      req.body?.refreshToken || cookies.mv_rt || ""
+    ).trim();
+
+    if (providedRefreshToken) {
+      await RefreshToken.updateOne(
+        { tokenHash: hashToken(providedRefreshToken), revokedAt: null },
+        { $set: { revokedAt: new Date(), revokedReason: "logout" } }
+      );
+    }
+
+    clearAuthCookies(res);
+    return res.json({ success: true, message: "Logged out successfully" });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Logout failed" });
   }
 });
 
@@ -827,7 +1175,7 @@ router.post("/users", requireSuperAdminAuth, async (req, res) => {
       .trim()
       .toLowerCase();
     const phone = String(req.body.phone || req.body.mobile || "").trim();
-    const password = String(req.body.password || "111111").trim();
+    const password = String(req.body.password || "").trim();
 
     if (!USER_ROLES.includes(role)) {
       return res
@@ -838,6 +1186,12 @@ router.post("/users", requireSuperAdminAuth, async (req, res) => {
       return res
         .status(400)
         .json({ success: false, message: "Name and email are required" });
+    }
+    if (!password || password.length < 12) {
+      return res.status(400).json({
+        success: false,
+        message: "A strong password (minimum 12 characters) is required",
+      });
     }
 
     if (role === "PATIENT") {
@@ -1203,7 +1557,16 @@ router.get("/advertisements", requireSuperAdminAuth, async (req, res) => {
       query.$or = [{ placement }, { placements: placement }];
     }
     const ads = await Advertisement.find(query).sort({ createdAt: -1 }).lean();
-    return res.json({ success: true, advertisements: ads });
+    const advertisements = await Promise.all(
+      ads.map(async (ad) => ({
+        ...ad,
+        imageUrl: await resolveStoredMediaUrl({
+          imageUrl: ad.imageUrl,
+          imageKey: ad.imageKey,
+        }),
+      }))
+    );
+    return res.json({ success: true, advertisements });
   } catch (error) {
     return res.status(500).json({
       success: false,
@@ -1218,6 +1581,13 @@ router.get(
   requireSuperAdminAuth,
   async (req, res) => {
     try {
+      if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid advertisement id",
+        });
+      }
+
       const limit = Math.min(Number(req.query.limit || 100), 500);
       const clicks = await AdvertisementClickLog.find({
         advertisementId: req.params.id,
@@ -1241,17 +1611,82 @@ router.get(
   }
 );
 
+router.post(
+  "/advertisements/upload-image",
+  requireSuperAdminAuth,
+  (req, res) => {
+    advertisementImageUpload.single("image")(req, res, async (error) => {
+      if (error) {
+        return res.status(400).json({
+          success: false,
+          message: error.message || "Image upload failed",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: "Image file is required",
+        });
+      }
+
+      try {
+        let imageKey = "";
+        let imageUrl = "";
+
+        if (hasAWSCredentials) {
+          imageKey = String(req.file.key || "").trim();
+          if (!imageKey) {
+            return res.status(500).json({
+              success: false,
+              message: "Failed to determine uploaded image key",
+            });
+          }
+          imageUrl = await generateSignedUrl(imageKey, BUCKET_NAME);
+        } else {
+          const relativePath = `/uploads/superadmin/advertisements/${req.file.filename}`;
+          imageKey = relativePath;
+          imageUrl = `${publicServerBaseUrl()}${relativePath}`;
+        }
+
+        await logActivity(req, {
+          action: "UPLOAD_ADVERTISEMENT_IMAGE",
+          targetType: "ADVERTISEMENT_IMAGE",
+          targetId: imageKey,
+          details: { storage: hasAWSCredentials ? "S3" : "LOCAL" },
+        });
+
+        return res.status(201).json({
+          success: true,
+          imageKey,
+          imageUrl,
+          storage: hasAWSCredentials ? "S3" : "LOCAL",
+        });
+      } catch (uploadError) {
+        return res.status(500).json({
+          success: false,
+          message: "Failed to process uploaded image",
+          error: uploadError.message,
+        });
+      }
+    });
+  }
+);
+
 router.post("/advertisements", requireSuperAdminAuth, async (req, res) => {
   try {
     const placements = normalizeAdPlacements(
       req.body.placements ?? req.body.placement
     );
+    const geoTargets = normalizeGeoTargets(req.body);
     const payload = {
       title: String(req.body.title || "").trim(),
       imageUrl: String(req.body.imageUrl || "").trim(),
+      imageKey: String(req.body.imageKey || "").trim(),
       redirectUrl: String(req.body.redirectUrl || "").trim(),
       placement: placements[0] || "",
       placements,
+      ...geoTargets,
       isActive: toBoolean(req.body.isActive, true),
       startDate: req.body.startDate,
       endDate: req.body.endDate,
@@ -1261,7 +1696,7 @@ router.post("/advertisements", requireSuperAdminAuth, async (req, res) => {
 
     if (
       !payload.title ||
-      !payload.imageUrl ||
+      (!payload.imageUrl && !payload.imageKey) ||
       !payload.redirectUrl ||
       !payload.placement ||
       placements.length === 0
@@ -1269,7 +1704,7 @@ router.post("/advertisements", requireSuperAdminAuth, async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          "title, imageUrl, redirectUrl and at least one placement are required",
+          "title, redirectUrl, at least one placement, and either imageUrl or imageKey are required",
       });
     }
     if (!validateDateOrder(payload.startDate, payload.endDate)) {
@@ -1292,11 +1727,29 @@ router.post("/advertisements", requireSuperAdminAuth, async (req, res) => {
       action: "CREATE_ADVERTISEMENT",
       targetType: "ADVERTISEMENT",
       targetId: ad._id?.toString(),
-      details: { placements: ad.placements || [ad.placement], title: ad.title },
+      details: {
+        placements: ad.placements || [ad.placement],
+        title: ad.title,
+        geoScope: ad.geoScope,
+      },
     });
 
-    return res.status(201).json({ success: true, advertisement: ad });
+    const advertisement = {
+      ...ad.toObject(),
+      imageUrl: await resolveStoredMediaUrl({
+        imageUrl: ad.imageUrl,
+        imageKey: ad.imageKey,
+      }),
+    };
+
+    return res.status(201).json({ success: true, advertisement });
   } catch (error) {
+    if (error?.name === "ValidationError") {
+      return res.status(400).json({
+        success: false,
+        message: error.message || "Invalid advertisement payload",
+      });
+    }
     return res.status(500).json({
       success: false,
       message: "Failed to create advertisement",
@@ -1307,6 +1760,13 @@ router.post("/advertisements", requireSuperAdminAuth, async (req, res) => {
 
 router.put("/advertisements/:id", requireSuperAdminAuth, async (req, res) => {
   try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid advertisement id",
+      });
+    }
+
     const ad = await Advertisement.findById(req.params.id);
     if (!ad) {
       return res.status(404).json({ success: false, message: "Advertisement not found" });
@@ -1314,6 +1774,7 @@ router.put("/advertisements/:id", requireSuperAdminAuth, async (req, res) => {
 
     if (req.body.title != null) ad.title = String(req.body.title).trim();
     if (req.body.imageUrl != null) ad.imageUrl = String(req.body.imageUrl).trim();
+    if (req.body.imageKey != null) ad.imageKey = String(req.body.imageKey).trim();
     if (req.body.redirectUrl != null) ad.redirectUrl = String(req.body.redirectUrl).trim();
     if (req.body.placements != null || req.body.placement != null) {
       const placements = normalizeAdPlacements(
@@ -1328,10 +1789,31 @@ router.put("/advertisements/:id", requireSuperAdminAuth, async (req, res) => {
       ad.placements = placements;
       ad.placement = placements[0];
     }
+    if (
+      req.body.targetCountries != null ||
+      req.body.targetStates != null ||
+      req.body.targetRegions != null ||
+      req.body.countries != null ||
+      req.body.states != null ||
+      req.body.regions != null
+    ) {
+      const geoTargets = normalizeGeoTargets(req.body);
+      ad.geoScope = geoTargets.geoScope;
+      ad.targetCountries = geoTargets.targetCountries;
+      ad.targetStates = geoTargets.targetStates;
+      ad.targetRegions = geoTargets.targetRegions;
+    }
     if (req.body.isActive != null) ad.isActive = toBoolean(req.body.isActive, ad.isActive);
     if (req.body.startDate != null) ad.startDate = req.body.startDate;
     if (req.body.endDate != null) ad.endDate = req.body.endDate;
     ad.updatedBy = req.superAdmin.email;
+
+    if (!String(ad.imageUrl || "").trim() && !String(ad.imageKey || "").trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Either imageUrl or imageKey is required",
+      });
+    }
 
     if (!validateDateOrder(ad.startDate, ad.endDate)) {
       return res.status(400).json({
@@ -1356,10 +1838,19 @@ router.put("/advertisements/:id", requireSuperAdminAuth, async (req, res) => {
       details: {
         placements: ad.placements || [ad.placement],
         isActive: ad.isActive,
+        geoScope: ad.geoScope,
       },
     });
 
-    return res.json({ success: true, advertisement: ad });
+    const advertisement = {
+      ...ad.toObject(),
+      imageUrl: await resolveStoredMediaUrl({
+        imageUrl: ad.imageUrl,
+        imageKey: ad.imageKey,
+      }),
+    };
+
+    return res.json({ success: true, advertisement });
   } catch (error) {
     return res.status(500).json({
       success: false,
@@ -1371,6 +1862,13 @@ router.put("/advertisements/:id", requireSuperAdminAuth, async (req, res) => {
 
 router.delete("/advertisements/:id", requireSuperAdminAuth, async (req, res) => {
   try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid advertisement id",
+      });
+    }
+
     const ad = await Advertisement.findById(req.params.id);
     if (!ad) {
       return res.status(404).json({ success: false, message: "Advertisement not found" });
@@ -1409,7 +1907,16 @@ router.get("/products", requireSuperAdminAuth, async (req, res) => {
     const query = {};
     if (category) query.category = category;
     const products = await Product.find(query).sort({ createdAt: -1 }).lean();
-    return res.json({ success: true, products });
+    const normalizedProducts = await Promise.all(
+      products.map(async (product) => ({
+        ...product,
+        imageUrl: await resolveStoredMediaUrl({
+          imageUrl: product.imageUrl,
+          imageKey: product.imageKey,
+        }),
+      }))
+    );
+    return res.json({ success: true, products: normalizedProducts });
   } catch (error) {
     return res.status(500).json({
       success: false,
@@ -1421,12 +1928,15 @@ router.get("/products", requireSuperAdminAuth, async (req, res) => {
 
 router.post("/products", requireSuperAdminAuth, async (req, res) => {
   try {
+    const geoTargets = normalizeGeoTargets(req.body);
     const payload = {
       name: String(req.body.name || "").trim(),
       description: String(req.body.description || "").trim(),
       price: Number(req.body.price || 0),
       imageUrl: String(req.body.imageUrl || "").trim(),
+      imageKey: String(req.body.imageKey || "").trim(),
       category: String(req.body.category || "").trim(),
+      ...geoTargets,
       isActive: toBoolean(req.body.isActive, true),
       createdBy: req.superAdmin.email,
       updatedBy: req.superAdmin.email,
@@ -1446,11 +1956,29 @@ router.post("/products", requireSuperAdminAuth, async (req, res) => {
       action: "CREATE_PRODUCT",
       targetType: "PRODUCT",
       targetId: product._id?.toString(),
-      details: { name: product.name, category: product.category },
+      details: {
+        name: product.name,
+        category: product.category,
+        geoScope: product.geoScope,
+      },
     });
 
-    return res.status(201).json({ success: true, product });
+    const responseProduct = {
+      ...product.toObject(),
+      imageUrl: await resolveStoredMediaUrl({
+        imageUrl: product.imageUrl,
+        imageKey: product.imageKey,
+      }),
+    };
+
+    return res.status(201).json({ success: true, product: responseProduct });
   } catch (error) {
+    if (error?.name === "ValidationError") {
+      return res.status(400).json({
+        success: false,
+        message: error.message || "Invalid product payload",
+      });
+    }
     return res.status(500).json({
       success: false,
       message: "Failed to create product",
@@ -1470,7 +1998,22 @@ router.put("/products/:id", requireSuperAdminAuth, async (req, res) => {
     if (req.body.description != null) product.description = String(req.body.description).trim();
     if (req.body.price != null) product.price = Number(req.body.price);
     if (req.body.imageUrl != null) product.imageUrl = String(req.body.imageUrl).trim();
+    if (req.body.imageKey != null) product.imageKey = String(req.body.imageKey).trim();
     if (req.body.category != null) product.category = String(req.body.category).trim();
+    if (
+      req.body.targetCountries != null ||
+      req.body.targetStates != null ||
+      req.body.targetRegions != null ||
+      req.body.countries != null ||
+      req.body.states != null ||
+      req.body.regions != null
+    ) {
+      const geoTargets = normalizeGeoTargets(req.body);
+      product.geoScope = geoTargets.geoScope;
+      product.targetCountries = geoTargets.targetCountries;
+      product.targetStates = geoTargets.targetStates;
+      product.targetRegions = geoTargets.targetRegions;
+    }
     if (req.body.isActive != null) {
       product.isActive = toBoolean(req.body.isActive, product.isActive);
     }
@@ -1482,10 +2025,22 @@ router.put("/products/:id", requireSuperAdminAuth, async (req, res) => {
       action: "UPDATE_PRODUCT",
       targetType: "PRODUCT",
       targetId: product._id?.toString(),
-      details: { name: product.name, category: product.category },
+      details: {
+        name: product.name,
+        category: product.category,
+        geoScope: product.geoScope,
+      },
     });
 
-    return res.json({ success: true, product });
+    const responseProduct = {
+      ...product.toObject(),
+      imageUrl: await resolveStoredMediaUrl({
+        imageUrl: product.imageUrl,
+        imageKey: product.imageKey,
+      }),
+    };
+
+    return res.json({ success: true, product: responseProduct });
   } catch (error) {
     return res.status(500).json({
       success: false,

@@ -14,6 +14,8 @@ import {
 import { auth } from '../middleware/auth.js';
 
 const router = express.Router();
+const ENABLE_DEBUG_ROUTES =
+  String(process.env.ENABLE_DEBUG_ROUTES || "false").toLowerCase() === "true";
 
 // @route   POST /api/notifications/save-token
 // @desc    Save FCM token for user or doctor
@@ -72,6 +74,9 @@ router.post('/send-all', sendNotificationToAll);
 // @desc    Send test notification to current user
 // @access  Private
 router.post('/test', async (req, res) => {
+  if (!ENABLE_DEBUG_ROUTES) {
+    return res.status(404).json({ success: false, message: "Not found" });
+  }
   try {
     const { title = 'Test Notification', body = 'This is a test notification', type = 'general' } = req.body;
     const userId = req.auth.id;
@@ -117,6 +122,9 @@ router.post('/test', async (req, res) => {
 // @desc    Manually trigger all reminder notifications
 // @access  Private
 router.post('/trigger-reminders', async (req, res) => {
+  if (!ENABLE_DEBUG_ROUTES) {
+    return res.status(404).json({ success: false, message: "Not found" });
+  }
   try {
     const { triggerReminders } = await import('../services/cronService.js');
     await triggerReminders();

@@ -1,65 +1,89 @@
-// routes/qrRoutes.js
+import crypto from "crypto";
 import express from "express";
-import jwt from "jsonwebtoken";
 import { auth } from "../middleware/auth.js";
 import { User } from "../models/User.js";
-import QRCode from "../models/QRCode.js"; // <-- new model
+import QRCode from "../models/QRCode.js";
 import { ok, fail } from "../utils/apiResponse.js";
 
 const router = express.Router();
+
+const SHARE_TTL_MS = 15 * 60 * 1000;
+const FRONTEND_URL = String(process.env.WEB_APP_URL || "https://health-vault-web.vercel.app").replace(/\/+$/, "");
+
+const normalizeRole = (role) => String(role || "").trim().toLowerCase();
+const isPrivilegedRole = (role) => role === "admin" || role === "superadmin";
+
+const resolveShareCodeFromRequest = (req) => {
+  const fromPath = String(req.params?.token || req.params?.shareCode || "").trim();
+  if (fromPath) return fromPath;
+
+  // Backward compatibility: old clients still send `?token=...`.
+  const fromQuery = String(req.query?.share || req.query?.token || "").trim();
+  return fromQuery;
+};
+
+const findActiveShare = async (shareCode) => {
+  if (!shareCode) return null;
+
+  return QRCode.findOne({
+    token: shareCode,
+    status: "active",
+    expiresAt: { $gt: new Date() },
+  }).lean();
+};
+
+const ensurePatientRole = (req, res) => {
+  const role = normalizeRole(req.auth?.role);
+  if (role !== "patient") {
+    res.status(403).json({ success: false, message: "Patient access required" });
+    return false;
+  }
+  return true;
+};
 
 /**
  * Quick check: confirm this router is mounted
  * GET /api/qr/ping
  */
-router.get("/ping", (req, res) => res.json({ ok: true, where: "qrRoutes" }));
+router.get("/ping", (_req, res) => res.json({ ok: true, where: "qrRoutes" }));
 
 /**
  * POST /api/qr/generate
- * Auth: required (patient)
- * Creates a short-lived JWT that carries the patient's userId and email.
- * Stores it in DB and expires older QR codes for this patient.
+ * Auth: patient
+ * Creates a short-lived share code and stores it server-side.
  */
 router.post("/generate", auth, async (req, res) => {
   try {
-    // Always read latest normalized email from DB
-    const me = await User.findById(req.user._id).select("email name");
-    if (!me) return res.status(404).json({ ok: false, msg: "User not found" });
+    if (!ensurePatientRole(req, res)) return;
 
-    // Expire any old active QR codes for this patient
+    const patientId = String(req.auth.id || "");
+    const me = await User.findById(patientId).select("email name");
+    if (!me) {
+      return res.status(404).json({ ok: false, msg: "User not found" });
+    }
+
     await QRCode.updateMany(
-      { patientId: req.user._id, status: "active" },
+      { patientId: me._id, status: "active" },
       { status: "expired" }
     );
 
-    // Generate short-lived anonymous-access JWT (15 minutes)
-    const payload = {
-      userId: req.user._id.toString(),
-      uid: req.user._id.toString(), // provide both for backward/forward compatibility
-      role: "anonymous",
-      typ: "vault_share",
-    };
+    const shareCode = crypto.randomBytes(32).toString("hex");
+    const expiresAt = new Date(Date.now() + SHARE_TTL_MS);
 
-    const token = jwt.sign(payload, process.env.JWT_SECRET, {
-      expiresIn: "15m",
-    });
-
-    // Store new QR in DB
-    const qrDoc = await QRCode.create({
-      patientId: req.user._id,
-      token,
-      expiresAt: new Date(Date.now() + 15 * 60 * 1000), // 15 min
+    await QRCode.create({
+      patientId: me._id,
+      token: shareCode,
+      expiresAt,
       status: "active",
     });
 
-    // Build Web URL for anonymous access via Vercel-hosted web app
-    const qrUrl = `https://health-vault-web.vercel.app/patient-details/${req.user._id.toString()}?token=${encodeURIComponent(token)}`;
+    const qrUrl = `${FRONTEND_URL}/patient-details/${me._id.toString()}?share=${encodeURIComponent(shareCode)}`;
 
     return ok(res, {
       message: "QR generated",
-      data: { token, qrUrl, expiresAt: qrDoc.expiresAt },
-      // Backward-compatible fields (older clients / existing web)
-      legacy: { ok: true, token, qrUrl, expiresAt: qrDoc.expiresAt },
+      data: { shareCode, qrUrl, expiresAt },
+      // Backward-compatible field names for existing clients.
+      legacy: { ok: true, token: shareCode, qrUrl, expiresAt },
     });
   } catch (err) {
     console.error("QR generate error:", err);
@@ -74,131 +98,130 @@ router.post("/generate", auth, async (req, res) => {
 
 /**
  * GET /api/qr/resolve/:token
- * Public (no auth): resolves QR token and returns user's grouped documents
+ * Auth: patient (owner) or admin/superadmin
  */
-router.get("/resolve/:token", async (req, res) => {
+router.get("/resolve/:token", auth, async (req, res) => {
   try {
-    const { token } = req.params;
-    if (!token)
-      return res.status(400).json({ success: false, msg: "Missing token" });
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    if (decoded.typ !== "vault_share") {
-      return res.status(400).json({ success: false, msg: "Invalid token type" });
+    const shareCode = resolveShareCodeFromRequest(req);
+    if (!shareCode) {
+      return res.status(400).json({ success: false, msg: "Missing share code" });
     }
 
-    // Check DB to see if this QR is still active
-    const qrDoc = await QRCode.findOne({ token, status: "active" });
+    const qrDoc = await findActiveShare(shareCode);
     if (!qrDoc) {
       return res.status(400).json({ success: false, msg: "QR expired or invalid" });
     }
 
-    // Fetch user's grouped documents
+    const role = normalizeRole(req.auth?.role);
+    const requesterId = String(req.auth?.id || "");
+    const patientId = String(qrDoc.patientId || "");
+
+    if (!isPrivilegedRole(role) && !(role === "patient" && requesterId === patientId)) {
+      return res.status(403).json({ success: false, msg: "Access denied" });
+    }
+
     const { Document } = await import("../models/File.js");
-    const targetUid = decoded.uid || decoded.userId;
-    const docs = await Document.find({ userId: String(targetUid) });
+    const docs = await Document.find({ userId: patientId }).lean();
 
     const grouped = {
-      reports: docs.filter(d => d.category?.toLowerCase() === "report"),
-      prescriptions: docs.filter(d => d.category?.toLowerCase() === "prescription"),
-      bills: docs.filter(d => d.category?.toLowerCase() === "bill"),
-      insurance: docs.filter(d => d.category?.toLowerCase() === "insurance"),
-      others: docs.filter(d =>
-        !["report", "prescription", "bill", "insurance"].includes(d.category?.toLowerCase())
+      reports: docs.filter((d) => d.category?.toLowerCase() === "report"),
+      prescriptions: docs.filter((d) => d.category?.toLowerCase() === "prescription"),
+      bills: docs.filter((d) => d.category?.toLowerCase() === "bill"),
+      insurance: docs.filter((d) =>
+        d.category?.toLowerCase() === "insurance"
       ),
     };
 
     return ok(res, {
       message: "QR resolved",
       data: {
-        patientId: targetUid,
-        counts: Object.fromEntries(Object.entries(grouped).map(([k, v]) => [k, v.length])),
+        patientId,
+        counts: Object.fromEntries(
+          Object.entries(grouped).map(([k, v]) => [k, v.length])
+        ),
         records: grouped,
       },
       legacy: {
-        patientId: targetUid,
-        counts: Object.fromEntries(Object.entries(grouped).map(([k, v]) => [k, v.length])),
+        patientId,
+        counts: Object.fromEntries(
+          Object.entries(grouped).map(([k, v]) => [k, v.length])
+        ),
         records: grouped,
       },
     });
   } catch (e) {
     return fail(res, {
       status: 400,
-      message: "Invalid/expired token",
-      legacy: { msg: "Invalid/expired token" },
+      message: "Invalid/expired share code",
+      legacy: { msg: "Invalid/expired share code" },
       error: e.message,
     });
   }
 });
 
 /**
- * GET /api/qr/preview?token=...
- * Public (no auth): used by the web portal after scanning to show
- * patient info before the doctor clicks "Request Access".
+ * GET /api/qr/preview?share=...
+ * Auth: doctor/admin/superadmin
  */
-router.get("/preview", async (req, res) => {
+router.get("/preview", auth, async (req, res) => {
   try {
-    const { token } = req.query;
-    if (!token)
-      return res.status(400).json({ ok: false, msg: "Missing token" });
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    if (decoded.typ !== "vault_share") {
-      return res.status(400).json({ ok: false, msg: "Invalid token type" });
+    const role = normalizeRole(req.auth?.role);
+    if (!["doctor", "admin", "superadmin"].includes(role)) {
+      return res.status(403).json({ ok: false, msg: "Access denied" });
     }
 
-    // Check DB to see if this QR is still active
-    const qrDoc = await QRCode.findOne({ token, status: "active" });
+    const shareCode = resolveShareCodeFromRequest(req);
+    if (!shareCode) {
+      return res.status(400).json({ ok: false, msg: "Missing share code" });
+    }
+
+    const qrDoc = await findActiveShare(shareCode);
     if (!qrDoc) {
       return res.status(400).json({ ok: false, msg: "QR expired or invalid" });
     }
 
-    // Fetch full patient profile
-    const targetUid = decoded.uid || decoded.userId;
-    const user = await User.findById(targetUid).select(
-      "name email profilePicture age gender dateOfBirth bloodType height weight lastVisit nextAppointment emergencyContact medicalHistory medications medicalRecords"
+    const user = await User.findById(qrDoc.patientId).select(
+      "name age gender bloodType profilePicture"
     );
-
-    if (!user)
+    if (!user) {
       return res.status(404).json({ ok: false, msg: "Patient not found" });
+    }
 
     return res.json({
       ok: true,
       patient: user,
-      expiresAt: decoded.exp ? decoded.exp * 1000 : null,
+      expiresAt: qrDoc.expiresAt,
     });
   } catch (e) {
     return res
       .status(400)
-      .json({ ok: false, msg: "Invalid/expired token", error: e.message });
+      .json({ ok: false, msg: "Invalid/expired share code", error: e.message });
   }
 });
 
 /**
- * GET /api/qr/validate?token=...
- * Public (no auth): returns { valid: boolean, expiresAt?, patientId? }
+ * GET /api/qr/validate?share=...
+ * Auth: doctor/admin/superadmin
  */
-router.get("/validate", async (req, res) => {
+router.get("/validate", auth, async (req, res) => {
   try {
-    const { token } = req.query;
-    if (!token) return res.json({ valid: false, reason: "missing_token" });
-
-    let decoded;
-    try {
-      decoded = jwt.verify(token, process.env.JWT_SECRET);
-    } catch (e) {
-      return res.json({ valid: false, reason: "jwt_invalid_or_expired" });
+    const role = normalizeRole(req.auth?.role);
+    if (!["doctor", "admin", "superadmin"].includes(role)) {
+      return res.status(403).json({ valid: false, reason: "access_denied" });
     }
 
-    const qrDoc = await QRCode.findOne({ token, status: "active" });
+    const shareCode = resolveShareCodeFromRequest(req);
+    if (!shareCode) return res.json({ valid: false, reason: "missing_share_code" });
+
+    const qrDoc = await findActiveShare(shareCode);
     if (!qrDoc) {
       return res.json({ valid: false, reason: "not_active" });
     }
 
     return res.json({
       valid: true,
-      expiresAt: decoded.exp ? decoded.exp * 1000 : qrDoc.expiresAt,
-      patientId: decoded.uid || decoded.userId,
+      expiresAt: qrDoc.expiresAt,
+      patientId: String(qrDoc.patientId),
     });
   } catch (e) {
     return res.json({ valid: false, reason: "error", error: e.message });
@@ -207,17 +230,21 @@ router.get("/validate", async (req, res) => {
 
 /**
  * POST /api/qr/invalidate
- * Auth: patient. Expires all active QR codes for this patient immediately.
+ * Auth: patient
  */
 router.post("/invalidate", auth, async (req, res) => {
   try {
+    if (!ensurePatientRole(req, res)) return;
+
     const result = await QRCode.updateMany(
-      { patientId: req.user._id, status: "active" },
+      { patientId: req.auth.id, status: "active" },
       { status: "expired" }
     );
     return res.json({ ok: true, expired: result.modifiedCount || 0 });
   } catch (e) {
-    return res.status(500).json({ ok: false, msg: "Failed to invalidate", error: e.message });
+    return res
+      .status(500)
+      .json({ ok: false, msg: "Failed to invalidate", error: e.message });
   }
 });
 
@@ -227,46 +254,55 @@ router.post("/invalidate", auth, async (req, res) => {
  */
 router.post("/expire-all", auth, async (req, res) => {
   try {
+    if (!ensurePatientRole(req, res)) return;
+
     const result = await QRCode.updateMany(
-      { patientId: req.user._id, status: "active" },
+      { patientId: req.auth.id, status: "active" },
       { status: "expired" }
     );
     return res.json({ ok: true, expired: result.modifiedCount || 0 });
   } catch (e) {
-    return res.status(500).json({ ok: false, msg: "Failed to expire-all", error: e.message });
+    return res
+      .status(500)
+      .json({ ok: false, msg: "Failed to expire-all", error: e.message });
   }
 });
 
 /**
  * POST /api/qr/rotate
- * Auth: patient. Expires old and creates a new QR (same as generate).
+ * Auth: patient
  */
 router.post("/rotate", auth, async (req, res) => {
   try {
-    // expire current actives
-    await QRCode.updateMany({ patientId: req.user._id, status: "active" }, { status: "expired" });
+    if (!ensurePatientRole(req, res)) return;
 
-    const payload = {
-      userId: req.user._id.toString(),
-      uid: req.user._id.toString(),
-      role: "anonymous",
-      typ: "vault_share",
-    };
+    await QRCode.updateMany(
+      { patientId: req.auth.id, status: "active" },
+      { status: "expired" }
+    );
 
-    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: "15m" });
+    const shareCode = crypto.randomBytes(32).toString("hex");
+    const expiresAt = new Date(Date.now() + SHARE_TTL_MS);
 
-    const qrDoc = await QRCode.create({
-      patientId: req.user._id,
-      token,
-      expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+    await QRCode.create({
+      patientId: req.auth.id,
+      token: shareCode,
+      expiresAt,
       status: "active",
     });
 
-    const qrUrl = `https://health-vault-web.vercel.app/patient-details/${req.user._id.toString()}?token=${encodeURIComponent(token)}`;
-
-    return res.json({ ok: true, token, qrUrl, expiresAt: qrDoc.expiresAt });
+    const qrUrl = `${FRONTEND_URL}/patient-details/${req.auth.id}?share=${encodeURIComponent(shareCode)}`;
+    return res.json({
+      ok: true,
+      shareCode,
+      token: shareCode,
+      qrUrl,
+      expiresAt,
+    });
   } catch (e) {
-    return res.status(500).json({ ok: false, msg: "QR rotate failed", error: e.message });
+    return res
+      .status(500)
+      .json({ ok: false, msg: "QR rotate failed", error: e.message });
   }
 });
 

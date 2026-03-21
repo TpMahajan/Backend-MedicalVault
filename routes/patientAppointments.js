@@ -3,8 +3,56 @@ import { auth } from "../middleware/auth.js";
 import { requirePatient } from "../middleware/auth.js";
 import { Appointment } from "../models/Appointment.js";
 import { Document } from "../models/File.js";
+import { BUCKET_NAME } from "../config/s3.js";
+import { generateSignedUrl } from "../utils/s3Utils.js";
 
 const router = express.Router();
+const hasAWSCredentials =
+  !!process.env.AWS_ACCESS_KEY_ID && !!process.env.AWS_SECRET_ACCESS_KEY;
+
+const getPublicBaseUrl = () => {
+  const configured = String(
+    process.env.PUBLIC_SERVER_BASE_URL || process.env.API_BASE_URL || ""
+  ).trim();
+  if (!configured) {
+    return `http://localhost:${process.env.PORT || 5000}`;
+  }
+  return configured.replace(/\/api\/?$/i, "");
+};
+
+const asText = (value) => (value == null ? "" : String(value).trim());
+
+const toAbsoluteUploadsUrl = (value) => {
+  const raw = asText(value);
+  if (!raw) return null;
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (raw.startsWith("/uploads/")) {
+    return `${getPublicBaseUrl()}${raw}`;
+  }
+  return null;
+};
+
+const resolveDoctorAvatarUrl = async (doctor) => {
+  const raw =
+    asText(
+      doctor?.profilePictureUrl ||
+        doctor?.profilePicture ||
+        doctor?.avatarUrl ||
+        doctor?.avatar
+    ) || "";
+
+  if (!raw) return null;
+
+  const directUrl = toAbsoluteUploadsUrl(raw);
+  if (directUrl) return directUrl;
+
+  if (!hasAWSCredentials) return null;
+  try {
+    return await generateSignedUrl(raw, BUCKET_NAME);
+  } catch {
+    return null;
+  }
+};
 
 // All routes require auth + patient role
 router.use(auth, requirePatient);
@@ -14,19 +62,22 @@ const getPatientId = (req) => {
   return req.user?._id?.toString() || req.user?.id?.toString();
 };
 
-const normalizeAppointmentDoctor = (appointment) => {
+const normalizeAppointmentDoctor = async (appointment) => {
   if (!appointment || typeof appointment !== "object") return appointment;
   const doctor = appointment.doctorId;
   if (!doctor || typeof doctor !== "object" || Array.isArray(doctor)) {
     return appointment;
   }
 
-  const profilePictureUrl =
-    doctor.profilePictureUrl ||
-    doctor.profilePicture ||
-    doctor.avatarUrl ||
-    doctor.avatar ||
+  const resolvedProfilePictureUrl = await resolveDoctorAvatarUrl(doctor);
+  const fallbackProfilePictureUrl =
+    toAbsoluteUploadsUrl(doctor.profilePictureUrl) ||
+    toAbsoluteUploadsUrl(doctor.profilePicture) ||
+    toAbsoluteUploadsUrl(doctor.avatarUrl) ||
+    toAbsoluteUploadsUrl(doctor.avatar) ||
     null;
+  const profilePictureUrl =
+    resolvedProfilePictureUrl || fallbackProfilePictureUrl || null;
   const specialization =
     doctor.specialization ||
     doctor.specialty ||
@@ -185,7 +236,9 @@ router.get("/appointments/upcoming", async (req, res) => {
       return aptDate > now;
     });
 
-    const normalizedUpcoming = upcoming.map(normalizeAppointmentDoctor);
+    const normalizedUpcoming = await Promise.all(
+      upcoming.map((appointment) => normalizeAppointmentDoctor(appointment))
+    );
 
     res.json({
       success: true,
@@ -269,7 +322,9 @@ router.get("/appointments/past", async (req, res) => {
         return db - da;
       });
 
-    const normalizedPast = past.map(normalizeAppointmentDoctor);
+    const normalizedPast = await Promise.all(
+      past.map((appointment) => normalizeAppointmentDoctor(appointment))
+    );
 
     res.json({
       success: true,
@@ -315,7 +370,7 @@ router.get("/appointments/:id", async (req, res) => {
       .select("title type category date url s3Key _id")
       .lean();
 
-    const normalizedAppointment = normalizeAppointmentDoctor(appointment);
+    const normalizedAppointment = await normalizeAppointmentDoctor(appointment);
 
     res.json({
       success: true,

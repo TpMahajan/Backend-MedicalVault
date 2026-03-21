@@ -90,7 +90,13 @@ const uiConfigSchema = new mongoose.Schema(
     qrActions: { type: [uiActionSchema], default: [] },
     dashboardCards: { type: [uiCardSchema], default: [] },
     dashboardAlerts: { type: [uiAlertSchema], default: [] },
-    updatedBy: { type: String, default: "superadmin@medicalvault.in" },
+    updatedBy: {
+      type: String,
+      default: () =>
+        String(process.env.SUPERADMIN_EMAIL || "system")
+          .trim()
+          .toLowerCase(),
+    },
   },
   {
     timestamps: true,

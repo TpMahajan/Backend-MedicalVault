@@ -1,11 +1,26 @@
-import { sendPushNotification } from '../config/firebase.js';
+﻿import { sendPushNotification } from '../config/firebase.js';
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { Notification } from "../models/Notification.js";
-import jwt from 'jsonwebtoken';
+import mongoose from "mongoose";
 
 // Store active SSE connections
 const activeConnections = new Map();
+
+const normalizeRole = (value) => String(value || "").trim().toLowerCase();
+
+const buildNotificationScopeFilter = ({ userId, userRole }) => {
+  const role = normalizeRole(userRole);
+  const roleAllowed = ["patient", "doctor", "admin"].includes(role);
+  const objectIdAllowed = mongoose.Types.ObjectId.isValid(userId);
+
+  const conditions = [];
+  if (objectIdAllowed) conditions.push({ recipientId: userId });
+  if (roleAllowed) conditions.push({ recipientRole: role });
+
+  if (conditions.length === 0) return null;
+  return { $or: conditions };
+};
 
 // @desc    Save FCM token for user or doctor
 // @route   POST /api/notifications/save-token
@@ -74,13 +89,24 @@ export const getNotifications = async (req, res) => {
     const userId = req.auth.id;
     const userRole = req.auth.role;
 
+    const scopeFilter = buildNotificationScopeFilter({ userId, userRole });
+    if (!scopeFilter) {
+      return res.json({
+        success: true,
+        data: {
+          notifications: [],
+          pagination: {
+            current: parseInt(page),
+            pages: 0,
+            total: 0
+          },
+          unreadCount: 0
+        }
+      });
+    }
+
     // Build query
-    const query = {
-      $or: [
-        { recipientId: userId },
-        { recipientRole: userRole }
-      ]
-    };
+    const query = { ...scopeFilter };
 
     if (unreadOnly === 'true') {
       query.read = false;
@@ -130,14 +156,21 @@ export const markNotificationAsRead = async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.auth.id;
+    const scopeFilter = buildNotificationScopeFilter({
+      userId,
+      userRole: req.auth.role
+    });
+    if (!scopeFilter) {
+      return res.status(403).json({
+        success: false,
+        message: 'Notification access is not allowed for this role'
+      });
+    }
 
     const notification = await Notification.findOneAndUpdate(
       {
         _id: id,
-        $or: [
-          { recipientId: userId },
-          { recipientRole: req.auth.role }
-        ]
+        ...scopeFilter
       },
       { read: true, readAt: new Date() },
       { new: true }
@@ -170,13 +203,20 @@ export const markNotificationAsRead = async (req, res) => {
 export const markAllNotificationsAsRead = async (req, res) => {
   try {
     const userId = req.auth.id;
+    const scopeFilter = buildNotificationScopeFilter({
+      userId,
+      userRole: req.auth.role
+    });
+    if (!scopeFilter) {
+      return res.status(403).json({
+        success: false,
+        message: 'Notification access is not allowed for this role'
+      });
+    }
 
     const result = await Notification.updateMany(
       {
-        $or: [
-          { recipientId: userId },
-          { recipientRole: req.auth.role }
-        ],
+        ...scopeFilter,
         read: false
       },
       { read: true, readAt: new Date() }
@@ -205,13 +245,20 @@ export const deleteNotification = async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.auth.id;
+    const scopeFilter = buildNotificationScopeFilter({
+      userId,
+      userRole: req.auth.role
+    });
+    if (!scopeFilter) {
+      return res.status(403).json({
+        success: false,
+        message: 'Notification access is not allowed for this role'
+      });
+    }
 
     const notification = await Notification.findOneAndDelete({
       _id: id,
-      $or: [
-        { recipientId: userId },
-        { recipientRole: req.auth.role }
-      ]
+      ...scopeFilter
     });
 
     if (!notification) {
@@ -240,12 +287,19 @@ export const deleteNotification = async (req, res) => {
 export const deleteAllNotifications = async (req, res) => {
   try {
     const userId = req.auth.id;
+    const scopeFilter = buildNotificationScopeFilter({
+      userId,
+      userRole: req.auth.role
+    });
+    if (!scopeFilter) {
+      return res.status(403).json({
+        success: false,
+        message: 'Notification access is not allowed for this role'
+      });
+    }
 
     await Notification.deleteMany({
-      $or: [
-        { recipientId: userId },
-        { recipientRole: req.auth.role }
-      ]
+      ...scopeFilter
     });
 
     res.json({
@@ -488,127 +542,64 @@ export const sendNotificationToAll = async (req, res) => {
 // @access  Private
 export const getNotificationStream = async (req, res) => {
   try {
-    console.log('📡 SSE stream request received:', {
-      hasToken: !!req.query.token,
-      hasAuth: !!req.auth,
-      authId: req.auth?.id,
-      queryToken: req.query.token ? 'present' : 'missing'
-    });
+    const userId = req.auth?.id;
+    const userRole = req.auth?.role;
 
-    // Handle token from query parameter for SSE
-    let userId, userRole;
-
-    if (req.query.token) {
-      try {
-        // Verify token from query parameter
-        const decoded = jwt.verify(req.query.token, process.env.JWT_SECRET);
-        userId = decoded.userId || decoded.id || decoded.uid; // Support multiple formats
-        userRole = decoded.role || decoded.typ;
-
-        if (!userId) {
-          console.error('❌ Token verified but userId missing:', decoded);
-          return res.status(401).json({ success: false, message: 'Invalid token payload' });
-        }
-
-        console.log('✅ Token verified successfully:', { userId, userRole });
-      } catch (jwtError) {
-        console.error('❌ JWT verification failed:', jwtError.message);
-        return res.status(401).json({
-          success: false,
-          message: 'Invalid or expired token. Please login again.'
-        });
-      }
-    } else if (req.auth && req.auth.id) {
-      // Fallback to auth middleware if available
-      userId = req.auth.id;
-      userRole = req.auth.role;
-      console.log('✅ Using auth middleware:', { userId, userRole });
-    } else {
-      // No authentication provided
-      console.log('❌ No authentication provided');
+    if (!userId) {
       return res.status(401).json({
         success: false,
-        message: 'Authentication required. Please provide a valid token.'
+        message: "Authentication required.",
       });
     }
 
-    // Set SSE headers
     res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache, no-transform', // no-transform prevents some proxies from buffering
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no', // Disable buffering for Nginx/Proxies
-      'Access-Control-Allow-Origin': '*',
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
     });
 
-    // Write a retry interval for the client (5 seconds)
-    res.write('retry: 5000\n');
+    const connectionId = `${userId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    activeConnections.set(connectionId, { res, userId, userRole });
 
-    // Send initial connection message
-    res.write(`data: ${JSON.stringify({
-      type: 'connected',
-      message: 'Connected to notification stream',
-      timestamp: new Date().toISOString()
-    })}\n\n`);
+    res.write(
+      `data: ${JSON.stringify({
+        type: "connected",
+        connectionId,
+        timestamp: new Date().toISOString(),
+      })}\n\n`
+    );
 
-    // Store connection
-    const connectionId = `${userId}_${Date.now()}`;
-    activeConnections.set(connectionId, {
-      res,
-      userId,
-      userRole,
-      connectedAt: new Date()
-    });
-
-    // Send initial unread count
-    const unreadCount = await Notification.countDocuments({
-      $or: [
-        { recipientId: userId },
-        { recipientRole: userRole }
-      ],
-      read: false
-    });
-
-    res.write(`data: ${JSON.stringify({
-      type: 'unread_count',
-      count: unreadCount,
-      timestamp: new Date().toISOString()
-    })}\n\n`);
-
-    // Handle client disconnect
-    req.on('close', () => {
-      console.log(`📡 SSE connection closed for user ${userId} (${connectionId})`);
+    req.on("close", () => {
       activeConnections.delete(connectionId);
       clearInterval(heartbeat);
     });
 
-    // Keep connection alive with heartbeat
     const heartbeat = setInterval(() => {
       if (res.destroyed) {
-        console.log(`📡 SSE connection destroyed, cleaning up heartbeat for ${connectionId}`);
         clearInterval(heartbeat);
         activeConnections.delete(connectionId);
         return;
       }
 
       try {
-        res.write(`data: ${JSON.stringify({
-          type: 'heartbeat',
-          timestamp: new Date().toISOString()
-        })}\n\n`);
-      } catch (err) {
-        console.error(`❌ SSE heartbeat failed for ${connectionId}:`, err);
+        res.write(
+          `data: ${JSON.stringify({
+            type: "heartbeat",
+            timestamp: new Date().toISOString(),
+          })}\n\n`
+        );
+      } catch {
         clearInterval(heartbeat);
         activeConnections.delete(connectionId);
       }
-    }, 15000); // Send heartbeat every 15 seconds (more frequent to prevent proxy timeout)
-
+    }, 15000);
   } catch (error) {
-    console.error('SSE stream error:', error);
+    console.error("SSE stream error:", error);
     if (!res.headersSent) {
       res.status(500).json({
         success: false,
-        message: 'Failed to establish notification stream'
+        message: "Failed to establish notification stream",
       });
     }
   }
@@ -627,7 +618,7 @@ export const broadcastNotification = async (notification) => {
       );
 
     if (userConnections.length === 0) {
-      console.log(`📡 No active connections for user ${recipientId}`);
+      console.log(`ðŸ“¡ No active connections for user ${recipientId}`);
       return;
     }
 
@@ -650,12 +641,12 @@ export const broadcastNotification = async (notification) => {
       try {
         if (!conn.res.destroyed) {
           conn.res.write(`data: ${JSON.stringify(notificationData)}\n\n`);
-          console.log(`📡 Notification sent to connection ${connectionId}`);
+          console.log(`ðŸ“¡ Notification sent to connection ${connectionId}`);
         } else {
           activeConnections.delete(connectionId);
         }
       } catch (error) {
-        console.error(`❌ Error sending to connection ${connectionId}:`, error);
+        console.error(`âŒ Error sending to connection ${connectionId}:`, error);
         activeConnections.delete(connectionId);
       }
     });
@@ -681,12 +672,12 @@ export const broadcastNotification = async (notification) => {
           conn.res.write(`data: ${JSON.stringify(unreadCountData)}\n\n`);
         }
       } catch (error) {
-        console.error(`❌ Error sending unread count to connection ${connectionId}:`, error);
+        console.error(`âŒ Error sending unread count to connection ${connectionId}:`, error);
         activeConnections.delete(connectionId);
       }
     });
 
   } catch (error) {
-    console.error('❌ Error broadcasting notification:', error);
+    console.error('âŒ Error broadcasting notification:', error);
   }
 };

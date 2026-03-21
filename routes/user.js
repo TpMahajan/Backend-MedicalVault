@@ -1,4 +1,4 @@
-import express from 'express';
+﻿import express from 'express';
 import {
   updateProfile,
   updateFCMToken,
@@ -11,44 +11,54 @@ import {
   updateProfileValidation,
   fcmTokenValidation
 } from '../middleware/validation.js';
-import { auth, optionalAuth } from '../middleware/auth.js';
+import { auth } from '../middleware/auth.js';
 import { fcmLimiter } from '../middleware/rateLimit.js';
 import { User } from '../models/User.js';
 import { checkSession } from '../middleware/checkSession.js';
+import { checkRole, requireOwnerOrRoles } from '../middleware/rbac.js';
+import { auditTrail } from '../middleware/auditLogger.js';
 
 const router = express.Router();
 
-// Note: Not all routes require authentication - getUserProfile is public
-
 // @route   PUT /api/users/profile
-// @desc    Update user profile
-// @access  Private
 router.put('/profile', auth, updateProfileValidation, updateProfile);
 
 // @route   GET /api/users/all-patients
-// @desc    Get all patients from database
-// @access  Private
-router.get('/all-patients', auth, getAllPatients);
+router.get('/all-patients', auth, checkRole('doctor', 'admin', 'superadmin'), getAllPatients);
 
 // @route   PUT /api/users/fcm-token
-// @desc    Update FCM token
-// @access  Private
 router.put('/fcm-token', auth, fcmLimiter, fcmTokenValidation, updateFCMToken);
 
 // @route   GET /api/users/:id/medical-card
-// @desc    Get medical card data (public, no auth required)
-// @access  Public
-router.get('/:id/medical-card', getMedicalCard);
+router.get(
+  '/:id/medical-card',
+  auth,
+  checkSession,
+  auditTrail({
+    action: 'READ_MEDICAL_CARD',
+    resourceType: 'USER_MEDICAL_CARD',
+    getResourceId: (req) => req.params.id,
+    getPatientId: (req) => req.params.id,
+  }),
+  getMedicalCard
+);
 
 // @route   GET /api/users/:id
-// @desc    Get user profile by ID (public info)
-// @access  Public (no auth required) - but doctors need active session
-router.get('/:id', optionalAuth, checkSession, getUserProfile);
+router.get(
+  '/:id',
+  auth,
+  checkSession,
+  auditTrail({
+    action: 'READ_PROFILE',
+    resourceType: 'USER_PROFILE',
+    getResourceId: (req) => req.params.id,
+    getPatientId: (req) => req.params.id,
+  }),
+  getUserProfile
+);
 
 // @route   POST /api/users/:id/fcm-token
-// @desc    Save FCM token for a specific user
-// @access  Private
-router.post('/:id/fcm-token', auth, fcmLimiter, fcmTokenValidation, async (req, res) => {
+router.post('/:id/fcm-token', auth, requireOwnerOrRoles({ ownerParam: 'id' }), fcmLimiter, fcmTokenValidation, async (req, res) => {
   try {
     const { token } = req.body;
     const user = await User.findById(req.params.id);
@@ -64,14 +74,15 @@ router.post('/:id/fcm-token', auth, fcmLimiter, fcmTokenValidation, async (req, 
 });
 
 // @route   DELETE /api/users/account
-// @desc    Delete user account
-// @access  Private
 router.delete('/account', auth, deleteAccount);
 
 // @route   GET /api/users/:id/records
-// @desc    Get user's medical records grouped by category (for web app)
-// @access  Private - doctors need active session, Anonymous allowed
-router.get('/:id/records', optionalAuth, checkSession, async (req, res) => {
+router.get('/:id/records', auth, checkSession, auditTrail({
+  action: 'READ_MEDICAL_RECORDS',
+  resourceType: 'USER_RECORDS',
+  getResourceId: (req) => req.params.id,
+  getPatientId: (req) => req.params.id,
+}), async (req, res) => {
   try {
     const user = await User.findById(req.params.id).populate('medicalRecords');
     if (!user) {
@@ -80,7 +91,6 @@ router.get('/:id/records', optionalAuth, checkSession, async (req, res) => {
 
     const records = user.medicalRecords || [];
 
-    // Group records by category
     const grouped = {
       reports: records.filter((record) => record.category?.toLowerCase() === "report"),
       prescriptions: records.filter((record) => record.category?.toLowerCase() === "prescription"),
@@ -88,7 +98,6 @@ router.get('/:id/records', optionalAuth, checkSession, async (req, res) => {
       insurance: records.filter((record) => record.category?.toLowerCase() === "insurance"),
     };
 
-    // Add URL field for frontend compatibility (using S3 signed URLs)
     const { generateSignedUrl } = await import("../utils/s3Utils.js");
     const groupedWithUrl = Object.fromEntries(
       await Promise.all(
@@ -116,7 +125,9 @@ router.get('/:id/records', optionalAuth, checkSession, async (req, res) => {
       )
     );
 
-    const mode = req.auth?.role === 'anonymous' ? 'anonymous' : (req.auth?.role === 'doctor' ? 'doctor' : (req.auth?.id?.toString() === req.params.id ? 'patient' : 'unknown'));
+    const role = String(req.auth?.role || '').toLowerCase();
+    const mode = role === 'doctor' ? 'doctor' : role === 'admin' ? 'admin' : role === 'superadmin' ? 'superadmin' : 'patient';
+
     const response = {
       success: true,
       counts: Object.fromEntries(

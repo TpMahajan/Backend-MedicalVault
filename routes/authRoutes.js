@@ -3,6 +3,7 @@ import jwt from "jsonwebtoken";
 import { User } from "../models/User.js";
 import rateLimit from "express-rate-limit";
 import { auth } from "../middleware/auth.js";
+import { authLimiter } from "../middleware/rateLimit.js";
 import { getMe, updateMe } from "../controllers/authController.js";
 import { DoctorUser } from "../models/DoctorUser.js";  // doctor model
 import bcrypt from "bcryptjs";
@@ -18,6 +19,15 @@ import s3Client, { BUCKET_NAME } from "../config/s3.js";
 import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { buildUserResponse } from "../utils/userResponse.js";
+import {
+  clearAuthCookies,
+  hashToken,
+  issueAuthTokenSet,
+  parseCookies,
+  setAuthCookies,
+  verifyRefreshToken,
+} from "../services/tokenService.js";
+import { RefreshToken } from "../models/RefreshToken.js";
 
 const router = express.Router();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -36,6 +46,35 @@ const codeLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+
+const ENABLE_DEBUG_ROUTES =
+  String(process.env.ENABLE_DEBUG_ROUTES || "false").toLowerCase() === "true";
+
+const persistRefreshToken = async (req, principalId, role, refreshToken, refreshMeta) => {
+  const decoded = verifyRefreshToken(refreshToken);
+  const expiresAt = new Date((decoded.exp || 0) * 1000);
+  await RefreshToken.create({
+    principalId: String(principalId),
+    role: String(role).toLowerCase(),
+    tokenHash: hashToken(refreshToken),
+    familyId: refreshMeta.familyId,
+    jti: refreshMeta.jti,
+    expiresAt,
+    createdByIp: req.ip || "",
+    userAgent: req.headers["user-agent"] || "",
+  });
+};
+
+const issueLoginTokens = async (req, res, { principalId, role, email }) => {
+  const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
+    principalId,
+    role,
+    email,
+  });
+  await persistRefreshToken(req, principalId, role, refreshToken, refreshMeta);
+  setAuthCookies(res, { accessToken, refreshToken });
+  return { accessToken, refreshToken };
+};
 
 const profilePhotoUpload = multer({
   storage: multerS3({
@@ -120,11 +159,11 @@ router.post("/signup", async (req, res) => {
       // Don't fail signup if email fails - user can resend
     }
 
-    const jwtToken = jwt.sign(
-      { userId: newUser._id, role: "patient" },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
-    );
+    const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
+      principalId: newUser._id.toString(),
+      role: "patient",
+      email: newUser.email,
+    });
 
     res.status(201).json({
       success: true,
@@ -136,7 +175,8 @@ router.post("/signup", async (req, res) => {
         mobile: newUser.mobile,
         emailVerified: false,
       },
-      token: jwtToken,
+      token: accessToken,
+      refreshToken,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -222,12 +262,11 @@ router.post("/google", async (req, res) => {
       console.log("✅ Existing user logged in via Google:", email);
     }
 
-    // Generate JWT
-    const jwtToken = jwt.sign(
-      { userId: user._id, role: "patient" },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
-    );
+    const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
+      principalId: user._id.toString(),
+      role: "patient",
+      email: user.email,
+    });
 
     // Infer loginType if not present in user document
     const loginType = user.loginType || (user.googleId ? 'google' : 'email');
@@ -238,7 +277,8 @@ router.post("/google", async (req, res) => {
       success: true,
       message: user.googleId === googleId ? "Login successful" : "Account created successfully",
       user: responseUser,
-      token: jwtToken,
+      token: accessToken,
+      refreshToken,
     });
 
   } catch (error) {
@@ -251,7 +291,7 @@ router.post("/google", async (req, res) => {
 });
 
 // ================= Patient Login =================
-router.post("/login", async (req, res) => {
+router.post("/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -265,11 +305,11 @@ router.post("/login", async (req, res) => {
     
     if (!isValid) return res.status(400).json({ message: "Invalid credentials" });
 
-    const token = jwt.sign(
-      { userId: user._id, role: "patient" },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
-    );
+    const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
+      principalId: user._id.toString(),
+      role: "patient",
+      email: user.email,
+    });
 
     user.lastLogin = new Date();
     await user.save();
@@ -280,7 +320,8 @@ router.post("/login", async (req, res) => {
       success: true,
       message: "Login successful",
       user: responseUser,
-      token,
+      token: accessToken,
+      refreshToken,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -310,11 +351,11 @@ router.post("/doctor/signup", async (req, res) => {
 
     await newDoctor.save();
 
-    const token = jwt.sign(
-      { doctorId: newDoctor._id, role: "doctor" },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
-    );
+    const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
+      principalId: newDoctor._id.toString(),
+      role: "doctor",
+      email: newDoctor.email,
+    });
 
     res.status(201).json({
       success: true,
@@ -325,7 +366,8 @@ router.post("/doctor/signup", async (req, res) => {
         email: newDoctor.email,
         specialization: newDoctor.specialization,
       },
-      token,
+      token: accessToken,
+      refreshToken,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -333,7 +375,7 @@ router.post("/doctor/signup", async (req, res) => {
 });
 
 // ================= Doctor Login =================
-router.post("/doctor/login", async (req, res) => {
+router.post("/doctor/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -343,11 +385,11 @@ router.post("/doctor/login", async (req, res) => {
     const isValid = await doctor.comparePassword(password);
     if (!isValid) return res.status(400).json({ message: "Invalid credentials" });
 
-    const token = jwt.sign(
-      { doctorId: doctor._id, role: "doctor" },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
-    );
+    const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
+      principalId: doctor._id.toString(),
+      role: "doctor",
+      email: doctor.email,
+    });
 
     doctor.lastLogin = new Date();
     await doctor.save();
@@ -361,7 +403,8 @@ router.post("/doctor/login", async (req, res) => {
         email: doctor.email,
         specialization: doctor.specialization,
       },
-      token,
+      token: accessToken,
+      refreshToken,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -372,8 +415,88 @@ router.post("/doctor/login", async (req, res) => {
 router.get("/me", auth, getMe);
 router.put("/me", auth, updateMe);
 
+// ================= Token Refresh / Logout =================
+router.post("/refresh", async (req, res) => {
+  try {
+    const cookies = parseCookies(req);
+    const providedRefreshToken = String(
+      req.body?.refreshToken || cookies.mv_rt || ""
+    ).trim();
+    if (!providedRefreshToken) {
+      return res.status(401).json({ success: false, message: "Refresh token is required" });
+    }
+
+    const decoded = verifyRefreshToken(providedRefreshToken);
+    const role = String(decoded.role || "").toLowerCase();
+    if (!["patient", "doctor"].includes(role)) {
+      return res.status(403).json({ success: false, message: "Invalid refresh token role" });
+    }
+
+    const stored = await RefreshToken.findOne({
+      tokenHash: hashToken(providedRefreshToken),
+      revokedAt: null,
+    });
+    if (!stored || stored.expiresAt <= new Date()) {
+      return res.status(401).json({ success: false, message: "Refresh token expired or revoked" });
+    }
+
+    let principal;
+    if (role === "doctor") {
+      principal = await DoctorUser.findById(stored.principalId).select("_id email isActive status");
+    } else {
+      principal = await User.findById(stored.principalId).select("_id email isActive status");
+    }
+
+    if (!principal || principal.isActive === false || principal.status === "BLOCKED") {
+      return res.status(403).json({ success: false, message: "Account inactive" });
+    }
+
+    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
+      principalId: principal._id.toString(),
+      role,
+      email: principal.email,
+      familyId: decoded.familyId,
+    });
+
+    stored.revokedAt = new Date();
+    stored.revokedReason = "rotated";
+    stored.replacedByTokenHash = hashToken(refreshToken);
+    await stored.save();
+    await persistRefreshToken(req, principal._id.toString(), role, refreshToken, refreshMeta);
+
+    setAuthCookies(res, { accessToken, refreshToken });
+    return res.json({ success: true, token: accessToken, refreshToken });
+  } catch {
+    return res.status(401).json({ success: false, message: "Invalid refresh token" });
+  }
+});
+
+router.post("/logout", auth, async (req, res) => {
+  try {
+    const cookies = parseCookies(req);
+    const providedRefreshToken = String(
+      req.body?.refreshToken || cookies.mv_rt || ""
+    ).trim();
+
+    if (providedRefreshToken) {
+      await RefreshToken.updateOne(
+        { tokenHash: hashToken(providedRefreshToken), revokedAt: null },
+        { $set: { revokedAt: new Date(), revokedReason: "logout" } }
+      );
+    }
+
+    clearAuthCookies(res);
+    return res.json({ success: true, message: "Logged out successfully" });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Logout failed" });
+  }
+});
+
 // ================= Debug Login Endpoint =================
 router.post("/debug-login", async (req, res) => {
+  if (!ENABLE_DEBUG_ROUTES) {
+    return res.status(404).json({ success: false, message: "Not found" });
+  }
   try {
     const { email, password, userType } = req.body;
     
@@ -414,11 +537,12 @@ router.post("/debug-login", async (req, res) => {
       });
     }
 
-    token = jwt.sign(
-      { userId: user._id, role: role },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
-    );
+    const tokens = await issueLoginTokens(req, res, {
+      principalId: user._id.toString(),
+      role,
+      email: user.email,
+    });
+    token = tokens.accessToken;
 
     console.log('✅ Login successful:', {
       userId: user._id,
@@ -436,6 +560,7 @@ router.post("/debug-login", async (req, res) => {
         role: role
       },
       token,
+      refreshToken: tokens.refreshToken,
       debug: {
         userType: userType,
         role: role,
@@ -457,7 +582,7 @@ router.post("/debug-login", async (req, res) => {
 // POST /auth/verify - Verify email with token
 router.post("/verify", async (req, res) => {
   try {
-    const tokenStr = req.body.token || req.query.token;
+    const tokenStr = req.body.token;
     if (!tokenStr) {
       return res.status(400).json({ success: false, message: "Token is required" });
     }
@@ -654,6 +779,9 @@ router.post("/resend-verification", emailLimiter, async (req, res) => {
 
 // ================= Test Endpoint for QR Scanner =================
 router.post("/test-patient", async (req, res) => {
+  if (!ENABLE_DEBUG_ROUTES) {
+    return res.status(404).json({ success: false, message: "Not found" });
+  }
   try {
     // Create a test patient for QR scanner testing
     const testPatient = new User({
@@ -677,19 +805,19 @@ router.post("/test-patient", async (req, res) => {
       patient = testPatient;
     }
 
-    // Generate token
-    const token = jwt.sign(
-      { userId: patient._id, role: "patient" },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
-    );
+    const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
+      principalId: patient._id.toString(),
+      role: "patient",
+      email: patient.email,
+    });
 
     const responseUser = await buildUserResponse(patient);
 
     res.json({
       success: true,
       message: "Test patient token generated",
-      token,
+      token: accessToken,
+      refreshToken,
       patient: responseUser,
     });
   } catch (error) {
@@ -782,7 +910,9 @@ const transporter = nodemailer.createTransport({
   } : undefined,
   tls: {
     ciphers: "TLSv1.2",
-    rejectUnauthorized: false // Allow self-signed certificates in dev
+    rejectUnauthorized:
+      String(process.env.SMTP_REJECT_UNAUTHORIZED || "true").toLowerCase() ===
+      "true",
   },
   connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 10000),
   greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),

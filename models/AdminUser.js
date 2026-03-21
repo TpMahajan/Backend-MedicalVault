@@ -34,7 +34,10 @@ const AdminUserSchema = new mongoose.Schema(
     },
     assignedBy: {
       type: String,
-      default: "superadmin@medicalvault.in",
+      default: () =>
+        String(process.env.SUPERADMIN_EMAIL || "superadmin")
+          .toLowerCase()
+          .trim(),
       lowercase: true,
       trim: true,
     },

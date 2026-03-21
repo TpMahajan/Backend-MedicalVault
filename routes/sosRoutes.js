@@ -1,18 +1,21 @@
-import express from "express";
-import { auth, optionalAuth } from "../middleware/auth.js";
+﻿import express from "express";
+import { auth } from "../middleware/auth.js";
 import SOS from "../models/SOS.js";
 import { User } from "../models/User.js";
 import { SosEvent } from "../models/SosEvent.js";
 import { MassIncident } from "../models/MassIncident.js";
+import { checkRole } from "../middleware/rbac.js";
+import { writeAuditLog } from "../middleware/auditLogger.js";
 
 const router = express.Router();
 
-// Mass crowd SOS detection thresholds (Meters + Minutes)
-const MASS_WINDOW_MINUTES = 10; // time window to consider for clustering
-const MASS_RADIUS_METERS = 15; // radius within which events are considered part of the same cluster
-const MASS_THRESHOLD = 8; // minimum SOS events required to trigger a mass incident
+const MASS_WINDOW_MINUTES = 10;
+const MASS_RADIUS_METERS = 15;
+const MASS_THRESHOLD = 8;
 
-// Create SOS message (patient/doctor)
+const normalizeRole = (role) => String(role || "").toLowerCase();
+
+// Create SOS message (patient/doctor/admin)
 router.post("/", auth, async (req, res) => {
   try {
     const { latitude, longitude } = req.body || {};
@@ -22,23 +25,36 @@ router.post("/", auth, async (req, res) => {
       Number.isFinite(Number(latitude)) &&
       Number.isFinite(Number(longitude));
 
-    // Legacy fallback for older clients that still POST profile/name/location strings
+    const role = normalizeRole(req.auth?.role || "patient");
+    const userId = req.user?._id || req.user?.id || req.auth?.id;
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "Unable to resolve user for SOS request.",
+      });
+    }
+
     if (!hasGeoPayload) {
-      const role = req.auth?.role || "patient";
-      const patientId =
-        role === "patient" ? (req.user?._id || req.user?.id) : undefined;
       const { profileId, name, age, location, mobile } = req.body || {};
 
       const legacySos = await SOS.create({
-        patientId,
+        patientId: role === "patient" ? userId : undefined,
         profileId: profileId?.toString?.() ?? profileId ?? "",
         name: name ?? "",
         age: age?.toString?.() ?? age ?? "",
-        mobile:
-          (mobile ?? (role === "patient" ? req.user?.mobile || "" : ""))?.toString?.() ??
-          "",
+        mobile: (mobile ?? (role === "patient" ? req.user?.mobile || "" : ""))?.toString?.() ?? "",
         location: location ?? "",
         submittedByRole: role,
+      });
+
+      await writeAuditLog({
+        req,
+        action: "CREATE_SOS",
+        resourceType: "SOS",
+        resourceId: legacySos._id?.toString(),
+        patientId: legacySos.patientId?.toString?.() || "",
+        statusCode: 201,
       });
 
       return res.status(201).json({
@@ -59,15 +75,12 @@ router.post("/", auth, async (req, res) => {
     }
 
     const accuracyMeters =
-      req.body.accuracyMeters !== undefined
-        ? Number(req.body.accuracyMeters)
-        : undefined;
+      req.body.accuracyMeters !== undefined ? Number(req.body.accuracyMeters) : undefined;
     const notes =
       typeof req.body.notes === "string" && req.body.notes.trim().length
         ? req.body.notes.trim()
         : undefined;
-    const source =
-      typeof req.body.source === "string" ? req.body.source : "patient_app";
+    const source = typeof req.body.source === "string" ? req.body.source : "patient_app";
     const providedAllergies =
       typeof req.body.allergies === "string" && req.body.allergies.trim().length
         ? req.body.allergies.trim()
@@ -85,8 +98,7 @@ router.post("/", auth, async (req, res) => {
         ? req.body.age.trim()
         : undefined;
     const providedLocationText =
-      typeof req.body.locationText === "string" &&
-      req.body.locationText.trim().length
+      typeof req.body.locationText === "string" && req.body.locationText.trim().length
         ? req.body.locationText.trim()
         : undefined;
     const providedProfileId =
@@ -94,41 +106,21 @@ router.post("/", auth, async (req, res) => {
         ? req.body.profileId.trim()
         : undefined;
 
-    const userId = req.user?._id || req.user?.id || req.auth?.id;
-    if (!userId) {
-      return res.status(401).json({
-        success: false,
-        message: "Unable to resolve user for SOS request.",
-      });
-    }
-
-    const userProfile = await User.findById(userId).select(
-      "allergies name mobile age dateOfBirth"
-    );
+    const userProfile = await User.findById(userId).select("allergies name mobile age dateOfBirth");
     const allergiesSnapshot =
-      providedAllergies ??
-      userProfile?.allergies?.trim?.() ??
-      userProfile?.allergies ??
-      "";
+      providedAllergies ?? userProfile?.allergies?.trim?.() ?? userProfile?.allergies ?? "";
     const displayName = providedName ?? userProfile?.name ?? "";
-    const displayMobile =
-      providedMobile ?? userProfile?.mobile?.toString?.() ?? "";
+    const displayMobile = providedMobile ?? userProfile?.mobile?.toString?.() ?? "";
 
     const computeAgeFromDob = (dobValue) => {
       if (!dobValue) return null;
       try {
-        const dob =
-          dobValue instanceof Date
-            ? dobValue
-            : new Date(dobValue?.toString?.() ?? dobValue);
+        const dob = dobValue instanceof Date ? dobValue : new Date(dobValue?.toString?.() ?? dobValue);
         if (Number.isNaN(dob.getTime())) return null;
         const now = new Date();
         let age = now.getUTCFullYear() - dob.getUTCFullYear();
         const monthDiff = now.getUTCMonth() - dob.getUTCMonth();
-        if (
-          monthDiff < 0 ||
-          (monthDiff === 0 && now.getUTCDate() < dob.getUTCDate())
-        ) {
+        if (monthDiff < 0 || (monthDiff === 0 && now.getUTCDate() < dob.getUTCDate())) {
           age--;
         }
         return age;
@@ -161,24 +153,20 @@ router.post("/", auth, async (req, res) => {
     const locationString =
       providedLocationText ??
       `${lat.toFixed(6)},${lng.toFixed(6)}${
-        Number.isFinite(accuracyMeters)
-          ? ` (±${Math.round(Math.abs(accuracyMeters))}m)`
-          : ""
+        Number.isFinite(accuracyMeters) ? ` (±${Math.round(Math.abs(accuracyMeters))}m)` : ""
       }`;
 
-    await SOS.create({
+    const queueEntry = await SOS.create({
       patientId: userId,
       profileId: providedProfileId ?? userId.toString(),
       name: displayName,
       age: derivedAge,
       mobile: displayMobile,
       location: locationString,
-      submittedByRole: req.auth?.role || "patient",
+      submittedByRole: role,
       allergiesSnapshot,
       notes,
-      accuracyMeters: Number.isFinite(accuracyMeters)
-        ? accuracyMeters
-        : undefined,
+      accuracyMeters: Number.isFinite(accuracyMeters) ? accuracyMeters : undefined,
       geoLat: lat,
       geoLng: lng,
     });
@@ -211,8 +199,7 @@ router.post("/", auth, async (req, res) => {
 
       if (!incident) {
         const firstCreatedAt = sosNearby.reduce(
-          (earliest, event) =>
-            event.createdAt < earliest ? event.createdAt : earliest,
+          (earliest, event) => (event.createdAt < earliest ? event.createdAt : earliest),
           sosNearby[0].createdAt
         );
 
@@ -229,15 +216,20 @@ router.post("/", auth, async (req, res) => {
         incident.lastSOSAt = now;
         await incident.save();
       }
-
-      // TODO: Integrate FCM/email/SMS alerts for admins/responders (#mass-sos-alerts)
-      console.log(
-        "MASS INCIDENT DETECTED:",
-        incident._id.toString(),
-        sosNearby.length,
-        "events"
-      );
     }
+
+    await writeAuditLog({
+      req,
+      action: "CREATE_SOS",
+      resourceType: "SOS",
+      resourceId: queueEntry._id?.toString(),
+      patientId: queueEntry.patientId?.toString?.() || "",
+      statusCode: 201,
+      metadata: {
+        massIncidentTriggered: Boolean(incident),
+        massIncidentId: incident ? incident._id?.toString() : "",
+      },
+    });
 
     return res.status(201).json({
       success: true,
@@ -247,21 +239,39 @@ router.post("/", auth, async (req, res) => {
     });
   } catch (e) {
     console.error("SOS create error:", e);
-    return res
-      .status(500)
-      .json({ success: false, message: "Failed to create SOS" });
+    return res.status(500).json({ success: false, message: "Failed to create SOS" });
   }
 });
 
-// List SOS messages FIFO (admins/doctors) — for now allow doctors
-// TEMP: Public listing for prototyping admin UI; will secure later
-router.get("/", optionalAuth, async (req, res) => {
+// List SOS messages
+router.get("/", auth, async (req, res) => {
   try {
+    const role = normalizeRole(req.auth?.role);
     const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);
     const skip = Math.max(parseInt(req.query.skip || "0", 10), 0);
-    const unreadOnly = String(req.query.unread || "false").toLowerCase() === 'true';
-    const filter = unreadOnly ? { isRead: { $ne: true } } : {};
+    const unreadOnly = String(req.query.unread || "false").toLowerCase() === "true";
+
+    const baseFilter = unreadOnly ? { isRead: { $ne: true } } : {};
+    let filter = baseFilter;
+
+    if (role === "patient") {
+      filter = { ...baseFilter, patientId: req.auth.id };
+    } else if (!role || !["admin", "superadmin"].includes(role)) {
+      return res.status(403).json({ success: false, message: "Access denied" });
+    }
+
     const items = await SOS.find(filter).sort({ createdAt: 1 }).skip(skip).limit(limit).lean();
+
+    await writeAuditLog({
+      req,
+      action: "LIST_SOS",
+      resourceType: "SOS",
+      resourceId: "",
+      patientId: role === "patient" ? String(req.auth.id) : "",
+      statusCode: 200,
+      metadata: { count: items.length },
+    });
+
     return res.json({ success: true, data: items });
   } catch (e) {
     console.error("SOS list error:", e);
@@ -269,12 +279,23 @@ router.get("/", optionalAuth, async (req, res) => {
   }
 });
 
-// Mark a batch of SOS messages as read
-router.post("/mark-read", optionalAuth, async (req, res) => {
+// Mark a batch of SOS messages as read (admin/superadmin only)
+router.post("/mark-read", auth, checkRole("admin", "superadmin"), async (req, res) => {
   try {
     const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
     if (!ids.length) return res.status(400).json({ success: false, message: "ids array is required" });
+
     await SOS.updateMany({ _id: { $in: ids } }, { $set: { isRead: true } });
+
+    await writeAuditLog({
+      req,
+      action: "MARK_SOS_READ",
+      resourceType: "SOS",
+      resourceId: ids.join(","),
+      statusCode: 200,
+      metadata: { idsCount: ids.length },
+    });
+
     return res.json({ success: true });
   } catch (e) {
     console.error("SOS mark-read error:", e);
@@ -282,15 +303,24 @@ router.post("/mark-read", optionalAuth, async (req, res) => {
   }
 });
 
-export default router;
-
-// Delete/clear an SOS item (temporary open access; secure later)
-router.delete("/:id", optionalAuth, async (req, res) => {
+// Delete/clear an SOS item (admin/superadmin only)
+router.delete("/:id", auth, checkRole("admin", "superadmin"), async (req, res) => {
   try {
     const id = req.params.id;
     if (!id) return res.status(400).json({ success: false, message: "Missing id" });
+
     const result = await SOS.findByIdAndDelete(id);
     if (!result) return res.status(404).json({ success: false, message: "Not found" });
+
+    await writeAuditLog({
+      req,
+      action: "DELETE_SOS",
+      resourceType: "SOS",
+      resourceId: id,
+      patientId: result.patientId?.toString?.() || "",
+      statusCode: 200,
+    });
+
     return res.json({ success: true });
   } catch (e) {
     console.error("SOS delete error:", e);
@@ -298,4 +328,4 @@ router.delete("/:id", optionalAuth, async (req, res) => {
   }
 });
 
-
+export default router;
