@@ -1,4 +1,4 @@
-﻿import crypto from "crypto";
+import crypto from "crypto";
 import jwt from "jsonwebtoken";
 
 const ACCESS_TTL = process.env.JWT_ACCESS_EXPIRES_IN || "15m";
@@ -7,6 +7,10 @@ const REFRESH_TTL = process.env.JWT_REFRESH_EXPIRES_IN || "7d";
 const getAccessSecret = () => {
   if (!process.env.JWT_SECRET) {
     throw new Error("JWT_SECRET is required");
+  }
+  const isProduction = String(process.env.NODE_ENV || "").toLowerCase() === "production";
+  if (isProduction && String(process.env.JWT_SECRET).trim().length < 32) {
+    throw new Error("JWT_SECRET must be at least 32 characters in production");
   }
   return process.env.JWT_SECRET;
 };

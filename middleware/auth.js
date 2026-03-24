@@ -1,4 +1,4 @@
-﻿import { User } from "../models/User.js";
+import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { AdminUser } from "../models/AdminUser.js";
 import { parseBearerToken, parseCookies, verifyAccessToken } from "../services/tokenService.js";
@@ -60,6 +60,9 @@ const hydratePrincipal = async (principal) => {
     if (!admin || admin.isActive === false || admin.status === "BLOCKED") {
       return null;
     }
+    if (admin.accessExpiresAt && admin.accessExpiresAt <= new Date()) {
+      return null;
+    }
     return { auth: { id, role, email: admin.email || email }, admin };
   }
 
@@ -75,13 +78,8 @@ const hydratePrincipal = async (principal) => {
     };
   }
 
-  // Treat unknown roles as patient for backward compatibility when role is omitted.
-  const patient = await User.findById(id).select("-password");
-  if (!patient || patient.isActive === false || patient.status === "BLOCKED") {
-    return null;
-  }
-
-  return { auth: { id, role: "patient", email: patient.email || email }, user: patient };
+  // Security hardening: reject unknown roles instead of falling back.
+  return null;
 };
 
 const applyPrincipalToRequest = (req, hydrated) => {

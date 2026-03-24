@@ -11,9 +11,11 @@ import { fileURLToPath } from "url";
 // Load env (.env first, then legacy db.env fallback)
 dotenv.config();
 dotenv.config({ path: "./db.env" });
+validateStartupConfig();
 
 // Config imports
 import connectDB from "./config/database.js";
+import { validateStartupConfig } from "./config/startupValidation.js";
 
 // Routes
 import authRoutes from "./routes/authRoutes.js";        // patient auth
@@ -29,6 +31,7 @@ import aiAssistantRoutes from "./routes/aiAssistant.js"; // AI assistant ✅
 import sosRoutes from "./routes/sosRoutes.js";          // SOS messages
 import appUpdateRoutes from "./routes/appUpdate.js";
 import adminAuthRoutes from "./routes/adminAuth.js";    // admin auth
+import adminSecurityRoutes from "./routes/adminSecurity.js";
 import superAdminRoutes from "./routes/superAdmin.js";
 import publicConfigRoutes from "./routes/publicConfig.js";
 import lostFoundRoutes from "./routes/lostFound.js";    // lost & found (user)
@@ -50,8 +53,19 @@ const ENV = process.env.NODE_ENV || "development";
 app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS || 1));
 app.use(
   helmet({
-    hsts: ENV !== "development",
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        defaultSrc: ["'self'"],
+        imgSrc: ["'self'", "data:", "https:"],
+        connectSrc: ["'self'", "https:"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+      },
+    },
+    hsts: ENV !== "development" ? { maxAge: 31536000, includeSubDomains: true, preload: true } : false,
     frameguard: { action: "deny" },
+    noSniff: true,
     referrerPolicy: { policy: "no-referrer" },
     crossOriginResourcePolicy: { policy: "same-site" },
   })
@@ -87,6 +101,13 @@ app.use(
     credentials: true,
   })
 );
+if (String(process.env.ENFORCE_HTTPS || "false").toLowerCase() === "true") {
+  app.use((req, res, next) => {
+    const forwardedProto = String(req.headers["x-forwarded-proto"] || "").toLowerCase();
+    if (req.secure || forwardedProto === "https") return next();
+    return res.redirect(301, `https://${req.headers.host}${req.originalUrl}`);
+  });
+}
 app.use("/api", apiLimiter);
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
@@ -135,6 +156,7 @@ app.use("/api/ai", aiAssistantRoutes);        // AI assistant ✅
 app.use("/api/sos", sosRoutes);               // SOS
 app.use("/api/app", appUpdateRoutes);
 app.use("/api/admin", adminAuthRoutes);       // admin auth
+app.use("/api/admin", adminSecurityRoutes);   // admin security logs/alerts
 app.use("/api/superadmin", superAdminRoutes);
 app.use("/api/public", publicConfigRoutes);
 app.use("/api/lost-found", lostFoundRoutes);  // lost & found
@@ -142,6 +164,29 @@ app.use("/api/admin/lost-found", adminLostFoundRoutes); // admin lost & found
 app.use("/api/admin/inventory", adminInventoryRoutes);  // admin inventory ✅
 app.use("/api", inventoryRoutes);                       // inventory/order API
 app.use("/api/inventory", inventoryRoutes);             // compatibility mount
+
+// Non-breaking versioned API mounts (v1)
+app.use("/api/v1/auth", authRoutes);
+app.use("/api/v1/doctors", doctorAuthRoutes);
+app.use("/api/v1/files", documentRoutes);
+app.use("/api/v1/appointments", appointmentRoutes);
+app.use("/api/v1/patient", patientAppointmentRoutes);
+app.use("/api/v1/qr", qrRoutes);
+app.use("/api/v1/users", userRoutes);
+app.use("/api/v1/sessions", sessionRoutes);
+app.use("/api/v1/notifications", notificationRoutes);
+app.use("/api/v1/profiles", profileRoutes);
+app.use("/api/v1/ai", aiAssistantRoutes);
+app.use("/api/v1/sos", sosRoutes);
+app.use("/api/v1/app", appUpdateRoutes);
+app.use("/api/v1/admin", adminAuthRoutes);
+app.use("/api/v1/admin", adminSecurityRoutes);
+app.use("/api/v1/superadmin", superAdminRoutes);
+app.use("/api/v1/public", publicConfigRoutes);
+app.use("/api/v1/lost-found", lostFoundRoutes);
+app.use("/api/v1/admin/lost-found", adminLostFoundRoutes);
+app.use("/api/v1/admin/inventory", adminInventoryRoutes);
+app.use("/api/v1", inventoryRoutes);
 
 // -------------------- Health Check --------------------
 app.get("/health", (req, res) =>

@@ -1,5 +1,5 @@
 import express from "express";
-import { requireAdminAuth } from "../middleware/adminAuth.js";
+import { requireAdminAuth, requireAdminPermissions } from "../middleware/adminAuth.js";
 import {
   adjustInventory,
   getInventoryDashboard,
@@ -12,16 +12,47 @@ import {
 
 const router = express.Router();
 
-router.get("/dashboard", requireAdminAuth, getInventoryDashboard);
-router.get("/products", requireAdminAuth, getInventoryProducts);
-router.get("/ledger", requireAdminAuth, getInventoryLedger);
+router.get(
+  "/dashboard",
+  requireAdminAuth,
+  requireAdminPermissions("MANAGE_PRODUCTS"),
+  getInventoryDashboard
+);
+router.get(
+  "/products",
+  requireAdminAuth,
+  requireAdminPermissions("MANAGE_PRODUCTS"),
+  getInventoryProducts
+);
+router.get(
+  "/ledger",
+  requireAdminAuth,
+  requireAdminPermissions("MANAGE_PRODUCTS"),
+  getInventoryLedger
+);
 
-router.post("/restock", requireAdminAuth, restockInventory);
-router.post("/adjust", requireAdminAuth, adjustInventory);
-router.post("/orders/:orderId/return", requireAdminAuth, processInventoryReturn);
+router.post(
+  "/restock",
+  requireAdminAuth,
+  requireAdminPermissions("MANAGE_PRODUCTS"),
+  restockInventory
+);
+router.post(
+  "/adjust",
+  requireAdminAuth,
+  requireAdminPermissions("MANAGE_PRODUCTS"),
+  adjustInventory
+);
+router.post(
+  "/orders/:orderId/return",
+  requireAdminAuth,
+  requireAdminPermissions("MANAGE_ORDERS"),
+  processInventoryReturn
+);
 router.patch(
   "/products/:productKey/reorder-level",
   requireAdminAuth,
+  requireAdminPermissions("MANAGE_PRODUCTS"),
   setInventoryReorderLevel
 );
 

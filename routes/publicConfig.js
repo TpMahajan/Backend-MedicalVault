@@ -344,7 +344,12 @@ router.get("/products", async (req, res) => {
     const query = { isActive: true };
     if (category) query.category = category;
 
-    const productsRaw = await Product.find(query).sort({ createdAt: -1 }).lean();
+    const productsRaw = await Product.find(query)
+      .select(
+        "name shortDescription fullDescription category subCategory tags mrp sellingPrice discountPercent discountAmount media imageUrl imageKey inventory brand sku expiryDate prescriptionRequired customFields geoScope targetCountries targetStates targetRegions isActive createdAt updatedAt"
+      )
+      .sort({ updatedAt: -1 })
+      .lean();
     const products = await Promise.all(
       productsRaw
         .filter((product) => matchesGeoTargets(product, { country, state, region }))

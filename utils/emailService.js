@@ -6,7 +6,10 @@ const resend = process.env.RESEND_API_KEY
   : null;
 
 // Use a Resend-verified sender for Resend API. Do NOT default to MAIL_FROM (SMTP) here.
-const MAIL_FROM_RESEND = process.env.MAIL_FROM_RESEND || "onboarding@resend.dev";
+const MAIL_FROM_RESEND =
+  process.env.MAIL_FROM_RESEND ||
+  process.env.MAIL_FROM ||
+  "onboarding@resend.dev";
 // SMTP or generic mail-from (used by nodemailer paths elsewhere)
 const MAIL_FROM = process.env.MAIL_FROM || process.env.SMTP_USER || "no-reply@medicalvault.app";
 const APP_BASE_URL = process.env.APP_BASE_URL || "https://backend-medicalvault.onrender.com";

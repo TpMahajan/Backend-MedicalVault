@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { decryptField, encryptField } from "../utils/fieldEncryption.js";
 
 const fileSchema = new mongoose.Schema(
   {
@@ -8,8 +9,14 @@ const fileSchema = new mongoose.Schema(
 
     // File info
     title: { type: String, required: true, trim: true },
-    description: { type: String, trim: true, default: "" },
-    notes: { type: String },
+    description: {
+      type: String,
+      trim: true,
+      default: "",
+      set: encryptField,
+      get: decryptField,
+    },
+    notes: { type: String, set: encryptField, get: decryptField },
 
     // Categorization (only 4 types)
     type: {
@@ -50,7 +57,11 @@ const fileSchema = new mongoose.Schema(
     reviewedAt: { type: Date },
     reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: "DoctorUser" },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: { getters: true },
+    toObject: { getters: true },
+  }
 );
 
 // ✅ Store in "files" collection

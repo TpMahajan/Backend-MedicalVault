@@ -1,4 +1,4 @@
-﻿import mongoose from "mongoose";
+import mongoose from "mongoose";
 
 const auditLogSchema = new mongoose.Schema(
   {
@@ -20,6 +20,8 @@ const auditLogSchema = new mongoose.Schema(
     requestId: { type: String, default: "", index: true },
     metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
     immutable: { type: Boolean, default: true },
+    previousHash: { type: String, default: "", index: true },
+    recordHash: { type: String, default: "", index: true },
   },
   {
     timestamps: true,
@@ -28,6 +30,10 @@ const auditLogSchema = new mongoose.Schema(
 );
 
 auditLogSchema.pre(["updateOne", "updateMany", "findOneAndUpdate", "replaceOne"], function () {
+  throw new Error("Audit logs are immutable");
+});
+
+auditLogSchema.pre(["deleteOne", "deleteMany", "findOneAndDelete", "findByIdAndDelete"], function () {
   throw new Error("Audit logs are immutable");
 });
 

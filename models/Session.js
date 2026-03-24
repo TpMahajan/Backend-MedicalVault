@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import { flushExpiredAcceptedSessions } from "../services/sessionHistoryPersistence.js";
+import { decryptField, encryptField } from "../utils/fieldEncryption.js";
 
 const sessionSchema = new mongoose.Schema(
   {
@@ -85,10 +86,14 @@ const sessionSchema = new mongoose.Schema(
     diagnosis: {
       type: String,
       default: "",
+      set: encryptField,
+      get: decryptField,
     },
     notes: {
       type: String,
       default: "",
+      set: encryptField,
+      get: decryptField,
     },
     visitDate: {
       type: Date,
@@ -97,6 +102,8 @@ const sessionSchema = new mongoose.Schema(
   },
   {
     timestamps: true, // Adds createdAt and updatedAt automatically
+    toJSON: { getters: true },
+    toObject: { getters: true },
   }
 );
 

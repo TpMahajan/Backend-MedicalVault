@@ -1,4 +1,4 @@
-﻿import express from "express";
+import express from "express";
 import { AdminUser } from "../models/AdminUser.js";
 import { MassIncident } from "../models/MassIncident.js";
 import { requireAdminAuth } from "../middleware/adminAuth.js";
@@ -12,6 +12,11 @@ import {
   verifyRefreshToken,
 } from "../services/tokenService.js";
 import { RefreshToken } from "../models/RefreshToken.js";
+import {
+  isActorTemporarilyBlocked,
+  monitorFailedLogin,
+  monitorSuspiciousSession,
+} from "../services/securityMonitorService.js";
 
 const router = express.Router();
 
@@ -27,6 +32,35 @@ router.post("/signup", (_req, res) => {
 const persistRefreshToken = async (req, adminId, refreshToken, refreshMeta) => {
   const decoded = verifyRefreshToken(refreshToken);
   const expiresAt = new Date((decoded.exp || 0) * 1000);
+  const existingActiveSession = await RefreshToken.findOne({
+    principalId: String(adminId),
+    role: "admin",
+    revokedAt: null,
+    expiresAt: { $gt: new Date() },
+  })
+    .sort({ createdAt: -1 })
+    .select("createdByIp deviceInfo userAgent")
+    .lean();
+  const incomingDevice = String(req.headers["sec-ch-ua-platform"] || req.headers["x-device-info"] || "");
+  const incomingIp = req.ip || "";
+  if (
+    existingActiveSession &&
+    ((incomingDevice && existingActiveSession.deviceInfo && incomingDevice !== existingActiveSession.deviceInfo) ||
+      (incomingIp && existingActiveSession.createdByIp && incomingIp !== existingActiveSession.createdByIp))
+  ) {
+    await monitorSuspiciousSession({
+      actorEmail: req.body?.email || "",
+      actorRole: "admin",
+      ipAddress: incomingIp,
+      userAgent: req.headers["user-agent"] || "",
+      metadata: {
+        previousDevice: existingActiveSession.deviceInfo || "",
+        previousIp: existingActiveSession.createdByIp || "",
+        newDevice: incomingDevice,
+        newIp: incomingIp,
+      },
+    });
+  }
 
   await RefreshToken.create({
     principalId: String(adminId),
@@ -37,6 +71,8 @@ const persistRefreshToken = async (req, adminId, refreshToken, refreshMeta) => {
     expiresAt,
     createdByIp: req.ip || "",
     userAgent: req.headers["user-agent"] || "",
+    deviceInfo: String(req.headers["sec-ch-ua-platform"] || req.headers["x-device-info"] || ""),
+    lastActiveAt: new Date(),
   });
 };
 
@@ -44,17 +80,37 @@ const persistRefreshToken = async (req, adminId, refreshToken, refreshMeta) => {
 router.post("/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
+    const blockState = await isActorTemporarilyBlocked({ actorEmail: email, actorRole: "admin" });
+    if (blockState.isBlocked) {
+      return res.status(429).json({ success: false, message: "Account temporarily blocked due to suspicious activity" });
+    }
     if (!email || !password) {
       return res.status(400).json({ success: false, message: "Email and password are required" });
     }
 
     const admin = await AdminUser.findOne({ email: String(email).toLowerCase().trim() });
     if (!admin || admin.isActive === false || admin.status === "BLOCKED") {
+      await monitorFailedLogin({
+        actorEmail: email,
+        actorRole: "admin",
+        ipAddress: req.ip || "",
+        userAgent: req.headers["user-agent"] || "",
+        source: "admin_login",
+      });
       return res.status(401).json({ success: false, message: "Invalid credentials" });
     }
 
     const valid = await admin.comparePassword(password);
-    if (!valid) return res.status(401).json({ success: false, message: "Invalid credentials" });
+    if (!valid) {
+      await monitorFailedLogin({
+        actorEmail: email,
+        actorRole: "admin",
+        ipAddress: req.ip || "",
+        userAgent: req.headers["user-agent"] || "",
+        source: "admin_login",
+      });
+      return res.status(401).json({ success: false, message: "Invalid credentials" });
+    }
 
     admin.lastLogin = new Date();
     await admin.save();
@@ -72,13 +128,40 @@ router.post("/login", authLimiter, async (req, res) => {
     return res.json({
       success: true,
       message: "Login successful",
-      admin: { id: admin._id, name: admin.name, email: admin.email },
+      admin: {
+        id: admin._id,
+        name: admin.name,
+        email: admin.email,
+        role: admin.role,
+        permissions: admin.permissions || [],
+        isActive: admin.isActive !== false,
+      },
       token: accessToken,
       refreshToken,
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
+});
+
+router.get("/me", requireAdminAuth, async (req, res) => {
+  const admin = req.admin;
+  if (!admin) {
+    return res.status(404).json({ success: false, message: "Admin profile not found" });
+  }
+
+  return res.json({
+    success: true,
+    admin: {
+      id: admin._id,
+      name: admin.name,
+      email: admin.email,
+      role: admin.role,
+      permissions: admin.permissions || [],
+      isActive: admin.isActive !== false,
+      lastLogin: admin.lastLogin || null,
+    },
+  });
 });
 
 router.post("/refresh", async (req, res) => {

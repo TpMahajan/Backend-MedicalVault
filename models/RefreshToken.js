@@ -1,4 +1,4 @@
-﻿import mongoose from "mongoose";
+import mongoose from "mongoose";
 
 const refreshTokenSchema = new mongoose.Schema(
   {
@@ -58,6 +58,15 @@ const refreshTokenSchema = new mongoose.Schema(
     userAgent: {
       type: String,
       default: "",
+    },
+    deviceInfo: {
+      type: String,
+      default: "",
+    },
+    lastActiveAt: {
+      type: Date,
+      default: Date.now,
+      index: true,
     },
   },
   {

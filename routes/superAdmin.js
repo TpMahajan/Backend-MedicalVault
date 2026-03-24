@@ -11,12 +11,22 @@ import { fileURLToPath } from "url";
 import { requireSuperAdminAuth } from "../middleware/superAdminAuth.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
-import { AdminUser } from "../models/AdminUser.js";
+import {
+  AdminUser,
+  ADMIN_PERMISSIONS,
+  ADMIN_ROLES,
+  ROLE_PERMISSION_MAP,
+} from "../models/AdminUser.js";
 import { SuperAdminCredential } from "../models/SuperAdminCredential.js";
 import { Advertisement } from "../models/Advertisement.js";
 import { Product } from "../models/Product.js";
 import { UIConfig } from "../models/UIConfig.js";
 import { Notification } from "../models/Notification.js";
+import { Appointment } from "../models/Appointment.js";
+import { Session } from "../models/Session.js";
+import { Document } from "../models/File.js";
+import { SosEvent } from "../models/SosEvent.js";
+import { InventoryOrder } from "../models/InventoryOrder.js";
 import { SuperAdminActivityLog } from "../models/SuperAdminActivityLog.js";
 import { AdvertisementClickLog } from "../models/AdvertisementClickLog.js";
 import { clearPublicConfigCache } from "./publicConfig.js";
@@ -32,6 +42,7 @@ import {
   issueAuthTokenSet,
 } from "../services/tokenService.js";
 import { RefreshToken } from "../models/RefreshToken.js";
+import { writeAuditLog } from "../middleware/auditLogger.js";
 import {
   PUBLIC_AD_SURFACES,
   PUBLIC_ALERT_PLATFORMS,
@@ -55,13 +66,7 @@ const LOGIN_LIMITER = rateLimit({
   legacyHeaders: false,
 });
 
-const PERMISSIONS = [
-  "MANAGE_USERS",
-  "MANAGE_ADS",
-  "MANAGE_PRODUCTS",
-  "MANAGE_ALERTS",
-  "MANAGE_NOTIFICATIONS",
-];
+const PERMISSIONS = [...ADMIN_PERMISSIONS];
 const USER_ROLES = ["PATIENT", "DOCTOR", "ADMIN"];
 const ALERT_AUDIENCES = ["ALL", "PATIENT", "DOCTOR"];
 const ALERT_PLATFORMS = ["ALL", ...PUBLIC_ALERT_PLATFORMS];
@@ -172,6 +177,49 @@ function toBoolean(value, fallback = false) {
     if (value.toLowerCase() === "false") return false;
   }
   return fallback;
+}
+
+function sanitizeRichText(value) {
+  const raw = String(value || "");
+  return raw
+    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "")
+    .replace(/\son\w+\s*=\s*(['"]).*?\1/gi, "")
+    .replace(/javascript:/gi, "")
+    .trim();
+}
+
+function toArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value == null) return [];
+  return [value];
+}
+
+function normalizeTags(value) {
+  return [...new Set(
+    toArray(value)
+      .flatMap((entry) => String(entry || "").split(","))
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+  )];
+}
+
+function normalizeCustomFields(value) {
+  return toArray(value)
+    .map((entry) => ({
+      key: String(entry?.key || "").trim(),
+      value: entry?.value ?? "",
+    }))
+    .filter((entry) => entry.key);
+}
+
+function normalizeMediaPayload(body = {}) {
+  const media = body.media || {};
+  const images = toArray(media.images ?? body.images)
+    .map((entry) => String(entry || "").trim())
+    .filter(Boolean);
+  const thumbnail = String(media.thumbnail || body.thumbnail || body.imageUrl || "").trim();
+  const video = String(media.video || body.video || "").trim();
+  return { thumbnail, images, video };
 }
 
 function normalizeAlertAudience(value) {
@@ -317,9 +365,11 @@ function mapAdmin(admin) {
     id: admin._id?.toString(),
     name: admin.name,
     email: admin.email,
-    role: admin.role || "ADMIN",
+    role: admin.role || "PRODUCT_ADMIN",
     status: admin.status || (admin.isActive === false ? "BLOCKED" : "ACTIVE"),
     permissions: admin.permissions || [],
+    accessExpiresAt: admin.accessExpiresAt || null,
+    temporaryAccessReason: admin.temporaryAccessReason || "",
     assignedBy: admin.assignedBy || SUPERADMIN_EMAIL || "system",
     createdAt: admin.createdAt,
     updatedAt: admin.updatedAt,
@@ -386,6 +436,14 @@ async function logActivity(req, payload) {
       ipAddress: req.ip || "",
       userAgent: req.headers["user-agent"] || "",
     });
+    await writeAuditLog({
+      req,
+      action: String(payload.action || "SUPERADMIN_ACTION"),
+      resourceType: String(payload.targetType || "SUPERADMIN"),
+      resourceId: String(payload.targetId || ""),
+      statusCode: 200,
+      metadata: { details: payload.details || {} },
+    });
   } catch (error) {
     console.error("SuperAdmin activity log failed:", error.message);
   }
@@ -423,6 +481,85 @@ function applyLegacyStatusFilter(query, statusFilter) {
     { status: { $exists: false }, isActive: isActiveEquivalent },
   ];
   return query;
+}
+
+const DAY_IN_MS = 24 * 60 * 60 * 1000;
+const HOUR_IN_MS = 60 * 60 * 1000;
+
+function startOfUtcDay(value = new Date()) {
+  const date = new Date(value);
+  return new Date(
+    Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())
+  );
+}
+
+function buildDailyBuckets(days = 7, now = new Date()) {
+  const normalizedDays = Math.max(1, Math.round(Number(days) || 1));
+  const firstDay = new Date(
+    startOfUtcDay(now).getTime() - (normalizedDays - 1) * DAY_IN_MS
+  );
+  return Array.from({ length: normalizedDays }, (_, index) => {
+    const start = new Date(firstDay.getTime() + index * DAY_IN_MS);
+    return {
+      key: start.toISOString().slice(0, 10),
+      start,
+      end: new Date(start.getTime() + DAY_IN_MS),
+    };
+  });
+}
+
+function buildHourlyBuckets(hours = 24, now = new Date()) {
+  const normalizedHours = Math.max(1, Math.round(Number(hours) || 1));
+  const roundedNow = new Date(now);
+  roundedNow.setUTCMinutes(0, 0, 0);
+  const firstHour = new Date(
+    roundedNow.getTime() - (normalizedHours - 1) * HOUR_IN_MS
+  );
+  return Array.from({ length: normalizedHours }, (_, index) => {
+    const start = new Date(firstHour.getTime() + index * HOUR_IN_MS);
+    return {
+      key: `${start.toISOString().slice(0, 13)}:00`,
+      start,
+      end: new Date(start.getTime() + HOUR_IN_MS),
+    };
+  });
+}
+
+function indexByKey(rows = [], valueField = "count") {
+  return rows.reduce((accumulator, entry) => {
+    if (entry?._id == null) return accumulator;
+    accumulator[String(entry._id)] = Number(entry[valueField] || 0);
+    return accumulator;
+  }, {});
+}
+
+function percent(value, total) {
+  const numerator = Number(value || 0);
+  const denominator = Number(total || 0);
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0) {
+    return 0;
+  }
+  return Number(((numerator / denominator) * 100).toFixed(2));
+}
+
+function buildLegacyStatusQuery(status = "ACTIVE") {
+  const normalizedStatus = String(status || "")
+    .trim()
+    .toUpperCase();
+  if (!normalizedStatus) return {};
+  const isActiveEquivalent = normalizedStatus === "ACTIVE";
+  return {
+    $or: [
+      { status: normalizedStatus },
+      { status: { $exists: false }, isActive: isActiveEquivalent },
+    ],
+  };
+}
+
+function toDateSafe(value) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
 }
 
 const advertisementImageStorage = hasAWSCredentials
@@ -728,6 +865,767 @@ router.get("/dashboard/stats", requireSuperAdminAuth, async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to fetch dashboard stats",
+      error: error.message,
+    });
+  }
+});
+
+router.get("/analytics", requireSuperAdminAuth, async (req, res) => {
+  try {
+    const now = new Date();
+    const last24Hours = new Date(now.getTime() - 24 * HOUR_IN_MS);
+    const last7Days = new Date(now.getTime() - 7 * DAY_IN_MS);
+    const last30Days = new Date(now.getTime() - 30 * DAY_IN_MS);
+
+    const dailyBuckets = buildDailyBuckets(7, now);
+    const hourlyBuckets = buildHourlyBuckets(24, now);
+    const daySeriesStart = dailyBuckets[0]?.start || last7Days;
+    const hourSeriesStart = hourlyBuckets[0]?.start || last24Hours;
+
+    const patientRoleFilter = { role: { $in: ["PATIENT", null] } };
+    const superAdminNotificationMatch = {
+      type: "system",
+      "data.type": "SUPERADMIN_NOTIFICATION",
+      "data.broadcastId": { $exists: true, $ne: "" },
+    };
+
+    const [
+      patientCount,
+      doctorCount,
+      adminCount,
+      activePatients,
+      activeDoctors,
+      activeAdmins,
+      blockedPatients,
+      blockedDoctors,
+      blockedAdmins,
+      newPatients24h,
+      newDoctors24h,
+      newAdmins24h,
+      newPatients7d,
+      newDoctors7d,
+      newAdmins7d,
+      appointmentsTotal,
+      appointmentsUpcoming,
+      appointmentsCompleted7d,
+      appointmentStatusRows,
+      sessionsTotal,
+      sessionsActive,
+      sessionsAccepted7d,
+      sessionStatusRows,
+      documentsTotal,
+      documentsUploaded7d,
+      totalAds,
+      activeAds,
+      totalProducts,
+      activeProducts,
+      adClicks24h,
+      adClicks7d,
+      adClicksByPlatformRows,
+      adClicksBySurfaceRows,
+      topAdsRows,
+      orderSummaryRows,
+      globalConfig,
+      notifications24h,
+      notifications7d,
+      notificationsRead7d,
+      notificationBroadcasts24hRows,
+      notificationBroadcasts7dRows,
+      notificationByRoleRows,
+      sosOpenCount,
+      sos24h,
+      sosResolved7d,
+      activityActionRows,
+      registrationPatientsRows,
+      registrationDoctorsRows,
+      registrationAdminsRows,
+      appointmentsDailyRows,
+      sessionsDailyRows,
+      notificationsDailyRows,
+      adClicksDailyRows,
+      sosDailyRows,
+      notificationsHourlyRows,
+    ] = await Promise.all([
+      User.countDocuments(patientRoleFilter),
+      DoctorUser.countDocuments({}),
+      AdminUser.countDocuments({}),
+      User.countDocuments({
+        ...patientRoleFilter,
+        ...buildLegacyStatusQuery("ACTIVE"),
+      }),
+      DoctorUser.countDocuments(buildLegacyStatusQuery("ACTIVE")),
+      AdminUser.countDocuments(buildLegacyStatusQuery("ACTIVE")),
+      User.countDocuments({
+        ...patientRoleFilter,
+        ...buildLegacyStatusQuery("BLOCKED"),
+      }),
+      DoctorUser.countDocuments(buildLegacyStatusQuery("BLOCKED")),
+      AdminUser.countDocuments(buildLegacyStatusQuery("BLOCKED")),
+      User.countDocuments({
+        ...patientRoleFilter,
+        createdAt: { $gte: last24Hours },
+      }),
+      DoctorUser.countDocuments({ createdAt: { $gte: last24Hours } }),
+      AdminUser.countDocuments({ createdAt: { $gte: last24Hours } }),
+      User.countDocuments({
+        ...patientRoleFilter,
+        createdAt: { $gte: last7Days },
+      }),
+      DoctorUser.countDocuments({ createdAt: { $gte: last7Days } }),
+      AdminUser.countDocuments({ createdAt: { $gte: last7Days } }),
+      Appointment.countDocuments({}),
+      Appointment.countDocuments({
+        appointmentDate: { $gte: now },
+        status: { $in: ["scheduled", "confirmed", "rescheduled"] },
+      }),
+      Appointment.countDocuments({
+        status: "completed",
+        updatedAt: { $gte: last7Days },
+      }),
+      Appointment.aggregate([
+        { $group: { _id: "$status", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+      ]),
+      Session.countDocuments({}),
+      Session.countDocuments({
+        status: "accepted",
+        isActive: true,
+        expiresAt: { $gte: now },
+      }),
+      Session.countDocuments({
+        status: "accepted",
+        createdAt: { $gte: last7Days },
+      }),
+      Session.aggregate([
+        { $group: { _id: "$status", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+      ]),
+      Document.countDocuments({}),
+      Document.countDocuments({
+        $or: [
+          { createdAt: { $gte: last7Days } },
+          { uploadedAt: { $gte: last7Days } },
+        ],
+      }),
+      Advertisement.countDocuments({}),
+      Advertisement.countDocuments({
+        isActive: true,
+        startDate: { $lte: now },
+        endDate: { $gte: now },
+      }),
+      Product.countDocuments({}),
+      Product.countDocuments({ isActive: true }),
+      AdvertisementClickLog.countDocuments({ createdAt: { $gte: last24Hours } }),
+      AdvertisementClickLog.countDocuments({ createdAt: { $gte: last7Days } }),
+      AdvertisementClickLog.aggregate([
+        { $match: { createdAt: { $gte: last7Days } } },
+        { $group: { _id: "$platform", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+      ]),
+      AdvertisementClickLog.aggregate([
+        { $match: { createdAt: { $gte: last7Days } } },
+        { $group: { _id: "$surface", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+      ]),
+      AdvertisementClickLog.aggregate([
+        { $match: { createdAt: { $gte: last7Days } } },
+        { $group: { _id: "$advertisementId", clicks: { $sum: 1 } } },
+        { $sort: { clicks: -1 } },
+        { $limit: 5 },
+        {
+          $lookup: {
+            from: "advertisements",
+            localField: "_id",
+            foreignField: "_id",
+            as: "advertisement",
+          },
+        },
+        {
+          $unwind: {
+            path: "$advertisement",
+            preserveNullAndEmptyArrays: true,
+          },
+        },
+      ]),
+      InventoryOrder.aggregate([
+        {
+          $group: {
+            _id: null,
+            totalOrders: { $sum: 1 },
+            completedOrders: {
+              $sum: {
+                $cond: [{ $eq: ["$orderStatus", "COMPLETED"] }, 1, 0],
+              },
+            },
+            pendingOrders: {
+              $sum: {
+                $cond: [{ $eq: ["$orderStatus", "PENDING"] }, 1, 0],
+              },
+            },
+            grossSales: {
+              $sum: {
+                $cond: [{ $gt: ["$total", 0] }, "$total", 0],
+              },
+            },
+          },
+        },
+      ]),
+      UIConfig.findOne({ key: "GLOBAL" })
+        .select("dashboardAlerts")
+        .lean(),
+      Notification.countDocuments({
+        ...superAdminNotificationMatch,
+        createdAt: { $gte: last24Hours },
+      }),
+      Notification.countDocuments({
+        ...superAdminNotificationMatch,
+        createdAt: { $gte: last7Days },
+      }),
+      Notification.countDocuments({
+        ...superAdminNotificationMatch,
+        createdAt: { $gte: last7Days },
+        read: true,
+      }),
+      Notification.aggregate([
+        {
+          $match: {
+            ...superAdminNotificationMatch,
+            createdAt: { $gte: last24Hours },
+          },
+        },
+        { $group: { _id: "$data.broadcastId" } },
+      ]),
+      Notification.aggregate([
+        {
+          $match: {
+            ...superAdminNotificationMatch,
+            createdAt: { $gte: last7Days },
+          },
+        },
+        { $group: { _id: "$data.broadcastId" } },
+      ]),
+      Notification.aggregate([
+        {
+          $match: {
+            ...superAdminNotificationMatch,
+            createdAt: { $gte: last7Days },
+          },
+        },
+        {
+          $group: {
+            _id: "$recipientRole",
+            total: { $sum: 1 },
+            read: {
+              $sum: {
+                $cond: [{ $eq: ["$read", true] }, 1, 0],
+              },
+            },
+          },
+        },
+        { $sort: { total: -1 } },
+      ]),
+      SosEvent.countDocuments({ status: { $in: ["open", "in_progress"] } }),
+      SosEvent.countDocuments({ createdAt: { $gte: last24Hours } }),
+      SosEvent.countDocuments({
+        status: "resolved",
+        updatedAt: { $gte: last7Days },
+      }),
+      SuperAdminActivityLog.aggregate([
+        { $match: { createdAt: { $gte: last30Days } } },
+        { $group: { _id: "$action", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 10 },
+      ]),
+      User.aggregate([
+        {
+          $match: {
+            ...patientRoleFilter,
+            createdAt: { $gte: daySeriesStart },
+          },
+        },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: "%Y-%m-%d",
+                date: "$createdAt",
+                timezone: "UTC",
+              },
+            },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+      DoctorUser.aggregate([
+        { $match: { createdAt: { $gte: daySeriesStart } } },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: "%Y-%m-%d",
+                date: "$createdAt",
+                timezone: "UTC",
+              },
+            },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+      AdminUser.aggregate([
+        { $match: { createdAt: { $gte: daySeriesStart } } },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: "%Y-%m-%d",
+                date: "$createdAt",
+                timezone: "UTC",
+              },
+            },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+      Appointment.aggregate([
+        { $match: { createdAt: { $gte: daySeriesStart } } },
+        {
+          $group: {
+            _id: {
+              day: {
+                $dateToString: {
+                  format: "%Y-%m-%d",
+                  date: "$createdAt",
+                  timezone: "UTC",
+                },
+              },
+              status: "$status",
+            },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+      Session.aggregate([
+        { $match: { createdAt: { $gte: daySeriesStart } } },
+        {
+          $group: {
+            _id: {
+              day: {
+                $dateToString: {
+                  format: "%Y-%m-%d",
+                  date: "$createdAt",
+                  timezone: "UTC",
+                },
+              },
+              status: "$status",
+            },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+      Notification.aggregate([
+        {
+          $match: {
+            ...superAdminNotificationMatch,
+            createdAt: { $gte: daySeriesStart },
+          },
+        },
+        {
+          $group: {
+            _id: {
+              day: {
+                $dateToString: {
+                  format: "%Y-%m-%d",
+                  date: "$createdAt",
+                  timezone: "UTC",
+                },
+              },
+              broadcastId: "$data.broadcastId",
+            },
+            sent: { $sum: 1 },
+            read: {
+              $sum: {
+                $cond: [{ $eq: ["$read", true] }, 1, 0],
+              },
+            },
+          },
+        },
+        {
+          $group: {
+            _id: "$_id.day",
+            sent: { $sum: "$sent" },
+            read: { $sum: "$read" },
+            broadcasts: { $sum: 1 },
+          },
+        },
+      ]),
+      AdvertisementClickLog.aggregate([
+        { $match: { createdAt: { $gte: daySeriesStart } } },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: "%Y-%m-%d",
+                date: "$createdAt",
+                timezone: "UTC",
+              },
+            },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+      SosEvent.aggregate([
+        { $match: { createdAt: { $gte: daySeriesStart } } },
+        {
+          $group: {
+            _id: {
+              day: {
+                $dateToString: {
+                  format: "%Y-%m-%d",
+                  date: "$createdAt",
+                  timezone: "UTC",
+                },
+              },
+              status: "$status",
+            },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+      Notification.aggregate([
+        {
+          $match: {
+            ...superAdminNotificationMatch,
+            createdAt: { $gte: hourSeriesStart },
+          },
+        },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: "%Y-%m-%dT%H:00",
+                date: "$createdAt",
+                timezone: "UTC",
+              },
+            },
+            sent: { $sum: 1 },
+            read: {
+              $sum: {
+                $cond: [{ $eq: ["$read", true] }, 1, 0],
+              },
+            },
+          },
+        },
+      ]),
+    ]);
+
+    const alerts = Array.isArray(globalConfig?.dashboardAlerts)
+      ? globalConfig.dashboardAlerts
+      : [];
+    const alertAudienceCounts = {};
+    let activeAlertCount = 0;
+    let alertsPublished24h = 0;
+    let alertsPublished7d = 0;
+
+    for (const alert of alerts) {
+      if (!alert || alert.isActive === false) continue;
+      const publishedAt =
+        toDateSafe(alert.createdAt) || toDateSafe(alert.startAt) || null;
+      const expiry = toDateSafe(alert.endAt);
+      const isActiveNow = !expiry || expiry >= now;
+      if (isActiveNow) activeAlertCount += 1;
+      if (publishedAt && publishedAt >= last24Hours) alertsPublished24h += 1;
+      if (publishedAt && publishedAt >= last7Days) alertsPublished7d += 1;
+      const audience = normalizeAlertAudience(alert.audience || "ALL");
+      alertAudienceCounts[audience] = (alertAudienceCounts[audience] || 0) + 1;
+    }
+
+    const registrationPatientsMap = indexByKey(registrationPatientsRows);
+    const registrationDoctorsMap = indexByKey(registrationDoctorsRows);
+    const registrationAdminsMap = indexByKey(registrationAdminsRows);
+    const adClicksDailyMap = indexByKey(adClicksDailyRows);
+
+    const appointmentsByDay = appointmentsDailyRows.reduce((accumulator, row) => {
+      const day = String(row?._id?.day || "");
+      const status = String(row?._id?.status || "unknown");
+      if (!day) return accumulator;
+      if (!accumulator[day]) accumulator[day] = {};
+      accumulator[day][status] = Number(row?.count || 0);
+      return accumulator;
+    }, {});
+
+    const sessionsByDay = sessionsDailyRows.reduce((accumulator, row) => {
+      const day = String(row?._id?.day || "");
+      const status = String(row?._id?.status || "unknown");
+      if (!day) return accumulator;
+      if (!accumulator[day]) accumulator[day] = {};
+      accumulator[day][status] = Number(row?.count || 0);
+      return accumulator;
+    }, {});
+
+    const notificationsByDay = notificationsDailyRows.reduce(
+      (accumulator, row) => {
+        if (!row?._id) return accumulator;
+        accumulator[String(row._id)] = {
+          sent: Number(row.sent || 0),
+          read: Number(row.read || 0),
+          broadcasts: Number(row.broadcasts || 0),
+        };
+        return accumulator;
+      },
+      {}
+    );
+
+    const sosByDay = sosDailyRows.reduce((accumulator, row) => {
+      const day = String(row?._id?.day || "");
+      const status = String(row?._id?.status || "unknown");
+      if (!day) return accumulator;
+      if (!accumulator[day]) accumulator[day] = {};
+      accumulator[day][status] = Number(row?.count || 0);
+      return accumulator;
+    }, {});
+
+    const notificationsByHour = notificationsHourlyRows.reduce(
+      (accumulator, row) => {
+        if (!row?._id) return accumulator;
+        accumulator[String(row._id)] = {
+          sent: Number(row.sent || 0),
+          read: Number(row.read || 0),
+        };
+        return accumulator;
+      },
+      {}
+    );
+
+    const registrationsLast7Days = dailyBuckets.map(({ key }) => {
+      const patients = Number(registrationPatientsMap[key] || 0);
+      const doctors = Number(registrationDoctorsMap[key] || 0);
+      const admins = Number(registrationAdminsMap[key] || 0);
+      return {
+        date: key,
+        patients,
+        doctors,
+        admins,
+        total: patients + doctors + admins,
+      };
+    });
+
+    const appointmentsLast7Days = dailyBuckets.map(({ key }) => {
+      const bucket = appointmentsByDay[key] || {};
+      const scheduled =
+        Number(bucket.scheduled || 0) +
+        Number(bucket.confirmed || 0) +
+        Number(bucket.rescheduled || 0);
+      const completed = Number(bucket.completed || 0);
+      const cancelled =
+        Number(bucket.cancelled || 0) + Number(bucket["no-show"] || 0);
+      const total = Object.values(bucket).reduce(
+        (sum, value) => sum + Number(value || 0),
+        0
+      );
+      return {
+        date: key,
+        scheduled,
+        completed,
+        cancelled,
+        total,
+      };
+    });
+
+    const sessionsLast7Days = dailyBuckets.map(({ key }) => {
+      const bucket = sessionsByDay[key] || {};
+      const pending = Number(bucket.pending || 0);
+      const accepted = Number(bucket.accepted || 0);
+      const declined = Number(bucket.declined || 0);
+      const ended = Number(bucket.ended || 0);
+      return {
+        date: key,
+        pending,
+        accepted,
+        declined,
+        ended,
+        total: pending + accepted + declined + ended,
+      };
+    });
+
+    const notificationsLast7Days = dailyBuckets.map(({ key }) => {
+      const bucket = notificationsByDay[key] || {
+        sent: 0,
+        read: 0,
+        broadcasts: 0,
+      };
+      return {
+        date: key,
+        sent: Number(bucket.sent || 0),
+        read: Number(bucket.read || 0),
+        broadcasts: Number(bucket.broadcasts || 0),
+      };
+    });
+
+    const adClicksLast7Days = dailyBuckets.map(({ key }) => ({
+      date: key,
+      clicks: Number(adClicksDailyMap[key] || 0),
+    }));
+
+    const sosLast7Days = dailyBuckets.map(({ key }) => {
+      const bucket = sosByDay[key] || {};
+      const open =
+        Number(bucket.open || 0) + Number(bucket.in_progress || 0);
+      const resolved = Number(bucket.resolved || 0);
+      const total = Object.values(bucket).reduce(
+        (sum, value) => sum + Number(value || 0),
+        0
+      );
+      return {
+        date: key,
+        open,
+        resolved,
+        total,
+      };
+    });
+
+    const notificationsLast24Hours = hourlyBuckets.map(({ key }) => {
+      const bucket = notificationsByHour[key] || { sent: 0, read: 0 };
+      return {
+        hour: key,
+        sent: Number(bucket.sent || 0),
+        read: Number(bucket.read || 0),
+      };
+    });
+
+    const totalUsers = patientCount + doctorCount + adminCount;
+    const totalActiveUsers = activePatients + activeDoctors + activeAdmins;
+    const totalBlockedUsers = blockedPatients + blockedDoctors + blockedAdmins;
+
+    const orderSummary = orderSummaryRows[0] || {};
+    const notificationBroadcasts24h = notificationBroadcasts24hRows.length;
+    const notificationBroadcasts7d = notificationBroadcasts7dRows.length;
+
+    const appointmentStatus = appointmentStatusRows.map((row) => ({
+      status: String(row?._id || "unknown"),
+      count: Number(row?.count || 0),
+    }));
+    const sessionStatus = sessionStatusRows.map((row) => ({
+      status: String(row?._id || "unknown"),
+      count: Number(row?.count || 0),
+    }));
+    const adClicksByPlatform = adClicksByPlatformRows.map((row) => ({
+      platform: String(row?._id || "unknown").toLowerCase(),
+      count: Number(row?.count || 0),
+    }));
+    const adClicksBySurface = adClicksBySurfaceRows.map((row) => ({
+      surface: String(row?._id || "UNKNOWN"),
+      count: Number(row?.count || 0),
+    }));
+    const notificationsByRole = notificationByRoleRows.map((row) => {
+      const total = Number(row?.total || 0);
+      const read = Number(row?.read || 0);
+      const unread = Math.max(0, total - read);
+      return {
+        role: String(row?._id || "unknown"),
+        total,
+        read,
+        unread,
+        readRate: percent(read, total),
+      };
+    });
+    const alertsByAudience = Object.entries(alertAudienceCounts)
+      .map(([audience, count]) => ({
+        audience,
+        count: Number(count || 0),
+      }))
+      .sort((left, right) => right.count - left.count);
+
+    const topAds = topAdsRows.map((row) => ({
+      advertisementId: row?._id ? String(row._id) : "",
+      title: String(row?.advertisement?.title || "Untitled Ad"),
+      placement: String(row?.advertisement?.placement || "UNKNOWN"),
+      clicks: Number(row?.clicks || 0),
+    }));
+
+    const actionMix = activityActionRows.map((row) => ({
+      action: String(row?._id || "UNKNOWN"),
+      count: Number(row?.count || 0),
+    }));
+
+    return res.json({
+      success: true,
+      generatedAt: now.toISOString(),
+      refreshIntervalSeconds: 15,
+      kpis: {
+        users: {
+          total: totalUsers,
+          patients: patientCount,
+          doctors: doctorCount,
+          admins: adminCount,
+          active: totalActiveUsers,
+          blocked: totalBlockedUsers,
+          newLast24h: newPatients24h + newDoctors24h + newAdmins24h,
+          newLast7d: newPatients7d + newDoctors7d + newAdmins7d,
+        },
+        clinical: {
+          appointmentsTotal,
+          appointmentsUpcoming,
+          appointmentsCompletedLast7d: appointmentsCompleted7d,
+          sessionsTotal,
+          sessionsActive,
+          sessionsAcceptedLast7d: sessionsAccepted7d,
+          documentsTotal,
+          documentsUploadedLast7d: documentsUploaded7d,
+        },
+        communications: {
+          activeAlerts: activeAlertCount,
+          alertsPublishedLast24h: alertsPublished24h,
+          alertsPublishedLast7d: alertsPublished7d,
+          notificationsSentLast24h: notifications24h,
+          notificationsSentLast7d: notifications7d,
+          notificationBroadcastsLast24h: notificationBroadcasts24h,
+          notificationBroadcastsLast7d: notificationBroadcasts7d,
+          notificationReadRateLast7d: percent(notificationsRead7d, notifications7d),
+        },
+        commerce: {
+          adsTotal: totalAds,
+          adsActive: activeAds,
+          adClicksLast24h: adClicks24h,
+          adClicksLast7d: adClicks7d,
+          productsTotal: totalProducts,
+          productsActive: activeProducts,
+          ordersTotal: Number(orderSummary.totalOrders || 0),
+          ordersCompleted: Number(orderSummary.completedOrders || 0),
+          ordersPending: Number(orderSummary.pendingOrders || 0),
+          grossSales: Number(orderSummary.grossSales || 0),
+        },
+        safety: {
+          sosOpen: sosOpenCount,
+          sosRaisedLast24h: sos24h,
+          sosResolvedLast7d: sosResolved7d,
+        },
+      },
+      trends: {
+        registrationsLast7Days,
+        appointmentsLast7Days,
+        sessionsLast7Days,
+        notificationsLast7Days,
+        notificationsLast24Hours,
+        adClicksLast7Days,
+        sosLast7Days,
+      },
+      breakdowns: {
+        appointmentStatus,
+        sessionStatus,
+        notificationsByRole,
+        adClicksByPlatform,
+        adClicksBySurface,
+        alertsByAudience,
+      },
+      top: {
+        advertisements: topAds,
+        activityActions: actionMix,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch analytics",
       error: error.message,
     });
   }
@@ -1254,14 +2152,21 @@ router.post("/users", requireSuperAdminAuth, async (req, res) => {
       return res.status(201).json({ success: true, user: mapDoctor(doctor) });
     }
 
+    const requestedAdminRole = normalizeRole(req.body.adminRole || req.body.admin_role || req.body.role);
+    const adminRole = ADMIN_ROLES.includes(requestedAdminRole)
+      ? requestedAdminRole
+      : "PRODUCT_ADMIN";
     const adminPermissions = normalizePermissions(req.body.permissions);
     const admin = new AdminUser({
       name,
       email,
       password,
       assignedBy: req.superAdmin.email,
-      permissions: adminPermissions.length > 0 ? adminPermissions : ["MANAGE_USERS"],
-      role: "ADMIN",
+      role: adminRole,
+      permissions:
+        adminPermissions.length > 0
+          ? adminPermissions
+          : ROLE_PERMISSION_MAP[adminRole] || ROLE_PERMISSION_MAP.PRODUCT_ADMIN,
       status: "ACTIVE",
     });
     await admin.save();
@@ -1316,6 +2221,12 @@ router.put("/users/:role/:id", requireSuperAdminAuth, async (req, res) => {
     }
 
     if (role === "ADMIN") {
+      if (req.body.adminRole != null || req.body.role != null) {
+        const nextRole = normalizeRole(req.body.adminRole || req.body.role);
+        if (ADMIN_ROLES.includes(nextRole)) {
+          entity.role = nextRole;
+        }
+      }
       if (Array.isArray(req.body.permissions)) {
         const permissions = normalizePermissions(req.body.permissions);
         entity.permissions = permissions.length > 0 ? permissions : entity.permissions;
@@ -1442,6 +2353,10 @@ router.post("/admins", requireSuperAdminAuth, async (req, res) => {
       .trim()
       .toLowerCase();
     const password = String(req.body.password || "").trim();
+    const requestedAdminRole = normalizeRole(req.body.adminRole || req.body.admin_role || req.body.role);
+    const adminRole = ADMIN_ROLES.includes(requestedAdminRole)
+      ? requestedAdminRole
+      : "PRODUCT_ADMIN";
     const permissions = normalizePermissions(req.body.permissions);
 
     if (!name || !email || !password) {
@@ -1455,10 +2370,15 @@ router.post("/admins", requireSuperAdminAuth, async (req, res) => {
       name,
       email,
       password,
-      role: "ADMIN",
+      role: adminRole,
       status: "ACTIVE",
       assignedBy: req.superAdmin.email,
-      permissions: permissions.length > 0 ? permissions : ["MANAGE_USERS"],
+      permissions:
+        permissions.length > 0
+          ? permissions
+          : ROLE_PERMISSION_MAP[adminRole] || ROLE_PERMISSION_MAP.PRODUCT_ADMIN,
+      accessExpiresAt: req.body.accessExpiresAt ? new Date(req.body.accessExpiresAt) : null,
+      temporaryAccessReason: String(req.body.temporaryAccessReason || "").trim(),
     });
     await admin.save();
 
@@ -1494,7 +2414,20 @@ router.patch("/admins/:id/permissions", requireSuperAdminAuth, async (req, res) 
       return res.status(404).json({ success: false, message: "Admin not found" });
     }
 
+    if (req.body.role != null || req.body.adminRole != null) {
+      const nextRole = normalizeRole(req.body.role || req.body.adminRole);
+      if (ADMIN_ROLES.includes(nextRole)) {
+        admin.role = nextRole;
+      }
+    }
+
     admin.permissions = permissions;
+    if (typeof req.body.accessExpiresAt !== "undefined") {
+      admin.accessExpiresAt = req.body.accessExpiresAt ? new Date(req.body.accessExpiresAt) : null;
+    }
+    if (typeof req.body.temporaryAccessReason !== "undefined") {
+      admin.temporaryAccessReason = String(req.body.temporaryAccessReason || "").trim();
+    }
     await admin.save();
 
     await logActivity(req, {
@@ -1903,10 +2836,42 @@ router.delete("/advertisements/:id", requireSuperAdminAuth, async (req, res) => 
 // ---------------- PRODUCTS ----------------
 router.get("/products", requireSuperAdminAuth, async (req, res) => {
   try {
+    const search = String(req.query.search || "").trim();
     const category = String(req.query.category || "").trim();
+    const subCategory = String(req.query.subCategory || "").trim();
+    const availability = String(req.query.availability || "").trim().toUpperCase();
+    const isActive =
+      req.query.isActive == null ? null : toBoolean(req.query.isActive, true);
+    const page = Math.max(Number(req.query.page || 1), 1);
+    const limit = Math.min(Math.max(Number(req.query.limit || 20), 1), 100);
+
     const query = {};
     if (category) query.category = category;
-    const products = await Product.find(query).sort({ createdAt: -1 }).lean();
+    if (subCategory) query.subCategory = subCategory;
+    if (availability) query["inventory.availability"] = availability;
+    if (typeof isActive === "boolean") query.isActive = isActive;
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: "i" } },
+        { shortDescription: { $regex: search, $options: "i" } },
+        { category: { $regex: search, $options: "i" } },
+        { tags: { $regex: search, $options: "i" } },
+        { sku: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    const [products, total] = await Promise.all([
+      Product.find(query)
+        .select(
+          "name shortDescription category subCategory tags mrp sellingPrice discountPercent inventory media.thumbnail imageUrl isActive sku brand updatedAt createdAt geoScope targetCountries targetStates targetRegions"
+        )
+        .sort({ updatedAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      Product.countDocuments(query),
+    ]);
+
     const normalizedProducts = await Promise.all(
       products.map(async (product) => ({
         ...product,
@@ -1916,7 +2881,16 @@ router.get("/products", requireSuperAdminAuth, async (req, res) => {
         }),
       }))
     );
-    return res.json({ success: true, products: normalizedProducts });
+    return res.json({
+      success: true,
+      products: normalizedProducts,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
   } catch (error) {
     return res.status(500).json({
       success: false,
@@ -1926,28 +2900,97 @@ router.get("/products", requireSuperAdminAuth, async (req, res) => {
   }
 });
 
+router.get("/products/:id", requireSuperAdminAuth, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid product id",
+      });
+    }
+    const product = await Product.findById(req.params.id).lean();
+    if (!product) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+    const resolved = {
+      ...product,
+      imageUrl: await resolveStoredMediaUrl({
+        imageUrl: product.imageUrl,
+        imageKey: product.imageKey,
+      }),
+    };
+    return res.json({ success: true, product: resolved });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch product",
+      error: error.message,
+    });
+  }
+});
+
 router.post("/products", requireSuperAdminAuth, async (req, res) => {
   try {
     const geoTargets = normalizeGeoTargets(req.body);
-    const payload = {
-      name: String(req.body.name || "").trim(),
-      description: String(req.body.description || "").trim(),
-      price: Number(req.body.price || 0),
-      imageUrl: String(req.body.imageUrl || "").trim(),
-      imageKey: String(req.body.imageKey || "").trim(),
-      category: String(req.body.category || "").trim(),
-      ...geoTargets,
-      isActive: toBoolean(req.body.isActive, true),
-      createdBy: req.superAdmin.email,
-      updatedBy: req.superAdmin.email,
-    };
+    const media = normalizeMediaPayload(req.body);
+    const name = String(req.body.name || "").trim();
+    const category = String(req.body.category || "").trim();
+    const mrp = Number(req.body.mrp ?? req.body.price ?? 0);
+    const sellingPrice = Number(req.body.sellingPrice ?? req.body.price ?? 0);
 
-    if (!payload.name || !payload.category) {
+    if (!name || !category) {
       return res.status(400).json({
         success: false,
         message: "name and category are required",
       });
     }
+    if (!Number.isFinite(mrp) || !Number.isFinite(sellingPrice) || mrp < 0 || sellingPrice < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid pricing values",
+      });
+    }
+    if (sellingPrice > mrp && mrp > 0) {
+      return res.status(400).json({
+        success: false,
+        message: "sellingPrice cannot exceed MRP",
+      });
+    }
+
+    const payload = {
+      name,
+      shortDescription: String(req.body.shortDescription || req.body.description || "")
+        .trim()
+        .slice(0, 400),
+      fullDescription: sanitizeRichText(req.body.fullDescription || ""),
+      description: String(req.body.description || req.body.shortDescription || "").trim(),
+      mrp,
+      sellingPrice,
+      price: sellingPrice,
+      imageUrl: String(req.body.imageUrl || "").trim(),
+      imageKey: String(req.body.imageKey || "").trim(),
+      media,
+      category,
+      subCategory: String(req.body.subCategory || "").trim(),
+      tags: normalizeTags(req.body.tags),
+      inventory: {
+        stock: Math.max(0, Number(req.body.stock ?? req.body.inventory?.stock ?? 0)),
+        availability: String(
+          req.body.availability || req.body.inventory?.availability || "IN_STOCK"
+        )
+          .trim()
+          .toUpperCase(),
+      },
+      brand: String(req.body.brand || "").trim(),
+      sku: String(req.body.sku || "").trim().toUpperCase(),
+      expiryDate: req.body.expiryDate ? new Date(req.body.expiryDate) : null,
+      prescriptionRequired: toBoolean(req.body.prescriptionRequired, false),
+      customFields: normalizeCustomFields(req.body.customFields),
+      ...geoTargets,
+      isActive: toBoolean(req.body.isActive, true),
+      createdBy: req.superAdmin.email,
+      updatedBy: req.superAdmin.email,
+    };
 
     const product = await Product.create(payload);
     clearPublicConfigCache();
@@ -1989,17 +3032,79 @@ router.post("/products", requireSuperAdminAuth, async (req, res) => {
 
 router.put("/products/:id", requireSuperAdminAuth, async (req, res) => {
   try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid product id",
+      });
+    }
     const product = await Product.findById(req.params.id);
     if (!product) {
       return res.status(404).json({ success: false, message: "Product not found" });
     }
 
     if (req.body.name != null) product.name = String(req.body.name).trim();
+    if (req.body.shortDescription != null) {
+      product.shortDescription = String(req.body.shortDescription).trim().slice(0, 400);
+    }
+    if (req.body.fullDescription != null) {
+      product.fullDescription = sanitizeRichText(req.body.fullDescription);
+    }
     if (req.body.description != null) product.description = String(req.body.description).trim();
-    if (req.body.price != null) product.price = Number(req.body.price);
+    if (req.body.mrp != null) product.mrp = Number(req.body.mrp);
+    if (req.body.sellingPrice != null) product.sellingPrice = Number(req.body.sellingPrice);
+    if (req.body.price != null && req.body.sellingPrice == null) {
+      product.sellingPrice = Number(req.body.price);
+    }
     if (req.body.imageUrl != null) product.imageUrl = String(req.body.imageUrl).trim();
     if (req.body.imageKey != null) product.imageKey = String(req.body.imageKey).trim();
+    if (
+      req.body.media != null ||
+      req.body.thumbnail != null ||
+      req.body.images != null ||
+      req.body.video != null
+    ) {
+      const media = normalizeMediaPayload(req.body);
+      product.media = {
+        ...(product.media || {}),
+        ...media,
+      };
+    }
     if (req.body.category != null) product.category = String(req.body.category).trim();
+    if (req.body.subCategory != null) product.subCategory = String(req.body.subCategory).trim();
+    if (req.body.tags != null) product.tags = normalizeTags(req.body.tags);
+    if (req.body.brand != null) product.brand = String(req.body.brand).trim();
+    if (req.body.sku != null) product.sku = String(req.body.sku).trim().toUpperCase();
+    if (req.body.expiryDate != null) {
+      product.expiryDate = req.body.expiryDate ? new Date(req.body.expiryDate) : null;
+    }
+    if (req.body.prescriptionRequired != null) {
+      product.prescriptionRequired = toBoolean(
+        req.body.prescriptionRequired,
+        product.prescriptionRequired
+      );
+    }
+    if (req.body.customFields != null) {
+      product.customFields = normalizeCustomFields(req.body.customFields);
+    }
+    if (req.body.stock != null || req.body.inventory?.stock != null) {
+      const stock = Math.max(0, Number(req.body.stock ?? req.body.inventory?.stock ?? 0));
+      product.inventory = {
+        ...(product.inventory || {}),
+        stock,
+      };
+    }
+    if (req.body.availability != null || req.body.inventory?.availability != null) {
+      const availability = String(
+        req.body.availability || req.body.inventory?.availability || "IN_STOCK"
+      )
+        .trim()
+        .toUpperCase();
+      product.inventory = {
+        ...(product.inventory || {}),
+        availability,
+      };
+    }
     if (
       req.body.targetCountries != null ||
       req.body.targetStates != null ||
@@ -2016,6 +3121,17 @@ router.put("/products/:id", requireSuperAdminAuth, async (req, res) => {
     }
     if (req.body.isActive != null) {
       product.isActive = toBoolean(req.body.isActive, product.isActive);
+    }
+    if (
+      Number.isFinite(Number(product.mrp)) &&
+      Number.isFinite(Number(product.sellingPrice)) &&
+      Number(product.sellingPrice) > Number(product.mrp) &&
+      Number(product.mrp) > 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "sellingPrice cannot exceed MRP",
+      });
     }
     product.updatedBy = req.superAdmin.email;
     await product.save();
@@ -2052,6 +3168,12 @@ router.put("/products/:id", requireSuperAdminAuth, async (req, res) => {
 
 router.delete("/products/:id", requireSuperAdminAuth, async (req, res) => {
   try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid product id",
+      });
+    }
     const product = await Product.findById(req.params.id);
     if (!product) {
       return res.status(404).json({ success: false, message: "Product not found" });

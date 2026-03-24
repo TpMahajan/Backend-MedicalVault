@@ -42,6 +42,7 @@ A secure, production-ready Node.js backend with MongoDB, JWT authentication, and
    
    # JWT Configuration
    JWT_SECRET=your-super-secret-jwt-key-here
+   DATA_ENCRYPTION_KEY=replace-with-64-char-hex-key
    JWT_EXPIRES_IN=7d
    
    # Server Configuration
@@ -53,6 +54,11 @@ A secure, production-ready Node.js backend with MongoDB, JWT authentication, and
    FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nYour Private Key Here\n-----END PRIVATE KEY-----\n"
    FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxxxx@your-project.iam.gserviceaccount.com
    # ... other Firebase config
+   ```
+
+   Generate a valid encryption key:
+   ```bash
+   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
    ```
 
 4. **Start the server:**
@@ -107,6 +113,7 @@ Key routes:
 - `POST /superadmin/auth/login`
 - `GET /superadmin/auth/me`
 - `GET /superadmin/dashboard/stats`
+- `GET /superadmin/analytics`
 - `GET /superadmin/users`, `POST /superadmin/users`, `PUT /superadmin/users/:role/:id`, `PATCH /superadmin/users/:role/:id/status`, `DELETE /superadmin/users/:role/:id`
 - `GET /superadmin/admins`, `POST /superadmin/admins`, `PATCH /superadmin/admins/:id/permissions`, `PATCH /superadmin/admins/:id/status`
 - `GET /superadmin/advertisements`, `POST /superadmin/advertisements`, `PUT /superadmin/advertisements/:id`, `DELETE /superadmin/advertisements/:id`

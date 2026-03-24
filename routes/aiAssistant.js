@@ -9,8 +9,10 @@ import { AIChat } from "../models/AIChat.js";
 import DocumentReader from "../services/documentReader.js";
 import { ok, fail } from "../utils/apiResponse.js";
 import { canDoctorAccessPatient } from "../services/accessControl.js";
+import { aiLimiter } from "../middleware/rateLimit.js";
 
 const router = express.Router();
+router.use(aiLimiter);
 const documentReader = new DocumentReader();
 
 // Helper function to detect document-related queries

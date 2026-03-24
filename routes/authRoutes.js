@@ -4,8 +4,16 @@ import { User } from "../models/User.js";
 import rateLimit from "express-rate-limit";
 import { auth } from "../middleware/auth.js";
 import { authLimiter } from "../middleware/rateLimit.js";
+import {
+  doctorSignupValidation,
+  forgotPasswordValidation,
+  loginValidation,
+  registerValidation,
+  resetPasswordValidation,
+} from "../middleware/validation.js";
 import { getMe, updateMe } from "../controllers/authController.js";
 import { DoctorUser } from "../models/DoctorUser.js";  // doctor model
+import { AdminUser } from "../models/AdminUser.js";
 import bcrypt from "bcryptjs";
 import nodemailer from "nodemailer";
 import { OAuth2Client } from 'google-auth-library';
@@ -28,9 +36,18 @@ import {
   verifyRefreshToken,
 } from "../services/tokenService.js";
 import { RefreshToken } from "../models/RefreshToken.js";
+import {
+  isActorTemporarilyBlocked,
+  monitorFailedLogin,
+  monitorSuspiciousSession,
+} from "../services/securityMonitorService.js";
 
 const router = express.Router();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+const isProduction = String(process.env.NODE_ENV || "").toLowerCase() === "production";
+const safeLog = (...args) => {
+  if (!isProduction) console.log(...args);
+};
 
 // Rate limiters for email-related endpoints (must be defined before routes)
 const emailLimiter = rateLimit({
@@ -50,18 +67,119 @@ const codeLimiter = rateLimit({
 const ENABLE_DEBUG_ROUTES =
   String(process.env.ENABLE_DEBUG_ROUTES || "false").toLowerCase() === "true";
 
+const RESETTABLE_ACCOUNT_DEFINITIONS = [
+  { role: "patient", model: User, displayName: "Patient" },
+  { role: "doctor", model: DoctorUser, displayName: "Doctor" },
+  { role: "admin", model: AdminUser, displayName: "Admin" },
+];
+
+const resolveResettableAccountByEmail = async (email) => {
+  const normalizedEmail = String(email || "").toLowerCase().trim();
+  for (const entry of RESETTABLE_ACCOUNT_DEFINITIONS) {
+    const account = await entry.model.findOne({ email: normalizedEmail });
+    if (account) {
+      return { ...entry, account };
+    }
+  }
+  return null;
+};
+
+const resolveResettableAccountByTokenPayload = async (payload) => {
+  const role = String(payload?.role || "").toLowerCase().trim() || "patient";
+  const userId = String(payload?.userId || payload?.sub || "").trim();
+  if (!userId) return null;
+
+  const roleDefinition = RESETTABLE_ACCOUNT_DEFINITIONS.find(
+    (entry) => entry.role === role
+  );
+  if (!roleDefinition) return null;
+
+  const account = await roleDefinition.model.findById(userId);
+  if (!account) return null;
+  return { ...roleDefinition, account };
+};
+
+const resolveAllowMultiSession = async ({ principalId, role }) => {
+  const normalizedRole = String(role || "").toLowerCase();
+
+  if (normalizedRole === "doctor") {
+    const doctor = await DoctorUser.findById(principalId)
+      .select("securitySettings.allowMultiSession")
+      .lean();
+    return doctor?.securitySettings?.allowMultiSession !== false;
+  }
+
+  const user = await User.findById(principalId)
+    .select("securitySettings.allowMultiSession")
+    .lean();
+  return user?.securitySettings?.allowMultiSession !== false;
+};
+
 const persistRefreshToken = async (req, principalId, role, refreshToken, refreshMeta) => {
   const decoded = verifyRefreshToken(refreshToken);
   const expiresAt = new Date((decoded.exp || 0) * 1000);
+  const roleKey = String(role).toLowerCase();
+  const allowMultiSession = await resolveAllowMultiSession({
+    principalId,
+    role: roleKey,
+  });
+
+  if (!allowMultiSession) {
+    await RefreshToken.updateMany(
+      {
+        principalId: String(principalId),
+        role: roleKey,
+        revokedAt: null,
+        expiresAt: { $gt: new Date() },
+      },
+      { $set: { revokedAt: new Date(), revokedReason: "single_session_enforced" } }
+    );
+  }
+
+  const existingActiveSession = allowMultiSession
+    ? await RefreshToken.findOne({
+        principalId: String(principalId),
+        role: roleKey,
+        revokedAt: null,
+        expiresAt: { $gt: new Date() },
+      })
+        .sort({ createdAt: -1 })
+        .select("createdByIp deviceInfo userAgent")
+        .lean()
+    : null;
+
+  const incomingDevice = String(req.headers["sec-ch-ua-platform"] || req.headers["x-device-info"] || "");
+  const incomingIp = req.ip || "";
+  if (
+    existingActiveSession &&
+    ((incomingDevice && existingActiveSession.deviceInfo && incomingDevice !== existingActiveSession.deviceInfo) ||
+      (incomingIp && existingActiveSession.createdByIp && incomingIp !== existingActiveSession.createdByIp))
+  ) {
+    await monitorSuspiciousSession({
+      actorEmail: req.body?.email || "",
+      actorRole: roleKey,
+      ipAddress: incomingIp,
+      userAgent: req.headers["user-agent"] || "",
+      metadata: {
+        previousDevice: existingActiveSession.deviceInfo || "",
+        previousIp: existingActiveSession.createdByIp || "",
+        newDevice: incomingDevice,
+        newIp: incomingIp,
+      },
+    });
+  }
+
   await RefreshToken.create({
     principalId: String(principalId),
-    role: String(role).toLowerCase(),
+    role: roleKey,
     tokenHash: hashToken(refreshToken),
     familyId: refreshMeta.familyId,
     jti: refreshMeta.jti,
     expiresAt,
     createdByIp: req.ip || "",
     userAgent: req.headers["user-agent"] || "",
+    deviceInfo: String(req.headers["sec-ch-ua-platform"] || req.headers["x-device-info"] || ""),
+    lastActiveAt: new Date(),
   });
 };
 
@@ -102,12 +220,22 @@ const profilePhotoUpload = multer({
     },
   }),
   limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const mimeType = String(file.mimetype || "").toLowerCase();
+    if (!mimeType.startsWith("image/")) {
+      return cb(new Error("Only image files are allowed"));
+    }
+    return cb(null, true);
+  },
 });
 
 // ================= Patient Signup =================
-router.post("/signup", async (req, res) => {
+router.post("/signup", registerValidation, async (req, res) => {
   try {
     const { name, email, password, mobile } = req.body;
+    if (typeof req.body?.role !== "undefined") {
+      return res.status(400).json({ success: false, message: "Role is not accepted in patient signup" });
+    }
 
     if (!name || !email || !password || !mobile) {
       return res.status(400).json({ message: "Name, email, mobile, and password are required" });
@@ -153,7 +281,7 @@ router.post("/signup", async (req, res) => {
     // Send verification email
     try {
       await sendVerificationEmail(email.toLowerCase(), name, tokenId, verificationToken, code);
-      console.log("✅ Verification email sent to:", email.toLowerCase());
+      safeLog("Verification email sent");
     } catch (emailError) {
       console.error("❌ Failed to send verification email:", emailError);
       // Don't fail signup if email fails - user can resend
@@ -240,7 +368,7 @@ router.post("/google", async (req, res) => {
         emailVerified: true, // Google users are pre-verified
       });
       await user.save();
-      console.log("✅ New user created via Google:", email);
+      safeLog("New user created via Google");
     } else {
       // Update existing user's Google info if not set
       if (!user.googleId) {
@@ -259,7 +387,7 @@ router.post("/google", async (req, res) => {
       }
       user.lastLogin = new Date();
       await user.save();
-      console.log("✅ Existing user logged in via Google:", email);
+      safeLog("Existing user logged in via Google");
     }
 
     const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
@@ -291,19 +419,38 @@ router.post("/google", async (req, res) => {
 });
 
 // ================= Patient Login =================
-router.post("/login", authLimiter, async (req, res) => {
+router.post("/login", authLimiter, loginValidation, async (req, res) => {
   try {
     const { email, password } = req.body;
+    const blockState = await isActorTemporarilyBlocked({ actorEmail: email, actorRole: "patient" });
+    if (blockState.isBlocked) {
+      return res.status(429).json({ message: "Account temporarily blocked due to suspicious activity" });
+    }
 
     const user = await User.findOne({ email: email.toLowerCase() });
-    if (!user) return res.status(400).json({ message: "Invalid credentials" });
+    if (!user) {
+      await monitorFailedLogin({
+        actorEmail: email,
+        actorRole: "patient",
+        ipAddress: req.ip || "",
+        userAgent: req.headers["user-agent"] || "",
+        source: "patient_login",
+      });
+      return res.status(400).json({ message: "Invalid credentials" });
+    }
 
-    console.log("Login attempt:", { userId: user._id, email: user.email, hasStoredPassword: !!user.password });
-    
     const isValid = await user.comparePassword(password);
-    console.log("Password validation result:", { userId: user._id, isValid });
     
-    if (!isValid) return res.status(400).json({ message: "Invalid credentials" });
+    if (!isValid) {
+      await monitorFailedLogin({
+        actorEmail: email,
+        actorRole: "patient",
+        ipAddress: req.ip || "",
+        userAgent: req.headers["user-agent"] || "",
+        source: "patient_login",
+      });
+      return res.status(400).json({ message: "Invalid credentials" });
+    }
 
     const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
       principalId: user._id.toString(),
@@ -329,8 +476,11 @@ router.post("/login", authLimiter, async (req, res) => {
 });
 
 // ================= Doctor Signup =================
-router.post("/doctor/signup", async (req, res) => {
+router.post("/doctor/signup", doctorSignupValidation, async (req, res) => {
   try {
+    if (typeof req.body?.role !== "undefined") {
+      return res.status(400).json({ success: false, message: "Role cannot be set from client" });
+    }
     const { name, email, password, specialization } = req.body;
 
     if (!name || !email || !password || !specialization) {
@@ -378,12 +528,34 @@ router.post("/doctor/signup", async (req, res) => {
 router.post("/doctor/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
+    const blockState = await isActorTemporarilyBlocked({ actorEmail: email, actorRole: "doctor" });
+    if (blockState.isBlocked) {
+      return res.status(429).json({ message: "Account temporarily blocked due to suspicious activity" });
+    }
 
     const doctor = await DoctorUser.findOne({ email: email.toLowerCase() });
-    if (!doctor) return res.status(400).json({ message: "Invalid credentials" });
+    if (!doctor) {
+      await monitorFailedLogin({
+        actorEmail: email,
+        actorRole: "doctor",
+        ipAddress: req.ip || "",
+        userAgent: req.headers["user-agent"] || "",
+        source: "doctor_login",
+      });
+      return res.status(400).json({ message: "Invalid credentials" });
+    }
 
     const isValid = await doctor.comparePassword(password);
-    if (!isValid) return res.status(400).json({ message: "Invalid credentials" });
+    if (!isValid) {
+      await monitorFailedLogin({
+        actorEmail: email,
+        actorRole: "doctor",
+        ipAddress: req.ip || "",
+        userAgent: req.headers["user-agent"] || "",
+        source: "doctor_login",
+      });
+      return res.status(400).json({ message: "Invalid credentials" });
+    }
 
     const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
       principalId: doctor._id.toString(),
@@ -939,30 +1111,31 @@ if (process.env.SMTP_USER && process.env.SMTP_PASS) {
 }
 
 // POST /auth/forgot-password
-router.post("/forgot-password", emailLimiter, async (req, res) => {
+router.post("/forgot-password", emailLimiter, forgotPasswordValidation, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ success: false, message: "Email is required" });
 
-    const user = await User.findOne({ email: email.toLowerCase() });
-    if (!user) {
+    const resolved = await resolveResettableAccountByEmail(email);
+    if (!resolved) {
       // Respond generically to avoid user enumeration
       return res.json({ success: true, message: "If your email exists, a reset link has been sent." });
     }
 
-    // Allow password reset regardless of emailVerified status
+    const { account, role, displayName } = resolved;
 
     const expiresInMinutes = Number(process.env.RESET_TOKEN_EXPIRES_MIN || 30);
     const resetToken = jwt.sign(
-      { userId: user._id },
+      { userId: account._id, role },
       process.env.JWT_SECRET,
       { expiresIn: `${expiresInMinutes}m` }
     );
+    const resetTokenHash = hashToken(resetToken);
 
     const expiryDate = new Date(Date.now() + expiresInMinutes * 60 * 1000);
-    user.resetToken = resetToken;
-    user.resetTokenExpiry = expiryDate;
-    await user.save();
+    account.resetTokenHash = resetTokenHash;
+    account.resetTokenExpiry = expiryDate;
+    await account.save();
 
     const frontendUrl =
       process.env.FRONTEND_URL ||
@@ -976,17 +1149,22 @@ router.post("/forgot-password", emailLimiter, async (req, res) => {
     let emailSent = false;
     try {
       if (process.env.RESEND_API_KEY) {
-        await sendPasswordResetEmail(user.email, user.name, resetLink, expiresInMinutes);
+        await sendPasswordResetEmail(
+          account.email,
+          account.name || displayName,
+          resetLink,
+          expiresInMinutes
+        );
         emailSent = true;
       } else if (transporter.options.auth) {
         await transporter.sendMail({
           from: process.env.MAIL_FROM_SMTP || process.env.MAIL_FROM || process.env.SMTP_USER || "no-reply@medicalvault.app",
-          to: user.email,
-          subject: "🔐 Reset Your HealthVault Password",
+          to: account.email,
+          subject: `Reset Your HealthVault ${displayName} Password`,
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
               <h2 style="color: #4A90E2;">Password Reset Request</h2>
-              <p>Hello ${user.name},</p>
+              <p>Hello ${account.name || displayName},</p>
               <p>You requested a password reset for your HealthVault account.</p>
               <p>Click the button below to set a new password (valid for ${expiresInMinutes} minutes):</p>
               <div style="text-align: center; margin: 30px 0;">
@@ -1009,7 +1187,7 @@ router.post("/forgot-password", emailLimiter, async (req, res) => {
           `
         });
         emailSent = true;
-        console.log(`✅ Password reset email sent to: ${user.email}`);
+        safeLog("Password reset email sent");
       } else {
         console.error("❌ No email provider configured for password reset");
       }
@@ -1035,7 +1213,7 @@ router.post("/forgot-password", emailLimiter, async (req, res) => {
 });
 
 // POST /auth/reset-password
-router.post("/reset-password", async (req, res) => {
+router.post("/reset-password", resetPasswordValidation, async (req, res) => {
   try {
     const { token, newPassword } = req.body;
     if (!token || !newPassword) {
@@ -1050,25 +1228,25 @@ router.post("/reset-password", async (req, res) => {
     }
 
     // Token is valid, proceed with reset
-
-    const user = await User.findById(payload.userId);
-    if (!user || user.resetToken !== token) {
+    const resolved = await resolveResettableAccountByTokenPayload(payload);
+    if (!resolved) {
       return res.status(400).json({ success: false, message: "Invalid token" });
     }
 
-    if (!user.resetTokenExpiry || user.resetTokenExpiry.getTime() < Date.now()) {
+    const { account } = resolved;
+    if (account.resetTokenHash !== hashToken(token)) {
+      return res.status(400).json({ success: false, message: "Invalid token" });
+    }
+
+    if (!account.resetTokenExpiry || account.resetTokenExpiry.getTime() < Date.now()) {
       return res.status(400).json({ success: false, message: "Token expired" });
     }
 
-    console.log("Password reset - before hash:", { userId: user._id, newPasswordLength: newPassword.length });
-    
     // Set the new password - the pre-save hook will hash it automatically
-    user.password = newPassword;
-    user.resetToken = null;
-    user.resetTokenExpiry = null;
-    await user.save();
-    
-    console.log("Password reset - after save:", { userId: user._id, passwordHashed: true });
+    account.password = newPassword;
+    account.resetTokenHash = null;
+    account.resetTokenExpiry = null;
+    await account.save();
 
     res.json({ success: true, message: "Password has been reset successfully" });
   } catch (error) {
@@ -1095,18 +1273,65 @@ router.post("/change-password", auth, async (req, res) => {
     const matches = await user.comparePassword(oldPassword);
     if (!matches) return res.status(400).json({ success: false, message: "Old password is incorrect" });
 
-    console.log("Password change - before hash:", { userId: user._id, newPasswordLength: newPassword.length });
-    
     // Set the new password - the pre-save hook will hash it automatically
     user.password = newPassword;
     await user.save();
-    
-    console.log("Password change - after save:", { userId: user._id, passwordHashed: true });
 
     res.json({ success: true, message: "Password changed successfully" });
   } catch (error) {
     console.error("Change password error:", error);
     res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+// ================= Consent Logging =================
+// POST /auth/consent
+router.post("/consent", auth, async (req, res) => {
+  try {
+    const userId = req.user?._id || req.auth?.id;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    const consentType = String(req.body?.consentType || "").trim().toUpperCase();
+    const version = String(req.body?.version || "").trim();
+    if (!["PRIVACY_POLICY", "TERMS_OF_SERVICE"].includes(consentType) || !version) {
+      return res.status(400).json({
+        success: false,
+        message: "consentType (PRIVACY_POLICY|TERMS_OF_SERVICE) and version are required",
+      });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const existingIdx = Array.isArray(user.consents)
+      ? user.consents.findIndex(
+          (entry) =>
+            String(entry?.consentType || "").toUpperCase() === consentType &&
+            String(entry?.version || "") === version
+        )
+      : -1;
+
+    const payload = {
+      consentType,
+      version,
+      acceptedAt: new Date(),
+      ipAddress: req.ip || "",
+      userAgent: req.headers["user-agent"] || "",
+    };
+
+    if (existingIdx >= 0) {
+      user.consents[existingIdx] = payload;
+    } else {
+      user.consents = [...(user.consents || []), payload];
+    }
+    await user.save();
+
+    return res.json({ success: true, message: "Consent logged successfully", consent: payload });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to log consent" });
   }
 });
 
@@ -1146,21 +1371,9 @@ router.post("/user/set-password", auth, async (req, res) => {
       });
     }
 
-    console.log("Setting password for user:", { 
-      userId: user._id, 
-      email: user.email,
-      loginType: user.loginType,
-      passwordLength: password.length 
-    });
-
     // Set the new password - the pre-save hook will hash it automatically
     user.password = password;
     await user.save();
-
-    console.log("Password set successfully:", { 
-      userId: user._id, 
-      passwordHashed: true 
-    });
 
     res.json({ 
       success: true, 
@@ -1175,3 +1388,4 @@ router.post("/user/set-password", auth, async (req, res) => {
     });
   }
 });
+

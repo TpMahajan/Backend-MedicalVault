@@ -1,6 +1,48 @@
 import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
 
+export const ADMIN_ROLES = [
+  "SUPER_ADMIN",
+  "PRODUCT_ADMIN",
+  "SOS_ADMIN",
+  "SUPPORT_ADMIN",
+  "USER_ADMIN",
+];
+
+export const ADMIN_PERMISSIONS = [
+  "MANAGE_PRODUCTS",
+  "MANAGE_ORDERS",
+  "VIEW_SOS",
+  "HANDLE_SOS",
+  "VIEW_TICKETS",
+  "REPLY_TICKETS",
+  "VIEW_AUDIT_LOGS",
+  "VIEW_SECURITY_ALERTS",
+];
+
+export const ROLE_PERMISSION_MAP = {
+  SUPER_ADMIN: [...ADMIN_PERMISSIONS],
+  PRODUCT_ADMIN: ["MANAGE_PRODUCTS", "MANAGE_ORDERS"],
+  SOS_ADMIN: ["VIEW_SOS", "HANDLE_SOS"],
+  SUPPORT_ADMIN: ["VIEW_TICKETS", "REPLY_TICKETS"],
+  USER_ADMIN: ["VIEW_AUDIT_LOGS", "VIEW_SECURITY_ALERTS"],
+};
+
+const normalizePermissions = (input) => {
+  if (!Array.isArray(input)) return [];
+  return [...new Set(
+    input
+      .map((entry) => String(entry || "").trim().toUpperCase())
+      .filter((entry) => ADMIN_PERMISSIONS.includes(entry))
+  )];
+};
+
+const normalizeRole = (value) => {
+  const role = String(value || "").trim().toUpperCase();
+  if (role === "ADMIN") return "PRODUCT_ADMIN";
+  return ADMIN_ROLES.includes(role) ? role : "PRODUCT_ADMIN";
+};
+
 const AdminUserSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true, maxlength: 50 },
@@ -20,8 +62,9 @@ const AdminUserSchema = new mongoose.Schema(
     isActive: { type: Boolean, default: true },
     role: {
       type: String,
-      enum: ["ADMIN"],
-      default: "ADMIN",
+      enum: ADMIN_ROLES,
+      default: "PRODUCT_ADMIN",
+      set: normalizeRole,
       uppercase: true,
       trim: true,
     },
@@ -43,15 +86,13 @@ const AdminUserSchema = new mongoose.Schema(
     },
     permissions: {
       type: [String],
-      default: ["MANAGE_USERS"],
-      enum: [
-        "MANAGE_USERS",
-        "MANAGE_ADS",
-        "MANAGE_PRODUCTS",
-        "MANAGE_ALERTS",
-        "MANAGE_NOTIFICATIONS",
-      ],
+      default: ROLE_PERMISSION_MAP.PRODUCT_ADMIN,
+      enum: ADMIN_PERMISSIONS,
     },
+    resetTokenHash: { type: String, default: null },
+    resetTokenExpiry: { type: Date, default: null },
+    accessExpiresAt: { type: Date, default: null, index: true },
+    temporaryAccessReason: { type: String, default: "", trim: true, maxlength: 240 },
   },
   {
     timestamps: true,
@@ -64,6 +105,17 @@ const AdminUserSchema = new mongoose.Schema(
     },
   }
 );
+
+AdminUserSchema.pre("validate", function (next) {
+  this.role = normalizeRole(this.role);
+  const roleDefaults = ROLE_PERMISSION_MAP[this.role] || [];
+  const current = normalizePermissions(this.permissions);
+  this.permissions =
+    this.role === "SUPER_ADMIN"
+      ? roleDefaults
+      : [...new Set([...roleDefaults, ...current])];
+  next();
+});
 
 AdminUserSchema.pre("save", function (next) {
   if (this.isModified("status")) {

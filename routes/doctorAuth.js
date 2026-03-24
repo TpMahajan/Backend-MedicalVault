@@ -5,6 +5,8 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import { DoctorUser } from "../models/DoctorUser.js";
+import { User } from "../models/User.js";
+import { Appointment } from "../models/Appointment.js";
 import { auth } from "../middleware/auth.js";
 import { authLimiter } from "../middleware/rateLimit.js";
 import s3Client, { BUCKET_NAME, REGION } from "../config/s3.js";
@@ -19,6 +21,11 @@ import {
   verifyRefreshToken,
 } from "../services/tokenService.js";
 import { RefreshToken } from "../models/RefreshToken.js";
+import {
+  isActorTemporarilyBlocked,
+  monitorFailedLogin,
+  monitorSuspiciousSession,
+} from "../services/securityMonitorService.js";
 
 // Helper: build avatar URL (handles both S3 keys and local paths)
 const buildSignedAvatarUrl = async (avatarValue) => {
@@ -98,13 +105,69 @@ const upload = multer({
   }
 });
 
-console.log(`📸 Avatar upload configured: ${hasAWSCredentials ? 'AWS S3' : 'Local Storage'}`);
+if (String(process.env.NODE_ENV || "").toLowerCase() !== "production") {
+  console.log(`Avatar upload configured: ${hasAWSCredentials ? "AWS S3" : "Local Storage"}`);
+}
 
 const router = express.Router();
+
+const resolveAllowMultiSession = async (doctorId) => {
+  const doctor = await DoctorUser.findById(doctorId)
+    .select("securitySettings.allowMultiSession")
+    .lean();
+  return doctor?.securitySettings?.allowMultiSession !== false;
+};
 
 const persistRefreshToken = async (req, doctorId, refreshToken, refreshMeta) => {
   const decoded = verifyRefreshToken(refreshToken);
   const expiresAt = new Date((decoded.exp || 0) * 1000);
+  const allowMultiSession = await resolveAllowMultiSession(doctorId);
+
+  if (!allowMultiSession) {
+    await RefreshToken.updateMany(
+      {
+        principalId: String(doctorId),
+        role: "doctor",
+        revokedAt: null,
+        expiresAt: { $gt: new Date() },
+      },
+      { $set: { revokedAt: new Date(), revokedReason: "single_session_enforced" } }
+    );
+  }
+
+  const existingActiveSession = allowMultiSession
+    ? await RefreshToken.findOne({
+        principalId: String(doctorId),
+        role: "doctor",
+        revokedAt: null,
+        expiresAt: { $gt: new Date() },
+      })
+        .sort({ createdAt: -1 })
+        .select("createdByIp deviceInfo userAgent")
+        .lean()
+    : null;
+
+  const incomingDevice = String(req.headers["sec-ch-ua-platform"] || req.headers["x-device-info"] || "");
+  const incomingIp = req.ip || "";
+  if (
+    existingActiveSession &&
+    ((incomingDevice && existingActiveSession.deviceInfo && incomingDevice !== existingActiveSession.deviceInfo) ||
+      (incomingIp && existingActiveSession.createdByIp && incomingIp !== existingActiveSession.createdByIp))
+  ) {
+    await monitorSuspiciousSession({
+      actorEmail: req.body?.email || "",
+      actorRole: "doctor",
+      ipAddress: incomingIp,
+      userAgent: req.headers["user-agent"] || "",
+      metadata: {
+        previousDevice: existingActiveSession.deviceInfo || "",
+        previousIp: existingActiveSession.createdByIp || "",
+        newDevice: incomingDevice,
+        newIp: incomingIp,
+      },
+    });
+  }
+
   await RefreshToken.create({
     principalId: String(doctorId),
     role: "doctor",
@@ -114,6 +177,8 @@ const persistRefreshToken = async (req, doctorId, refreshToken, refreshMeta) => 
     expiresAt,
     createdByIp: req.ip || "",
     userAgent: req.headers["user-agent"] || "",
+    deviceInfo: String(req.headers["sec-ch-ua-platform"] || req.headers["x-device-info"] || ""),
+    lastActiveAt: new Date(),
   });
 };
 
@@ -182,6 +247,10 @@ router.post("/signup", async (req, res) => {
 router.post("/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
+    const blockState = await isActorTemporarilyBlocked({ actorEmail: email, actorRole: "doctor" });
+    if (blockState.isBlocked) {
+      return res.status(429).json({ success: false, message: "Account temporarily blocked due to suspicious activity." });
+    }
 
     if (!email || !password) {
       return res.status(400).json({
@@ -192,11 +261,25 @@ router.post("/login", authLimiter, async (req, res) => {
 
     const doctor = await DoctorUser.findOne({ email: email.toLowerCase() });
     if (!doctor) {
+      await monitorFailedLogin({
+        actorEmail: email,
+        actorRole: "doctor",
+        ipAddress: req.ip || "",
+        userAgent: req.headers["user-agent"] || "",
+        source: "doctor_portal_login",
+      });
       return res.status(401).json({ success: false, message: "Invalid email or password." });
     }
 
     const isPasswordValid = await doctor.comparePassword(password);
     if (!isPasswordValid) {
+      await monitorFailedLogin({
+        actorEmail: email,
+        actorRole: "doctor",
+        ipAddress: req.ip || "",
+        userAgent: req.headers["user-agent"] || "",
+        source: "doctor_portal_login",
+      });
       return res.status(401).json({ success: false, message: "Invalid email or password." });
     }
 
@@ -312,10 +395,6 @@ router.get("/profile", auth, async (req, res) => {
 
     // Calculate actual statistics
     try {
-      // Import User model to count patients
-      const User = require('../models/User');
-      const Appointment = require('../models/Appointment');
-
       // Count total patients associated with this doctor
       const totalPatients = await User.countDocuments({ doctorId: req.doctor._id });
 
@@ -349,7 +428,7 @@ router.get("/profile", auth, async (req, res) => {
     if (!doctorData.preferences) {
       doctorData.preferences = {
         language: 'en',
-        timezone: 'America/New_York',
+        timezone: 'Asia/Kolkata',
         theme: 'auto',
         notifications: {
           newPatients: true,
@@ -533,7 +612,13 @@ router.put("/security-settings", auth, async (req, res) => {
       return res.status(404).json({ success: false, message: "Doctor not found." });
     }
 
-    const { twoFactorAuth, sessionTimeout, passwordExpiry, loginNotifications } = req.body;
+    const {
+      twoFactorAuth,
+      sessionTimeout,
+      passwordExpiry,
+      loginNotifications,
+      allowMultiSession,
+    } = req.body;
 
     // Validate input
     const updateData = {};
@@ -549,12 +634,42 @@ router.put("/security-settings", auth, async (req, res) => {
     if (typeof loginNotifications === 'boolean') {
       updateData['securitySettings.loginNotifications'] = loginNotifications;
     }
+    if (typeof allowMultiSession === 'boolean') {
+      updateData['securitySettings.allowMultiSession'] = allowMultiSession;
+    }
 
     const updatedDoctor = await DoctorUser.findByIdAndUpdate(
       req.doctor._id,
       { $set: updateData },
       { new: true, runValidators: true }
     ).select("-password");
+
+    let revokedCount = 0;
+    if (allowMultiSession === false) {
+      const activeTokens = await RefreshToken.find({
+        principalId: req.doctor._id.toString(),
+        role: "doctor",
+        revokedAt: null,
+        expiresAt: { $gt: new Date() },
+      })
+        .sort({ lastActiveAt: -1, createdAt: -1 })
+        .select("_id")
+        .lean();
+
+      if (activeTokens.length > 1) {
+        const keepTokenId = activeTokens[0]?._id;
+        const revokeResult = await RefreshToken.updateMany(
+          {
+            principalId: req.doctor._id.toString(),
+            role: "doctor",
+            revokedAt: null,
+            _id: { $ne: keepTokenId },
+          },
+          { $set: { revokedAt: new Date(), revokedReason: "single_session_enforced" } }
+        );
+        revokedCount = revokeResult.modifiedCount || 0;
+      }
+    }
 
     // Calculate password expiry info
     const passwordInfo = {
@@ -574,6 +689,7 @@ router.put("/security-settings", auth, async (req, res) => {
       message: "Security settings updated successfully.",
       securitySettings: updatedDoctor.securitySettings,
       passwordInfo: passwordInfo,
+      revokedSessions: revokedCount,
     });
   } catch (error) {
     console.error("Update security settings error:", error);

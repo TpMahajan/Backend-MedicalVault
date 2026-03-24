@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
+import { decryptField, encryptField } from "../utils/fieldEncryption.js";
 
 const UserSchema = new mongoose.Schema(
   {
@@ -21,7 +22,7 @@ const UserSchema = new mongoose.Schema(
     googleId: { type: String, unique: true, sparse: true }, // No default - will be undefined for regular users
     loginType: { type: String, enum: ["email", "google"], default: "email" }, // Track login method
     emailVerified: { type: Boolean, default: false }, // Email verification status
-    aadhaar: { type: String, default: null },
+    aadhaar: { type: String, default: null, set: encryptField, get: decryptField },
     role: {
       type: String,
       enum: ["PATIENT", "DOCTOR", "ADMIN", "SUPERADMIN"],
@@ -51,14 +52,29 @@ const UserSchema = new mongoose.Schema(
     emergencyContact: {
       name: { type: String, default: null },
       relationship: { type: String, default: null },
-      phone: { type: String, default: null },
+      phone: { type: String, default: null, set: encryptField, get: decryptField },
     },
 
     allergies: {
       type: String,
       default: "",
       trim: true,
+      set: encryptField,
+      get: decryptField,
     },
+    consents: [
+      {
+        consentType: {
+          type: String,
+          enum: ["PRIVACY_POLICY", "TERMS_OF_SERVICE"],
+          required: true,
+        },
+        version: { type: String, required: true, trim: true },
+        acceptedAt: { type: Date, default: Date.now, required: true },
+        ipAddress: { type: String, default: "" },
+        userAgent: { type: String, default: "" },
+      },
+    ],
 
     medicalHistory: [
       {
@@ -79,6 +95,10 @@ const UserSchema = new mongoose.Schema(
 
     medicalRecords: [{ type: mongoose.Schema.Types.ObjectId, ref: "Document" }],
 
+    securitySettings: {
+      allowMultiSession: { type: Boolean, default: true },
+    },
+
     // 🔹 System fields
     fcmToken: { type: String, default: null },
     isActive: { type: Boolean, default: true },
@@ -90,16 +110,19 @@ const UserSchema = new mongoose.Schema(
 
     // 🔹 Password reset fields
     resetToken: { type: String, default: null },
+    resetTokenHash: { type: String, default: null },
     resetTokenExpiry: { type: Date, default: null },
   },
   {
     timestamps: true,
     toJSON: {
+      getters: true,
       transform: function (doc, ret) {
         delete ret.password;
         return ret;
       },
     },
+    toObject: { getters: true },
   }
 );
 
@@ -134,3 +157,4 @@ UserSchema.methods.comparePassword = async function (candidatePassword) {
 
 // ✅ Named export (consistent with DoctorUser, File, Appointment)
 export const User = mongoose.model("User", UserSchema);
+

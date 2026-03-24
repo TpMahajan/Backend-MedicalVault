@@ -45,6 +45,38 @@ export const loginValidation = [
   validate
 ];
 
+export const forgotPasswordValidation = [
+  body("email").isEmail().withMessage("Valid email is required").normalizeEmail(),
+  validate,
+];
+
+export const resetPasswordValidation = [
+  body("token").isString().trim().notEmpty().withMessage("Token is required"),
+  body("newPassword")
+    .isLength({ min: 8 })
+    .withMessage("New password must be at least 8 characters"),
+  validate,
+];
+
+export const doctorSignupValidation = [
+  body("name")
+    .trim()
+    .isLength({ min: 2, max: 80 })
+    .withMessage("Name must be between 2 and 80 characters"),
+  body("email")
+    .isEmail()
+    .withMessage("Please enter a valid email address")
+    .normalizeEmail(),
+  body("password")
+    .isLength({ min: 8 })
+    .withMessage("Password must be at least 8 characters long"),
+  body("specialization")
+    .trim()
+    .isLength({ min: 2, max: 120 })
+    .withMessage("Specialization is required"),
+  validate,
+];
+
 export const updateProfileValidation = [
   body('name')
     .optional()

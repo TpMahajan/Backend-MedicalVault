@@ -3,6 +3,7 @@ import { Appointment } from "../models/Appointment.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { auth } from "../middleware/auth.js";
+import { requireDoctor } from "../middleware/auth.js";
 import { sendNotification } from "../utils/notifications.js";
 
 const router = express.Router();
@@ -50,7 +51,7 @@ const updatePatientNextAppointment = async (patientId) => {
 };
 
 // ================= Create Appointment =================
-router.post("/", auth, async (req, res) => {
+router.post("/", auth, requireDoctor, async (req, res) => {
   try {
     const {
       patientId,
@@ -177,7 +178,7 @@ router.post("/", auth, async (req, res) => {
 });
 
 // ================= Get All Appointments =================
-router.get("/", auth, async (req, res) => {
+router.get("/", auth, requireDoctor, async (req, res) => {
   try {
     const appointments = await Appointment.find({ doctorId: req.doctor._id })
       .sort({ appointmentDate: 1, appointmentTime: 1 })
@@ -199,7 +200,7 @@ router.get("/", auth, async (req, res) => {
 });
 
 // ================= Get Appointment by ID =================
-router.get("/:id", auth, async (req, res) => {
+router.get("/:id", auth, requireDoctor, async (req, res) => {
   try {
     const appointment = await Appointment.findOne({
       _id: req.params.id,
@@ -224,7 +225,7 @@ router.get("/:id", auth, async (req, res) => {
 });
 
 // ================= Update Appointment =================
-router.put("/:id", auth, async (req, res) => {
+router.put("/:id", auth, requireDoctor, async (req, res) => {
   try {
     const { patientName, appointmentDate, appointmentTime, reason, notes, status } = req.body;
 
@@ -289,7 +290,7 @@ router.put("/:id", auth, async (req, res) => {
 });
 
 // ================= Delete Appointment =================
-router.delete("/:id", auth, async (req, res) => {
+router.delete("/:id", auth, requireDoctor, async (req, res) => {
   try {
     const appointment = await Appointment.findOneAndDelete({
       _id: req.params.id,
@@ -340,7 +341,7 @@ router.delete("/:id", auth, async (req, res) => {
 });
 
 // ================= Get Appointments for Specific Patient =================
-router.get("/patient/:patientId", auth, async (req, res) => {
+router.get("/patient/:patientId", auth, requireDoctor, async (req, res) => {
   try {
     const { patientId } = req.params;
     
@@ -367,7 +368,7 @@ router.get("/patient/:patientId", auth, async (req, res) => {
 });
 
 // ================= Get Patient's Next Appointment =================
-router.get("/patient/:patientId/next", auth, async (req, res) => {
+router.get("/patient/:patientId/next", auth, requireDoctor, async (req, res) => {
   try {
     const { patientId } = req.params;
     

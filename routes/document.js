@@ -2,7 +2,7 @@ import express from "express";
 import multer from "multer";
 import multerS3 from "multer-s3";
 import path from "path";
-import { DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import axios from "axios";
 import { auth } from "../middleware/auth.js";
 import { requireVerified } from "../middleware/requireVerified.js";
@@ -15,6 +15,7 @@ import { generateSignedUrl, generatePreviewUrl, generateDownloadUrl } from "../u
 import { sendNotification } from "../utils/notifications.js";
 import { canDoctorAccessPatient } from "../services/accessControl.js";
 import { writeAuditLog } from "../middleware/auditLogger.js";
+import { uploadLimiter } from "../middleware/rateLimit.js";
 
 const router = express.Router();
 
@@ -30,11 +31,20 @@ const allowedMimeTypes = new Set([
   "application/msword",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 ]);
+const magicSignatureByMime = {
+  "application/pdf": [[0x25, 0x50, 0x44, 0x46]],
+  "image/jpeg": [[0xff, 0xd8, 0xff]],
+  "image/png": [[0x89, 0x50, 0x4e, 0x47]],
+  "image/webp": [[0x52, 0x49, 0x46, 0x46]], // RIFF....WEBP
+  "application/msword": [[0xd0, 0xcf, 0x11, 0xe0]],
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [[0x50, 0x4b, 0x03, 0x04]],
+};
 
 const validateUploadFilename = (name = "") => {
   const normalized = String(name || "").toLowerCase();
   return /\.(pdf|jpg|jpeg|png|webp|doc|docx)$/.test(normalized);
 };
+const isValidObjectId = (value) => /^[a-fA-F0-9]{24}$/.test(String(value || ""));
 
 const isRole = (req, role) => String(req.auth?.role || "").toLowerCase() === role;
 
@@ -73,6 +83,33 @@ const runMalwareScan = async ({ bucket, key, mimeType, size }) => {
   return { status: "passed", clean: true };
 };
 
+const readStreamToBuffer = async (stream) => {
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+};
+
+const hasSignature = (buffer, signature) => signature.every((byte, idx) => buffer[idx] === byte);
+
+const validateMagicBytes = async ({ bucket, key, mimeType }) => {
+  const allowedSignatures = magicSignatureByMime[String(mimeType || "").toLowerCase()];
+  if (!allowedSignatures || allowedSignatures.length === 0) return true;
+  const object = await s3Client.send(
+    new GetObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Range: "bytes=0-15",
+    })
+  );
+  const firstBytes = await readStreamToBuffer(object.Body);
+  if (String(mimeType).toLowerCase() === "image/webp") {
+    return hasSignature(firstBytes, [0x52, 0x49, 0x46, 0x46]) && firstBytes.includes(Buffer.from("WEBP"));
+  }
+  return allowedSignatures.some((signature) => hasSignature(firstBytes, signature));
+};
+
 // ---------------- AWS S3 Storage ----------------
 const storage = multerS3({
   s3: s3Client,
@@ -108,28 +145,11 @@ const upload = multer({
 });
 
 // ---------------- Upload ----------------
-router.post("/upload", auth, requireVerified, upload.single("file"), async (req, res) => {
+router.post("/upload", auth, requireVerified, uploadLimiter, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
 
     const { title, category, date, notes, userId } = req.body;
-
-    console.log('📤 Upload request received:', {
-      title,
-      category,
-      date,
-      notes,
-      userId,
-      authId: req.auth.id,
-      authRole: req.auth?.role
-    });
-
-    console.log('📅 Date processing:', {
-      originalDate: date,
-      dateType: typeof date,
-      isEmpty: !date || date.trim() === '',
-      currentTime: new Date().toISOString()
-    });
 
     const validCategories = ["Report", "Prescription", "Bill", "Insurance"];
     let chosenCategory = "Report"; // Default
@@ -166,6 +186,9 @@ router.post("/upload", auth, requireVerified, upload.single("file"), async (req,
       if (!targetUserId) {
         return res.status(400).json({ success: false, msg: "Doctors must provide target patient userId" });
       }
+      if (!isValidObjectId(targetUserId)) {
+        return res.status(400).json({ success: false, msg: "Invalid target patient userId" });
+      }
       const allowed = await canDoctorAccessPatient(requesterId, targetUserId);
       if (!allowed) {
         return res.status(403).json({ success: false, msg: "No active doctor-patient relationship" });
@@ -174,6 +197,9 @@ router.post("/upload", auth, requireVerified, upload.single("file"), async (req,
       targetUserId = requestedTargetId || "";
       if (!targetUserId) {
         return res.status(400).json({ success: false, msg: "target userId is required" });
+      }
+      if (!isValidObjectId(targetUserId)) {
+        return res.status(400).json({ success: false, msg: "Invalid target userId" });
       }
     } else {
       return res.status(403).json({ success: false, msg: "Unauthorized role for upload" });
@@ -185,6 +211,14 @@ router.post("/upload", auth, requireVerified, upload.single("file"), async (req,
     }
 
     try {
+      const magicOk = await validateMagicBytes({
+        bucket: s3Bucket,
+        key: s3Key,
+        mimeType: req.file.mimetype,
+      });
+      if (!magicOk) {
+        throw new Error("Magic-byte validation failed");
+      }
       await runMalwareScan({
         bucket: s3Bucket,
         key: s3Key,
@@ -209,13 +243,6 @@ router.post("/upload", auth, requireVerified, upload.single("file"), async (req,
       });
     }
 
-    console.log('🎯 Target userId determined:', {
-      fromBody: req.body.userId,
-      fromAuth: req.auth.id,
-      finalTarget: targetUserId,
-      isDoctorUpload: !!req.body.userId
-    });
-
     // ✅ Properly handle date conversion
     let uploadDate = new Date(); // Default to current time
     if (date && date.trim() !== '') {
@@ -225,14 +252,9 @@ router.post("/upload", auth, requireVerified, upload.single("file"), async (req,
           uploadDate = parsedDate;
         }
       } catch (error) {
-        console.log('⚠️ Invalid date provided, using current time:', error.message);
+        // Keep default upload date when input is malformed.
       }
     }
-
-    console.log('📅 Final upload date:', {
-      uploadDate: uploadDate.toISOString(),
-      uploadTimestamp: uploadDate.getTime()
-    });
 
     const doc = await Document.create({
       userId: targetUserId,
@@ -256,12 +278,6 @@ router.post("/upload", auth, requireVerified, upload.single("file"), async (req,
     // ✅ Link the document to the target user's medicalRecords array
     await User.findByIdAndUpdate(targetUserId, { $push: { medicalRecords: doc._id } });
 
-    console.log('✅ Document created and linked:', {
-      docId: doc._id,
-      targetUserId: targetUserId,
-      category: chosenCategory,
-      title: doc.title
-    });
 
     // Send notification to patient if doctor uploaded the document
     if (req.auth?.role === "doctor" && req.body.userId) {
@@ -608,6 +624,9 @@ router.get("/grouped/:email", auth, checkSessionByEmail, async (req, res) => {
 // ---------------- Preview ----------------
 router.get("/:id/preview", auth, checkSession, async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ msg: "Invalid file id" });
+    }
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
@@ -635,6 +654,9 @@ router.get("/:id/preview", auth, checkSession, async (req, res) => {
 // ---------------- Download ----------------
 router.get("/:id/download", auth, checkSession, async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ msg: "Invalid file id" });
+    }
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
@@ -684,6 +706,9 @@ router.get("/:id/download", auth, checkSession, async (req, res) => {
 // ---------------- Proxy (for inline preview) ----------------
 router.get("/:id/proxy", auth, checkSession, async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ msg: "Invalid file id" });
+    }
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
@@ -724,6 +749,9 @@ router.get("/:id/proxy", auth, checkSession, async (req, res) => {
 // ---------------- Update Document ----------------
 router.put("/:id", auth, requireVerified, checkSession, async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, msg: "Invalid file id" });
+    }
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ success: false, msg: "File not found" });
 
@@ -805,6 +833,9 @@ router.put("/:id", auth, requireVerified, checkSession, async (req, res) => {
 // ---------------- Delete ----------------
 router.delete("/:id", auth, requireVerified, checkSession, async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ msg: "Invalid file id" });
+    }
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 

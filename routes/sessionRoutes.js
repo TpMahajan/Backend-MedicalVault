@@ -10,6 +10,7 @@ import { sendNotification, sendNotificationToDoctor } from "../utils/notificatio
 import { persistSessionHistory } from "../services/sessionHistoryPersistence.js";
 import { BUCKET_NAME } from "../config/s3.js";
 import { generateSignedUrl } from "../utils/s3Utils.js";
+import { RefreshToken } from "../models/RefreshToken.js";
 
 const router = express.Router();
 const ENABLE_DEBUG_ROUTES =
@@ -39,6 +40,42 @@ const resolveParticipantName = (participant, fallback) => {
   if (fromProfile) return fromProfile;
   if (fromFallback) return fromFallback;
   return "User";
+};
+
+const resolveAllowMultiSession = async ({ role, principalId }) => {
+  if (role === "doctor") {
+    const doctor = await DoctorUser.findById(principalId)
+      .select("securitySettings.allowMultiSession")
+      .lean();
+    return doctor?.securitySettings?.allowMultiSession !== false;
+  }
+
+  const user = await User.findById(principalId)
+    .select("securitySettings.allowMultiSession")
+    .lean();
+  return user?.securitySettings?.allowMultiSession !== false;
+};
+
+const updateAllowMultiSession = async ({ role, principalId, allowMultiSession }) => {
+  if (role === "doctor") {
+    const updated = await DoctorUser.findByIdAndUpdate(
+      principalId,
+      { $set: { "securitySettings.allowMultiSession": allowMultiSession } },
+      { new: true, runValidators: true }
+    )
+      .select("securitySettings.allowMultiSession")
+      .lean();
+    return updated?.securitySettings?.allowMultiSession !== false;
+  }
+
+  const updated = await User.findByIdAndUpdate(
+    principalId,
+    { $set: { "securitySettings.allowMultiSession": allowMultiSession } },
+    { new: true, runValidators: true }
+  )
+    .select("securitySettings.allowMultiSession")
+    .lean();
+  return updated?.securitySettings?.allowMultiSession !== false;
 };
 
 const resolveDoctorAvatarUrl = async (doctor) => {
@@ -656,6 +693,190 @@ router.get("/:id/status", auth, async (req, res) => {
 
 // All other routes require authentication
 router.use(auth);
+
+// ---------------- Device Sessions (Patient/Doctor) ----------------
+// GET /api/sessions/settings -> get device-session policy for current account
+router.get("/settings", async (req, res) => {
+  try {
+    const role = asText(req.auth?.role).toLowerCase();
+    const principalId = asText(req.auth?.id);
+    if (!["patient", "doctor"].includes(role) || !principalId) {
+      return res.status(403).json({ success: false, message: "Access denied" });
+    }
+
+    const allowMultiSession = await resolveAllowMultiSession({ role, principalId });
+    return res.json({ success: true, allowMultiSession });
+  } catch {
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch session settings" });
+  }
+});
+
+// PUT /api/sessions/settings -> update device-session policy for current account
+router.put("/settings", async (req, res) => {
+  try {
+    const role = asText(req.auth?.role).toLowerCase();
+    const principalId = asText(req.auth?.id);
+    if (!["patient", "doctor"].includes(role) || !principalId) {
+      return res.status(403).json({ success: false, message: "Access denied" });
+    }
+
+    const allowMultiSession = req.body?.allowMultiSession;
+    if (typeof allowMultiSession !== "boolean") {
+      return res.status(400).json({
+        success: false,
+        message: "allowMultiSession must be a boolean",
+      });
+    }
+
+    const persistedValue = await updateAllowMultiSession({
+      role,
+      principalId,
+      allowMultiSession,
+    });
+
+    let revokedCount = 0;
+    if (persistedValue === false) {
+      const activeTokens = await RefreshToken.find({
+        principalId,
+        role,
+        revokedAt: null,
+        expiresAt: { $gt: new Date() },
+      })
+        .sort({ lastActiveAt: -1, createdAt: -1 })
+        .select("_id")
+        .lean();
+
+      if (activeTokens.length > 1) {
+        const keepTokenId = activeTokens[0]?._id;
+        const revokeResult = await RefreshToken.updateMany(
+          {
+            principalId,
+            role,
+            revokedAt: null,
+            _id: { $ne: keepTokenId },
+          },
+          { $set: { revokedAt: new Date(), revokedReason: "single_session_enforced" } }
+        );
+        revokedCount = revokeResult.modifiedCount || 0;
+      }
+    }
+
+    return res.json({
+      success: true,
+      allowMultiSession: persistedValue,
+      revokedCount,
+      message:
+        persistedValue
+          ? "Multi-device sessions enabled"
+          : "Single-device session mode enabled",
+    });
+  } catch {
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to update session settings" });
+  }
+});
+
+// GET /api/sessions -> list current user's auth device sessions
+router.get("/", async (req, res) => {
+  try {
+    const role = asText(req.auth?.role).toLowerCase();
+    const principalId = asText(req.auth?.id);
+    if (!["patient", "doctor"].includes(role) || !principalId) {
+      return res.status(403).json({ success: false, message: "Access denied" });
+    }
+
+    const rows = await RefreshToken.find({
+      principalId,
+      role,
+      revokedAt: null,
+      expiresAt: { $gt: new Date() },
+    })
+      .sort({ lastActiveAt: -1, createdAt: -1 })
+      .select("jti createdByIp userAgent deviceInfo lastActiveAt createdAt expiresAt")
+      .lean();
+
+    const sessions = rows.map((row) => ({
+      id: row._id?.toString(),
+      sessionId: row._id?.toString(),
+      jti: row.jti || "",
+      ipAddress: row.createdByIp || "",
+      userAgent: row.userAgent || "",
+      deviceInfo: row.deviceInfo || "",
+      lastActiveAt: row.lastActiveAt || row.updatedAt || row.createdAt,
+      createdAt: row.createdAt,
+      expiresAt: row.expiresAt,
+    }));
+
+    return res.json({ success: true, sessions, count: sessions.length });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to fetch sessions" });
+  }
+});
+
+// DELETE /api/sessions/:id -> logout one device session
+router.delete("/:id", async (req, res) => {
+  try {
+    const role = asText(req.auth?.role).toLowerCase();
+    const principalId = asText(req.auth?.id);
+    if (!["patient", "doctor"].includes(role) || !principalId) {
+      return res.status(403).json({ success: false, message: "Access denied" });
+    }
+
+    const sessionId = asText(req.params.id);
+    if (!isValidObjectId(sessionId)) {
+      return res.status(400).json({ success: false, message: "Invalid session id" });
+    }
+
+    const updated = await RefreshToken.updateOne(
+      {
+        _id: sessionId,
+        principalId,
+        role,
+        revokedAt: null,
+      },
+      { $set: { revokedAt: new Date(), revokedReason: "device_logout" } }
+    );
+
+    if (!updated.matchedCount) {
+      return res.status(404).json({ success: false, message: "Session not found" });
+    }
+    return res.json({ success: true, message: "Device session logged out" });
+  } catch {
+    return res.status(500).json({ success: false, message: "Failed to logout session" });
+  }
+});
+
+// DELETE /api/sessions -> logout all device sessions
+router.delete("/", async (req, res) => {
+  try {
+    const role = asText(req.auth?.role).toLowerCase();
+    const principalId = asText(req.auth?.id);
+    if (!["patient", "doctor"].includes(role) || !principalId) {
+      return res.status(403).json({ success: false, message: "Access denied" });
+    }
+
+    const now = new Date();
+    const result = await RefreshToken.updateMany(
+      {
+        principalId,
+        role,
+        revokedAt: null,
+      },
+      { $set: { revokedAt: now, revokedReason: "logout_all_devices" } }
+    );
+
+    return res.json({
+      success: true,
+      message: "All device sessions logged out",
+      revokedCount: result.modifiedCount || 0,
+    });
+  } catch {
+    return res.status(500).json({ success: false, message: "Failed to logout all sessions" });
+  }
+});
 
 // ---------------- Direct Chat Threads ----------------
 // GET /api/sessions/chat/threads
@@ -2721,7 +2942,5 @@ router.patch('/:sessionId/update', async (req, res) => {
 
 
 export default router;
-
-
 
 

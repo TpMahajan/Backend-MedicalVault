@@ -36,3 +36,27 @@ export const fcmLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+
+// High-cost AI routes
+export const aiLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: parseInt(process.env.AI_RATE_LIMIT_MAX || "20", 10),
+  message: {
+    success: false,
+    message: "Too many AI requests. Please try again shortly.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// File uploads
+export const uploadLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: parseInt(process.env.UPLOAD_RATE_LIMIT_MAX || "30", 10),
+  message: {
+    success: false,
+    message: "Too many upload attempts. Please try again later.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});

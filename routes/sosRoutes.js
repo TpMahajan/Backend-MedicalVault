@@ -1,4 +1,4 @@
-﻿import express from "express";
+import express from "express";
 import { auth } from "../middleware/auth.js";
 import SOS from "../models/SOS.js";
 import { User } from "../models/User.js";
@@ -6,6 +6,7 @@ import { SosEvent } from "../models/SosEvent.js";
 import { MassIncident } from "../models/MassIncident.js";
 import { checkRole } from "../middleware/rbac.js";
 import { writeAuditLog } from "../middleware/auditLogger.js";
+import { requireAdminPermissions } from "../middleware/adminAuth.js";
 
 const router = express.Router();
 
@@ -258,6 +259,15 @@ router.get("/", auth, async (req, res) => {
       filter = { ...baseFilter, patientId: req.auth.id };
     } else if (!role || !["admin", "superadmin"].includes(role)) {
       return res.status(403).json({ success: false, message: "Access denied" });
+    } else if (role === "admin") {
+      const assigned = new Set(
+        (Array.isArray(req.admin?.permissions) ? req.admin.permissions : [])
+          .map((entry) => String(entry || "").trim().toUpperCase())
+      );
+      const isSuperAdminRole = String(req.admin?.role || "").toUpperCase() === "SUPER_ADMIN";
+      if (!isSuperAdminRole && !assigned.has("VIEW_SOS")) {
+        return res.status(403).json({ success: false, message: "Insufficient permissions" });
+      }
     }
 
     const items = await SOS.find(filter).sort({ createdAt: 1 }).skip(skip).limit(limit).lean();
@@ -280,7 +290,12 @@ router.get("/", auth, async (req, res) => {
 });
 
 // Mark a batch of SOS messages as read (admin/superadmin only)
-router.post("/mark-read", auth, checkRole("admin", "superadmin"), async (req, res) => {
+router.post(
+  "/mark-read",
+  auth,
+  checkRole("admin", "superadmin"),
+  requireAdminPermissions("HANDLE_SOS"),
+  async (req, res) => {
   try {
     const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
     if (!ids.length) return res.status(400).json({ success: false, message: "ids array is required" });
@@ -301,10 +316,16 @@ router.post("/mark-read", auth, checkRole("admin", "superadmin"), async (req, re
     console.error("SOS mark-read error:", e);
     return res.status(500).json({ success: false, message: "Failed to mark as read" });
   }
-});
+  }
+);
 
 // Delete/clear an SOS item (admin/superadmin only)
-router.delete("/:id", auth, checkRole("admin", "superadmin"), async (req, res) => {
+router.delete(
+  "/:id",
+  auth,
+  checkRole("admin", "superadmin"),
+  requireAdminPermissions("HANDLE_SOS"),
+  async (req, res) => {
   try {
     const id = req.params.id;
     if (!id) return res.status(400).json({ success: false, message: "Missing id" });
@@ -326,6 +347,7 @@ router.delete("/:id", auth, checkRole("admin", "superadmin"), async (req, res) =
     console.error("SOS delete error:", e);
     return res.status(500).json({ success: false, message: "Failed to delete" });
   }
-});
+  }
+);
 
 export default router;

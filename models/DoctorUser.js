@@ -50,12 +50,13 @@ const doctorUserSchema = new mongoose.Schema({
     sessionTimeout: { type: Number, default: 30, min: 5, max: 480 },
     passwordExpiry: { type: Number, default: 90, min: 30, max: 365 },
     loginNotifications: { type: Boolean, default: true },
+    allowMultiSession: { type: Boolean, default: true },
   },
 
   // Application Settings
   preferences: {
     language: { type: String, default: 'en' },
-    timezone: { type: String, default: 'America/New_York' },
+    timezone: { type: String, default: 'Asia/Kolkata' },
     theme: { type: String, default: 'auto', enum: ['light', 'dark', 'auto'] },
     notifications: {
       newPatients: { type: Boolean, default: true },
@@ -85,6 +86,8 @@ const doctorUserSchema = new mongoose.Schema({
   lastLoginAt: { type: Date, default: Date.now },
   loginAttempts: { type: Number, default: 0 },
   accountLockedUntil: { type: Date },
+  resetTokenHash: { type: String, default: null },
+  resetTokenExpiry: { type: Date, default: null },
 
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
