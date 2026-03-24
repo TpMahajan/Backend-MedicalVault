@@ -41,7 +41,7 @@ A secure, production-ready Node.js backend with MongoDB, JWT authentication, and
    MONGO_URI=mongodb+srv://username:password@cluster.mongodb.net/database
    
    # JWT Configuration
-   JWT_SECRET=your-super-secret-jwt-key-here
+   JWT_SECRET=replace-with-random-secret-at-least-32-chars-long
    DATA_ENCRYPTION_KEY=replace-with-64-char-hex-key
    JWT_EXPIRES_IN=7d
    
@@ -499,7 +499,7 @@ class _LoginScreenState extends State<LoginScreen> {
 
 ### Environment Variables
 - Set `NODE_ENV=production`
-- Use strong `JWT_SECRET`
+- Use strong `JWT_SECRET` (minimum 32 characters)
 - Configure production MongoDB URI
 - Set up Firebase Admin SDK credentials
 

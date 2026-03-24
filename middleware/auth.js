@@ -47,6 +47,14 @@ const hydratePrincipal = async (principal) => {
 
   const { id, role, email } = principal;
 
+  if (role === "patient") {
+    const user = await User.findById(id).select("-password");
+    if (!user || user.isActive === false || user.status === "BLOCKED") {
+      return null;
+    }
+    return { auth: { id, role, email: user.email || email }, user };
+  }
+
   if (role === "doctor") {
     const doctor = await DoctorUser.findById(id).select("-password");
     if (!doctor || doctor.isActive === false || doctor.status === "BLOCKED") {
