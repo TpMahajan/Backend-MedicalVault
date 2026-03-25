@@ -85,15 +85,44 @@ const envCorsOrigins = (process.env.CORS_ORIGINS || "")
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+const defaultCorsOriginPatterns = [
+  /^https:\/\/health-vault-web-[a-z0-9-]+\.vercel\.app$/i,
+  /^https:\/\/medicalvault-aially-[a-z0-9-]+\.vercel\.app$/i,
+];
+
+const envCorsOriginPatterns = (process.env.CORS_ORIGIN_PATTERNS || "")
+  .split(",")
+  .map((pattern) => pattern.trim())
+  .filter(Boolean)
+  .flatMap((pattern) => {
+    try {
+      return [new RegExp(pattern, "i")];
+    } catch (error) {
+      console.warn(`[cors] ignoring invalid CORS_ORIGIN_PATTERNS entry: ${pattern}`, error);
+      return [];
+    }
+  });
+
 const allowedCorsOrigins = new Set([
   ...defaultCorsOrigins,
   ...envCorsOrigins,
 ]);
 
+const allowedCorsOriginPatterns = [
+  ...defaultCorsOriginPatterns,
+  ...envCorsOriginPatterns,
+];
+
+const isAllowedCorsOrigin = (origin) => {
+  if (!origin) return true;
+  if (allowedCorsOrigins.has(origin)) return true;
+  return allowedCorsOriginPatterns.some((pattern) => pattern.test(origin));
+};
+
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin || allowedCorsOrigins.has(origin)) {
+      if (isAllowedCorsOrigin(origin)) {
         callback(null, true);
         return;
       }
@@ -133,7 +162,7 @@ app.use(
   "/uploads",
   (req, res, next) => {
     const requestOrigin = req.headers.origin;
-    if (requestOrigin && allowedCorsOrigins.has(requestOrigin)) {
+    if (requestOrigin && isAllowedCorsOrigin(requestOrigin)) {
       res.setHeader("Access-Control-Allow-Origin", requestOrigin);
     }
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
@@ -264,4 +293,3 @@ process.on("uncaughtException", (err) => {
 });
 
 startServer();
-

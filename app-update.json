@@ -1,8 +1,8 @@
 {
-    "latestVersion":  "1.0.12",
+    "latestVersion":  "1.0.13",
     "minimumSupportedVersion":  "1.0.9",
     "apkUrl":  "",
     "releaseNotes":  "New Look and Feel \nNew theme colors added \nPerformance Improvements",
-    "sha256":  "5ea6abfeac372c420eae566159e563f6807ed2604b21f93349054b3c0537340e",
+    "sha256":  "86c045052004d9299cf48879a6ca7a4421a9222b3cb1efef69cd63599d4813a5",
     "checksum":  "934d2b368cf9143704ce18b33c01593699fe920c246e2b00fede7b6ff0cef843"
 }
