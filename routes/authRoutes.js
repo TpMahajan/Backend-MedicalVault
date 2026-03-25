@@ -523,6 +523,8 @@ const handlePatientLoginWithSessionPolicy = async ({
     attemptId,
     requestedDeviceInfo,
     requestedIp,
+    requestedDeviceId,
+    principalId,
   });
 
   console.info("[AuthSession] Login approval required", {

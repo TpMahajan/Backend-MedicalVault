@@ -189,12 +189,34 @@ export const updateMe = async (req, res) => {
       "medicalRecords",
       "profilePicture",
       "allergies",
-      "fcmToken"
+      "fcmToken",
+      "allowMultipleSessions",
     ];
+
+    const parseBooleanLike = (value) => {
+      if (typeof value === "boolean") return value;
+      if (typeof value === "number") return value !== 0;
+      const normalized = String(value ?? "").trim().toLowerCase();
+      if (!normalized) return null;
+      if (["true", "1", "yes", "on", "enabled"].includes(normalized)) {
+        return true;
+      }
+      if (["false", "0", "no", "off", "disabled"].includes(normalized)) {
+        return false;
+      }
+      return null;
+    };
 
     const updates = {};
     Object.keys(req.body).forEach((field) => {
       if (allowedFields.includes(field)) {
+        if (field === "allowMultipleSessions") {
+          const parsed = parseBooleanLike(req.body[field]);
+          if (parsed !== null) {
+            updates[field] = parsed;
+          }
+          return;
+        }
         updates[field] = req.body[field];
       }
     });

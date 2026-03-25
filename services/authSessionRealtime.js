@@ -1,4 +1,5 @@
 import { WebSocketServer } from "ws";
+import crypto from "crypto";
 import {
   verifyAccessToken,
   verifyLoginAttemptToken,
@@ -10,6 +11,8 @@ const WS_PATH = "/api/auth/session/ws";
 
 const sessionClients = new Map();
 const attemptClients = new Map();
+const principalSessionClients = new Map();
+const principalActiveSocketId = new Map();
 
 const asText = (value) => (value == null ? "" : String(value).trim());
 
@@ -37,11 +40,33 @@ const removeClient = (bucket, key, client) => {
 };
 
 const cleanupClient = (client) => {
+  const principalId = asText(client?.principalId);
+  const activeSocketId = principalActiveSocketId.get(principalId);
+
   removeClient(sessionClients, client.sessionId, client);
   removeClient(attemptClients, client.attemptId, client);
+  removeClient(principalSessionClients, client.principalId, client);
+
+  if (!principalId || !activeSocketId || activeSocketId !== client.socketId) {
+    return;
+  }
+
+  const remaining = principalSessionClients.get(principalId);
+  if (!remaining || remaining.size === 0) {
+    principalActiveSocketId.delete(principalId);
+    return;
+  }
+
+  for (const candidate of Array.from(remaining)) {
+    if (candidate?.ws?.readyState === WS_OPEN) {
+      principalActiveSocketId.set(principalId, asText(candidate.socketId));
+      return;
+    }
+  }
+  principalActiveSocketId.delete(principalId);
 };
 
-const broadcast = (bucket, key, payload) => {
+const broadcast = (bucket, key, payload, { shouldSend } = {}) => {
   const set = bucket.get(asText(key));
   if (!set || set.size === 0) return 0;
 
@@ -51,6 +76,10 @@ const broadcast = (bucket, key, payload) => {
     const ws = client.ws;
     if (!ws || ws.readyState !== WS_OPEN) {
       cleanupClient(client);
+      continue;
+    }
+
+    if (typeof shouldSend === "function" && !shouldSend(client)) {
       continue;
     }
 
@@ -129,28 +158,40 @@ export function initAuthSessionRealtime(server) {
 
       const token = asText(url.searchParams.get("token"));
       const attemptToken = asText(url.searchParams.get("attemptToken"));
+      const requestedDeviceId = asText(url.searchParams.get("deviceId"));
 
       const client = {
         ws,
+        socketId: crypto.randomUUID(),
         sessionId: "",
         attemptId: "",
+        principalId: "",
+        deviceId: "",
       };
 
       if (token) {
         try {
           const payload = verifyAccessToken(token);
           const sessionId = asText(payload?.sid);
+          const principalId = asText(payload?.sub || payload?.userId);
           if (!sessionId) {
             ws.close(4401, "missing_session_id");
             return;
           }
           client.sessionId = sessionId;
+          client.principalId = principalId;
+          client.deviceId = requestedDeviceId;
           addClient(sessionClients, sessionId, client);
+          addClient(principalSessionClients, principalId, client);
+          if (principalId) {
+            principalActiveSocketId.set(principalId, client.socketId);
+          }
           ws.send(
             toJson({
               type: "connected",
               mode: "session",
               sessionId,
+              socketId: client.socketId,
             })
           );
         } catch {
@@ -171,12 +212,14 @@ export function initAuthSessionRealtime(server) {
             return;
           }
           client.attemptId = attemptId;
+          client.deviceId = requestedDeviceId;
           addClient(attemptClients, attemptId, client);
           ws.send(
             toJson({
               type: "connected",
               mode: "attempt",
               attemptId,
+              socketId: client.socketId,
             })
           );
         } catch {
@@ -235,14 +278,41 @@ export function emitLoginAttemptEvent({
   attemptId,
   requestedDeviceInfo = "",
   requestedIp = "",
+  requestedDeviceId = "",
+  principalId = "",
 }) {
-  return broadcast(sessionClients, sessionId, {
-    type: "login_attempt",
-    attemptId: asText(attemptId),
-    requestedDeviceInfo: asText(requestedDeviceInfo),
-    requestedIp: asText(requestedIp),
-    message: "Another device is trying to login to your account.",
-  });
+  const normalizedRequestedDeviceId = asText(requestedDeviceId);
+  const normalizedPrincipalId = asText(principalId);
+
+  return broadcast(
+    sessionClients,
+    sessionId,
+    {
+      type: "login_attempt",
+      attemptId: asText(attemptId),
+      requestedDeviceInfo: asText(requestedDeviceInfo),
+      requestedIp: asText(requestedIp),
+      requestedDeviceId: normalizedRequestedDeviceId,
+      message: "Another device is trying to login to your account.",
+    },
+    {
+      shouldSend: (client) => {
+        if (
+          normalizedPrincipalId &&
+          asText(client?.principalId) !== normalizedPrincipalId
+        ) {
+          return false;
+        }
+        if (
+          normalizedRequestedDeviceId &&
+          asText(client?.deviceId) === normalizedRequestedDeviceId
+        ) {
+          return false;
+        }
+        return true;
+      },
+    }
+  );
 }
 
 export function emitSessionInvalidatedEvent({
