@@ -20,88 +20,6 @@ const hasAWSCredentials =
 
 const asText = (value) => (value == null ? "" : String(value).trim());
 
-const normalizeSpace = (value) =>
-  asText(value)
-    .replace(/\s+/g, " ")
-    .trim();
-
-const toTitleCase = (value) =>
-  normalizeSpace(value)
-    .toLowerCase()
-    .split(" ")
-    .filter(Boolean)
-    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
-    .join(" ");
-
-const inferDeviceName = ({ deviceInfo, userAgent }) => {
-  const source = `${normalizeSpace(deviceInfo)} ${normalizeSpace(userAgent)}`.toLowerCase();
-  if (source.includes("android")) return "Android";
-  if (source.includes("iphone")) return "iPhone";
-  if (source.includes("ipad")) return "iPad";
-  if (source.includes("ios")) return "iOS";
-  if (source.includes("windows")) return "Windows";
-  if (source.includes("mac os") || source.includes("macintosh") || source.includes("darwin")) {
-    return "macOS";
-  }
-  if (source.includes("linux")) return "Linux";
-  if (
-    source.includes("mozilla") ||
-    source.includes("chrome") ||
-    source.includes("safari") ||
-    source.includes("firefox")
-  ) {
-    return "Web browser";
-  }
-  return "Unknown device";
-};
-
-const inferDeviceLocation = (deviceInfo) => {
-  const raw = normalizeSpace(deviceInfo);
-  if (!raw) return "";
-
-  const inMatch = raw.match(/\bin\s+([a-z0-9][a-z0-9\s,.\-]{1,80})$/i);
-  if (inMatch?.[1]) {
-    return toTitleCase(inMatch[1]);
-  }
-
-  const separatorMatch = raw.match(
-    /^(?:android|iphone|ipad|ios|windows|macos|linux|web browser|web)\s*[-|,:]\s*(.+)$/i
-  );
-  if (separatorMatch?.[1]) {
-    return toTitleCase(separatorMatch[1]);
-  }
-
-  return "";
-};
-
-const buildDevicePresentation = ({ deviceInfo, userAgent }) => {
-  const deviceName = inferDeviceName({ deviceInfo, userAgent });
-  const deviceLocation = inferDeviceLocation(deviceInfo);
-  const deviceLabel = deviceLocation
-    ? `${deviceName} in ${deviceLocation}`
-    : deviceName;
-
-  return {
-    deviceName,
-    deviceLocation,
-    deviceLabel,
-  };
-};
-
-const buildDeviceDedupeKey = (row) => {
-  const deviceId = normalizeSpace(row?.deviceId).toLowerCase();
-  if (deviceId) return `device:${deviceId}`;
-
-  const deviceInfo = normalizeSpace(row?.deviceInfo).toLowerCase();
-  const userAgent = normalizeSpace(row?.userAgent).toLowerCase();
-  if (deviceInfo || userAgent) return `meta:${deviceInfo}|${userAgent}`;
-
-  const ipAddress = normalizeSpace(row?.createdByIp).toLowerCase();
-  if (ipAddress) return `ip:${ipAddress}`;
-
-  return `row:${asText(row?._id).toLowerCase()}`;
-};
-
 const resolveDoctorSpecialization = (doctor) =>
   asText(doctor?.specialization || doctor?.specialty);
 
@@ -122,42 +40,6 @@ const resolveParticipantName = (participant, fallback) => {
   if (fromProfile) return fromProfile;
   if (fromFallback) return fromFallback;
   return "User";
-};
-
-const resolveAllowMultiSession = async ({ role, principalId }) => {
-  if (role === "doctor") {
-    const doctor = await DoctorUser.findById(principalId)
-      .select("securitySettings.allowMultiSession")
-      .lean();
-    return doctor?.securitySettings?.allowMultiSession !== false;
-  }
-
-  const user = await User.findById(principalId)
-    .select("securitySettings.allowMultiSession")
-    .lean();
-  return user?.securitySettings?.allowMultiSession !== false;
-};
-
-const updateAllowMultiSession = async ({ role, principalId, allowMultiSession }) => {
-  if (role === "doctor") {
-    const updated = await DoctorUser.findByIdAndUpdate(
-      principalId,
-      { $set: { "securitySettings.allowMultiSession": allowMultiSession } },
-      { new: true, runValidators: true }
-    )
-      .select("securitySettings.allowMultiSession")
-      .lean();
-    return updated?.securitySettings?.allowMultiSession !== false;
-  }
-
-  const updated = await User.findByIdAndUpdate(
-    principalId,
-    { $set: { "securitySettings.allowMultiSession": allowMultiSession } },
-    { new: true, runValidators: true }
-  )
-    .select("securitySettings.allowMultiSession")
-    .lean();
-  return updated?.securitySettings?.allowMultiSession !== false;
 };
 
 const resolveDoctorAvatarUrl = async (doctor) => {
@@ -777,104 +659,6 @@ router.get("/:id/status", auth, async (req, res) => {
 router.use(auth);
 
 // ---------------- Device Sessions (Patient/Doctor) ----------------
-// GET /api/sessions/settings -> get device-session policy for current account
-router.get("/settings", async (req, res) => {
-  try {
-    const role = asText(req.auth?.role).toLowerCase();
-    const principalId = asText(req.auth?.id);
-    if (!["patient", "doctor"].includes(role) || !principalId) {
-      return res.status(403).json({ success: false, message: "Access denied" });
-    }
-
-    return res.json({
-      success: true,
-      allowMultiSession: false,
-      strictSingleDevice: true,
-    });
-  } catch {
-    return res
-      .status(500)
-      .json({ success: false, message: "Failed to fetch session settings" });
-  }
-});
-
-// PUT /api/sessions/settings -> update device-session policy for current account
-router.put("/settings", async (req, res) => {
-  try {
-    const role = asText(req.auth?.role).toLowerCase();
-    const principalId = asText(req.auth?.id);
-    if (!["patient", "doctor"].includes(role) || !principalId) {
-      return res.status(403).json({ success: false, message: "Access denied" });
-    }
-
-    const allowMultiSession = req.body?.allowMultiSession;
-    if (typeof allowMultiSession !== "boolean") {
-      return res.status(400).json({
-        success: false,
-        message: "allowMultiSession must be a boolean",
-      });
-    }
-
-    if (allowMultiSession === true) {
-      return res.status(400).json({
-        success: false,
-        message: "Strict single-device session mode is enforced",
-      });
-    }
-
-    const persistedValue = await updateAllowMultiSession({
-      role,
-      principalId,
-      allowMultiSession: false,
-    });
-
-    let revokedCount = 0;
-    if (persistedValue === false) {
-      const activeTokens = await RefreshToken.find({
-        principalId,
-        role,
-        revokedAt: null,
-        expiresAt: { $gt: new Date() },
-      })
-        .sort({ lastActiveAt: -1, createdAt: -1 })
-        .select("_id")
-        .lean();
-
-      if (activeTokens.length > 1) {
-        const keepTokenId = activeTokens[0]?._id;
-        const revokeResult = await RefreshToken.updateMany(
-          {
-            principalId,
-            role,
-            revokedAt: null,
-            _id: { $ne: keepTokenId },
-          },
-          {
-            $set: {
-              revokedAt: new Date(),
-              revokedReason: "single_session_enforced",
-              isCurrentSession: false,
-            },
-          }
-        );
-        revokedCount = revokeResult.modifiedCount || 0;
-      }
-    }
-
-    return res.json({
-      success: true,
-      allowMultiSession: false,
-      strictSingleDevice: true,
-      revokedCount,
-      message: "Strict single-device session mode enabled",
-    });
-  } catch {
-    return res
-      .status(500)
-      .json({ success: false, message: "Failed to update session settings" });
-  }
-});
-
 // GET /api/sessions -> list current user's auth device sessions
 router.get("/", async (req, res) => {
   try {
@@ -889,53 +673,24 @@ router.get("/", async (req, res) => {
       role,
       revokedAt: null,
       expiresAt: { $gt: new Date() },
-      isCurrentSession: { $ne: false },
     })
       .sort({ lastActiveAt: -1, createdAt: -1 })
-      .select(
-        "sessionId jti deviceId createdByIp userAgent deviceInfo lastActiveAt createdAt expiresAt"
-      )
+      .select("jti createdByIp userAgent deviceInfo lastActiveAt createdAt expiresAt")
       .lean();
 
-    const seenDeviceKeys = new Set();
-    const sessions = [];
+    const sessions = rows.map((row) => ({
+      id: row._id?.toString(),
+      sessionId: row._id?.toString(),
+      jti: row.jti || "",
+      ipAddress: row.createdByIp || "",
+      userAgent: row.userAgent || "",
+      deviceInfo: row.deviceInfo || "",
+      lastActiveAt: row.lastActiveAt || row.updatedAt || row.createdAt,
+      createdAt: row.createdAt,
+      expiresAt: row.expiresAt,
+    }));
 
-    for (const row of rows) {
-      const deviceKey = buildDeviceDedupeKey(row);
-      if (seenDeviceKeys.has(deviceKey)) {
-        continue;
-      }
-      seenDeviceKeys.add(deviceKey);
-
-      const devicePresentation = buildDevicePresentation({
-        deviceInfo: row.deviceInfo,
-        userAgent: row.userAgent,
-      });
-
-      sessions.push({
-        id: row._id?.toString(),
-        sessionId: asText(row.sessionId) || row._id?.toString(),
-        jti: row.jti || "",
-        deviceId: row.deviceId || "",
-        deviceKey,
-        ipAddress: row.createdByIp || "",
-        userAgent: row.userAgent || "",
-        deviceInfo: row.deviceInfo || "",
-        deviceName: devicePresentation.deviceName,
-        deviceLocation: devicePresentation.deviceLocation,
-        deviceLabel: devicePresentation.deviceLabel,
-        lastActiveAt: row.lastActiveAt || row.updatedAt || row.createdAt,
-        createdAt: row.createdAt,
-        expiresAt: row.expiresAt,
-      });
-    }
-
-    return res.json({
-      success: true,
-      sessions,
-      count: sessions.length,
-      totalActiveSessions: rows.length,
-    });
+    return res.json({ success: true, sessions, count: sessions.length });
   } catch (error) {
     return res.status(500).json({ success: false, message: "Failed to fetch sessions" });
   }
@@ -955,45 +710,20 @@ router.delete("/:id", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid session id" });
     }
 
-    const target = await RefreshToken.findOne({
-      _id: sessionId,
-      principalId,
-      role,
-      revokedAt: null,
-    })
-      .select("_id deviceId")
-      .lean();
+    const updated = await RefreshToken.updateOne(
+      {
+        _id: sessionId,
+        principalId,
+        role,
+        revokedAt: null,
+      },
+      { $set: { revokedAt: new Date(), revokedReason: "device_logout" } }
+    );
 
-    if (!target?._id) {
+    if (!updated.matchedCount) {
       return res.status(404).json({ success: false, message: "Session not found" });
     }
-
-    const revokeFilter = {
-      principalId,
-      role,
-      revokedAt: null,
-    };
-
-    const targetDeviceId = asText(target.deviceId);
-    if (targetDeviceId) {
-      revokeFilter.deviceId = targetDeviceId;
-    } else {
-      revokeFilter._id = target._id;
-    }
-
-    const updated = await RefreshToken.updateMany(revokeFilter, {
-      $set: {
-        revokedAt: new Date(),
-        revokedReason: "device_logout",
-        isCurrentSession: false,
-      },
-    });
-
-    return res.json({
-      success: true,
-      message: "Device session logged out",
-      revokedCount: updated.modifiedCount || 0,
-    });
+    return res.json({ success: true, message: "Device session logged out" });
   } catch {
     return res.status(500).json({ success: false, message: "Failed to logout session" });
   }
@@ -1015,13 +745,7 @@ router.delete("/", async (req, res) => {
         role,
         revokedAt: null,
       },
-      {
-        $set: {
-          revokedAt: now,
-          revokedReason: "logout_all_devices",
-          isCurrentSession: false,
-        },
-      }
+      { $set: { revokedAt: now, revokedReason: "logout_all_devices" } }
     );
 
     return res.json({
@@ -3098,3 +2822,7 @@ router.patch('/:sessionId/update', async (req, res) => {
 
 
 export default router;
+
+
+
+

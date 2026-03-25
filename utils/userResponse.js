@@ -39,6 +39,10 @@ export const buildUserResponse = async (doc) => {
     emailVerified: plain.emailVerified ?? false,
     loginType: plain.loginType ?? "email",
     googleId: plain.googleId ?? null,
+    allowMultipleSessions: plain.allowMultipleSessions === true,
+    currentSessionId: plain.currentSessionId ?? "",
+    currentDeviceId: plain.currentDeviceId ?? "",
+    lastActiveAt: plain.lastActiveAt ?? null,
   };
 
   if (plain.profilePicture) {

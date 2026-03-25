@@ -91,6 +91,19 @@ const closeSessionSockets = (sessionId, code = 4001, reason = "session_invalidat
   }
 };
 
+export function hasActiveSessionSocket(sessionId) {
+  const key = asText(sessionId);
+  if (!key) return false;
+  const set = sessionClients.get(key);
+  if (!set || set.size === 0) return false;
+  for (const client of Array.from(set)) {
+    if (client?.ws?.readyState === WS_OPEN) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function initAuthSessionRealtime(server) {
   const wss = new WebSocketServer({ noServer: true });
 
@@ -228,7 +241,7 @@ export function emitLoginAttemptEvent({
     attemptId: asText(attemptId),
     requestedDeviceInfo: asText(requestedDeviceInfo),
     requestedIp: asText(requestedIp),
-    message: "Another device is trying to access your account.",
+    message: "Another device is trying to login to your account.",
   });
 }
 

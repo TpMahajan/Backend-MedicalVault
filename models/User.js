@@ -95,14 +95,14 @@ const UserSchema = new mongoose.Schema(
 
     medicalRecords: [{ type: mongoose.Schema.Types.ObjectId, ref: "Document" }],
 
-    securitySettings: {
-      allowMultiSession: { type: Boolean, default: true },
-    },
-
     // 🔹 System fields
     fcmToken: { type: String, default: null },
     isActive: { type: Boolean, default: true },
     lastLogin: { type: Date, default: null },
+    currentSessionId: { type: String, default: "", trim: true },
+    currentDeviceId: { type: String, default: "", trim: true },
+    lastActiveAt: { type: Date, default: null, index: true },
+    allowMultipleSessions: { type: Boolean, default: false },
     profilePicture: { type: String, default: null },
 
     // 🔹 Profile Switching fields
@@ -157,4 +157,3 @@ UserSchema.methods.comparePassword = async function (candidatePassword) {
 
 // ✅ Named export (consistent with DoctorUser, File, Appointment)
 export const User = mongoose.model("User", UserSchema);
-

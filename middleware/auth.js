@@ -5,6 +5,10 @@ import { RefreshToken } from "../models/RefreshToken.js";
 import { parseBearerToken, parseCookies, verifyAccessToken } from "../services/tokenService.js";
 
 const normalizeRole = (role) => String(role || "").trim().toLowerCase();
+const asText = (value) => (value == null ? "" : String(value).trim());
+const SESSION_INVALID_MESSAGE =
+  "You have been logged out due to login from another device";
+const HEARTBEAT_TOUCH_WINDOW_MS = 15_000;
 
 const extractPrincipalFromPayload = (payload) => {
   if (!payload) return null;
@@ -28,7 +32,7 @@ const extractPrincipalFromPayload = (payload) => {
     role: mappedRole,
     id: String(principalId),
     email: payload.email ? String(payload.email).toLowerCase() : "",
-    sessionId: payload.sid ? String(payload.sid) : "",
+    sid: asText(payload.sid),
   };
 };
 
@@ -47,41 +51,17 @@ const resolveTokenCandidates = (req) => {
 const hydratePrincipal = async (principal) => {
   if (!principal) return null;
 
-  const { id, role, email, sessionId } = principal;
-
-  const requiresBoundSession = role === "patient" || role === "doctor";
-  if (requiresBoundSession) {
-    if (!sessionId) {
-      return { invalidReason: "SESSION_INVALID" };
-    }
-
-    const activeSession = await RefreshToken.findOne({
-      sessionId,
-      principalId: id,
-      role,
-      revokedAt: null,
-      expiresAt: { $gt: new Date() },
-      isCurrentSession: { $ne: false },
-    })
-      .select("_id")
-      .lean();
-
-    if (!activeSession) {
-      return { invalidReason: "SESSION_INVALID" };
-    }
-
-    void RefreshToken.updateOne(
-      { sessionId },
-      { $set: { lastActiveAt: new Date() } }
-    ).catch(() => {});
-  }
+  const { id, role, email, sid } = principal;
 
   if (role === "patient") {
     const user = await User.findById(id).select("-password");
     if (!user || user.isActive === false || user.status === "BLOCKED") {
       return null;
     }
-    return { auth: { id, role, email: user.email || email, sessionId }, user };
+    return {
+      auth: { id, role, email: user.email || email, sid },
+      user,
+    };
   }
 
   if (role === "doctor") {
@@ -89,7 +69,7 @@ const hydratePrincipal = async (principal) => {
     if (!doctor || doctor.isActive === false || doctor.status === "BLOCKED") {
       return null;
     }
-    return { auth: { id, role, email: doctor.email || email, sessionId }, doctor };
+    return { auth: { id, role, email: doctor.email || email, sid }, doctor };
   }
 
   if (role === "admin") {
@@ -100,7 +80,7 @@ const hydratePrincipal = async (principal) => {
     if (admin.accessExpiresAt && admin.accessExpiresAt <= new Date()) {
       return null;
     }
-    return { auth: { id, role, email: admin.email || email }, admin };
+    return { auth: { id, role, email: admin.email || email, sid }, admin };
   }
 
   if (role === "superadmin") {
@@ -110,7 +90,7 @@ const hydratePrincipal = async (principal) => {
       return null;
     }
     return {
-      auth: { id: configuredEmail, role, email: configuredEmail },
+      auth: { id: configuredEmail, role, email: configuredEmail, sid },
       superAdmin: { email: configuredEmail, role: "SUPERADMIN" },
     };
   }
@@ -129,13 +109,88 @@ const applyPrincipalToRequest = (req, hydrated) => {
   if (hydrated.superAdmin) req.superAdmin = hydrated.superAdmin;
 };
 
+const touchSessionHeartbeat = async ({ principalId, role, sessionId }) => {
+  if (!principalId || !role || !sessionId) return;
+  const now = new Date();
+  const staleBefore = new Date(now.getTime() - HEARTBEAT_TOUCH_WINDOW_MS);
+
+  await RefreshToken.updateOne(
+    {
+      principalId,
+      role,
+      jti: sessionId,
+      revokedAt: null,
+      expiresAt: { $gt: now },
+      $or: [{ lastActiveAt: { $lt: staleBefore } }, { lastActiveAt: null }],
+    },
+    { $set: { lastActiveAt: now } }
+  );
+
+  if (role === "patient") {
+    await User.updateOne(
+      {
+        _id: principalId,
+        $or: [{ lastActiveAt: { $lt: staleBefore } }, { lastActiveAt: null }],
+      },
+      { $set: { lastActiveAt: now } }
+    );
+  }
+};
+
+const validateSessionState = async ({ principal }) => {
+  const role = normalizeRole(principal?.role);
+  const principalId = asText(principal?.id);
+  const sessionId = asText(principal?.sid);
+
+  if (!principalId || !role) return { valid: false };
+
+  // Backward compatibility for tokens issued before sid support.
+  if (!sessionId) return { valid: true };
+
+  const tokenSession = await RefreshToken.findOne({
+    principalId,
+    role,
+    jti: sessionId,
+    revokedAt: null,
+    expiresAt: { $gt: new Date() },
+  })
+    .select("jti")
+    .lean();
+
+  if (!tokenSession) {
+    return { valid: false, reason: "session_revoked" };
+  }
+
+  if (role === "patient") {
+    const user = await User.findById(principalId)
+      .select("allowMultipleSessions currentSessionId isActive status")
+      .lean();
+    if (!user || user.isActive === false || user.status === "BLOCKED") {
+      return { valid: false, reason: "account_inactive" };
+    }
+
+    const currentSessionId = asText(user.currentSessionId);
+    if (
+      user.allowMultipleSessions !== true &&
+      currentSessionId &&
+      currentSessionId !== sessionId
+    ) {
+      return { valid: false, reason: "session_not_current" };
+    }
+  }
+
+  await touchSessionHeartbeat({ principalId, role, sessionId });
+  return { valid: true };
+};
+
 const verifyTokenAndHydrate = async (req) => {
   const { ordered } = resolveTokenCandidates(req);
   if (!ordered.length) {
-    return { token: "", principal: null, hydrated: null, invalidReason: "" };
+    return { token: "", principal: null, hydrated: null, sessionInvalid: false };
   }
 
   let lastError = null;
+  let sessionInvalid = false;
   for (const token of ordered) {
     try {
       const payload = verifyAccessToken(token);
@@ -145,11 +200,13 @@ const verifyTokenAndHydrate = async (req) => {
       }
 
       const hydrated = await hydratePrincipal(principal);
-      if (hydrated?.auth) {
-        return { token, principal, hydrated };
-      }
-      if (hydrated?.invalidReason) {
-        return { token, principal, hydrated: null, invalidReason: hydrated.invalidReason };
+      if (hydrated) {
+        const sessionState = await validateSessionState({ principal });
+        if (!sessionState.valid) {
+          sessionInvalid = true;
+          continue;
+        }
+        return { token, principal, hydrated, sessionInvalid: false };
       }
     } catch (error) {
       lastError = error;
@@ -160,20 +217,20 @@ const verifyTokenAndHydrate = async (req) => {
     throw lastError;
   }
 
-  return { token: "", principal: null, hydrated: null, invalidReason: "" };
+  return { token: "", principal: null, hydrated: null, sessionInvalid };
 };
 
 // Middleware for required authentication
 export const auth = async (req, res, next) => {
   try {
-    const { hydrated, invalidReason } = await verifyTokenAndHydrate(req);
+    const { hydrated, sessionInvalid } = await verifyTokenAndHydrate(req);
 
     if (!hydrated) {
-      if (invalidReason === "SESSION_INVALID") {
+      if (sessionInvalid) {
         return res.status(401).json({
           success: false,
           code: "SESSION_INVALID",
-          message: "SESSION_INVALID",
+          message: SESSION_INVALID_MESSAGE,
         });
       }
       return res.status(401).json({
@@ -211,7 +268,7 @@ export const optionalAuth = async (req, res, next) => {
         }
 
         const hydrated = await hydratePrincipal(principal);
-        if (!hydrated?.auth) {
+        if (!hydrated) {
           continue;
         }
 

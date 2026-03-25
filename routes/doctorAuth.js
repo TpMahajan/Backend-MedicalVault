@@ -111,53 +111,18 @@ if (String(process.env.NODE_ENV || "").toLowerCase() !== "production") {
 
 const router = express.Router();
 
-const resolveAllowMultiSession = async (doctorId) => {
-  const doctor = await DoctorUser.findById(doctorId)
-    .select("securitySettings.allowMultiSession")
-    .lean();
-  return doctor?.securitySettings?.allowMultiSession !== false;
-};
-
 const persistRefreshToken = async (req, doctorId, refreshToken, refreshMeta) => {
   const decoded = verifyRefreshToken(refreshToken);
   const expiresAt = new Date((decoded.exp || 0) * 1000);
-  const sessionId = String(refreshMeta?.sid || "").trim();
-  if (!sessionId) {
-    throw new Error("Missing session id for doctor refresh token");
-  }
-  const allowMultiSession = await resolveAllowMultiSession(doctorId);
-
-  if (!allowMultiSession) {
-    await RefreshToken.updateMany(
-      {
-        principalId: String(doctorId),
-        role: "doctor",
-        revokedAt: null,
-        expiresAt: { $gt: new Date() },
-        sessionId: { $ne: sessionId },
-      },
-      {
-        $set: {
-          revokedAt: new Date(),
-          revokedReason: "single_session_enforced",
-          isCurrentSession: false,
-        },
-      }
-    );
-  }
-
-  const existingActiveSession = allowMultiSession
-    ? await RefreshToken.findOne({
-        principalId: String(doctorId),
-        role: "doctor",
-        revokedAt: null,
-        expiresAt: { $gt: new Date() },
-        isCurrentSession: { $ne: false },
-      })
-        .sort({ createdAt: -1 })
-        .select("createdByIp deviceInfo userAgent")
-        .lean()
-    : null;
+  const existingActiveSession = await RefreshToken.findOne({
+    principalId: String(doctorId),
+    role: "doctor",
+    revokedAt: null,
+    expiresAt: { $gt: new Date() },
+  })
+    .sort({ createdAt: -1 })
+    .select("createdByIp deviceInfo userAgent")
+    .lean();
 
   const incomingDevice = String(req.headers["sec-ch-ua-platform"] || req.headers["x-device-info"] || "");
   const incomingIp = req.ip || "";
@@ -180,35 +145,18 @@ const persistRefreshToken = async (req, doctorId, refreshToken, refreshMeta) => 
     });
   }
 
-  await RefreshToken.findOneAndUpdate(
-    { sessionId },
-    {
-      $set: {
-        principalId: String(doctorId),
-        role: "doctor",
-        tokenHash: hashToken(refreshToken),
-        familyId: refreshMeta.familyId,
-        jti: refreshMeta.jti,
-        expiresAt,
-        revokedAt: null,
-        revokedReason: "",
-        replacedByTokenHash: "",
-        createdByIp: req.ip || "",
-        userAgent: req.headers["user-agent"] || "",
-        deviceInfo: String(
-          req.headers["sec-ch-ua-platform"] || req.headers["x-device-info"] || ""
-        ),
-        deviceId: String(req.body?.deviceId || req.headers["x-device-id"] || ""),
-        lastActiveAt: new Date(),
-        isCurrentSession: true,
-      },
-    },
-    {
-      upsert: true,
-      new: true,
-      setDefaultsOnInsert: true,
-    }
-  );
+  await RefreshToken.create({
+    principalId: String(doctorId),
+    role: "doctor",
+    tokenHash: hashToken(refreshToken),
+    familyId: refreshMeta.familyId,
+    jti: refreshMeta.jti,
+    expiresAt,
+    createdByIp: req.ip || "",
+    userAgent: req.headers["user-agent"] || "",
+    deviceInfo: String(req.headers["sec-ch-ua-platform"] || req.headers["x-device-info"] || ""),
+    lastActiveAt: new Date(),
+  });
 };
 
 // ================= Signup =================
@@ -240,7 +188,7 @@ router.post("/signup", async (req, res) => {
 
     await doctor.save();
 
-    const { accessToken, refreshToken, refreshMeta, sessionId } = issueAuthTokenSet({
+    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
       principalId: doctor._id.toString(),
       role: "doctor",
       email: doctor.email,
@@ -262,7 +210,6 @@ router.post("/signup", async (req, res) => {
       },
       token: accessToken,
       refreshToken,
-      sessionId,
     });
   } catch (error) {
     console.error("Signup error:", error);
@@ -313,7 +260,7 @@ router.post("/login", authLimiter, async (req, res) => {
       return res.status(401).json({ success: false, message: "Invalid email or password." });
     }
 
-    const { accessToken, refreshToken, refreshMeta, sessionId } = issueAuthTokenSet({
+    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
       principalId: doctor._id.toString(),
       role: "doctor",
       email: doctor.email,
@@ -329,7 +276,6 @@ router.post("/login", authLimiter, async (req, res) => {
       message: "Login successful.",
       token: accessToken,
       refreshToken,
-      sessionId,
       doctor: {
         id: doctor._id,
         name: doctor.name,
@@ -367,7 +313,6 @@ router.post("/refresh", async (req, res) => {
     const existing = await RefreshToken.findOne({
       tokenHash: hashToken(provided),
       revokedAt: null,
-      isCurrentSession: { $ne: false },
     });
     if (!existing || existing.expiresAt <= new Date()) {
       return res.status(401).json({ success: false, message: "Refresh token expired or revoked." });
@@ -378,12 +323,11 @@ router.post("/refresh", async (req, res) => {
       return res.status(403).json({ success: false, message: "Doctor account inactive." });
     }
 
-    const { accessToken, refreshToken, refreshMeta, sessionId } = issueAuthTokenSet({
+    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
       principalId: doctor._id.toString(),
       role: "doctor",
       email: doctor.email,
       familyId: decoded.familyId,
-      sessionId: String(existing.sessionId || decoded.sid || "").trim() || undefined,
     });
 
     existing.revokedAt = new Date();
@@ -393,7 +337,7 @@ router.post("/refresh", async (req, res) => {
     await persistRefreshToken(req, doctor._id, refreshToken, refreshMeta);
 
     setAuthCookies(res, { accessToken, refreshToken });
-    return res.json({ success: true, token: accessToken, refreshToken, sessionId });
+    return res.json({ success: true, token: accessToken, refreshToken });
   } catch {
     return res.status(401).json({ success: false, message: "Invalid refresh token." });
   }
@@ -406,7 +350,7 @@ router.post("/logout", auth, async (req, res) => {
     if (provided) {
       await RefreshToken.updateOne(
         { tokenHash: hashToken(provided), revokedAt: null },
-        { $set: { revokedAt: new Date(), revokedReason: "logout", isCurrentSession: false } }
+        { $set: { revokedAt: new Date(), revokedReason: "logout" } }
       );
     }
     clearAuthCookies(res);
@@ -645,13 +589,7 @@ router.put("/security-settings", auth, async (req, res) => {
       return res.status(404).json({ success: false, message: "Doctor not found." });
     }
 
-    const {
-      twoFactorAuth,
-      sessionTimeout,
-      passwordExpiry,
-      loginNotifications,
-      allowMultiSession,
-    } = req.body;
+    const { twoFactorAuth, sessionTimeout, passwordExpiry, loginNotifications } = req.body;
 
     // Validate input
     const updateData = {};
@@ -667,48 +605,12 @@ router.put("/security-settings", auth, async (req, res) => {
     if (typeof loginNotifications === 'boolean') {
       updateData['securitySettings.loginNotifications'] = loginNotifications;
     }
-    if (typeof allowMultiSession === 'boolean') {
-      updateData['securitySettings.allowMultiSession'] = allowMultiSession;
-    }
 
     const updatedDoctor = await DoctorUser.findByIdAndUpdate(
       req.doctor._id,
       { $set: updateData },
       { new: true, runValidators: true }
     ).select("-password");
-
-    let revokedCount = 0;
-    if (allowMultiSession === false) {
-      const activeTokens = await RefreshToken.find({
-        principalId: req.doctor._id.toString(),
-        role: "doctor",
-        revokedAt: null,
-        expiresAt: { $gt: new Date() },
-      })
-        .sort({ lastActiveAt: -1, createdAt: -1 })
-        .select("_id")
-        .lean();
-
-      if (activeTokens.length > 1) {
-        const keepTokenId = activeTokens[0]?._id;
-        const revokeResult = await RefreshToken.updateMany(
-          {
-            principalId: req.doctor._id.toString(),
-            role: "doctor",
-            revokedAt: null,
-            _id: { $ne: keepTokenId },
-          },
-          {
-            $set: {
-              revokedAt: new Date(),
-              revokedReason: "single_session_enforced",
-              isCurrentSession: false,
-            },
-          }
-        );
-        revokedCount = revokeResult.modifiedCount || 0;
-      }
-    }
 
     // Calculate password expiry info
     const passwordInfo = {
@@ -728,7 +630,6 @@ router.put("/security-settings", auth, async (req, res) => {
       message: "Security settings updated successfully.",
       securitySettings: updatedDoctor.securitySettings,
       passwordInfo: passwordInfo,
-      revokedSessions: revokedCount,
     });
   } catch (error) {
     console.error("Update security settings error:", error);

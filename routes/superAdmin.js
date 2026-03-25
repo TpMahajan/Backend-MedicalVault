@@ -413,39 +413,16 @@ async function ensureSuperAdminCredential(targetEmail) {
 async function persistRefreshTokenForSuperAdmin(req, principalEmail, refreshToken, refreshMeta) {
   const decoded = verifyRefreshToken(refreshToken);
   const expiresAt = new Date((decoded.exp || 0) * 1000);
-  const sessionId = String(refreshMeta?.sid || "").trim();
-  if (!sessionId) {
-    throw new Error("Missing session id for superadmin refresh token");
-  }
-  await RefreshToken.findOneAndUpdate(
-    { sessionId },
-    {
-      $set: {
-        principalId: principalEmail,
-        role: "superadmin",
-        tokenHash: hashToken(refreshToken),
-        familyId: refreshMeta.familyId,
-        jti: refreshMeta.jti,
-        expiresAt,
-        revokedAt: null,
-        revokedReason: "",
-        replacedByTokenHash: "",
-        createdByIp: req.ip || "",
-        userAgent: req.headers["user-agent"] || "",
-        deviceInfo: String(
-          req.headers["x-device-info"] || req.headers["sec-ch-ua-platform"] || ""
-        ),
-        deviceId: String(req.body?.deviceId || req.headers["x-device-id"] || ""),
-        lastActiveAt: new Date(),
-        isCurrentSession: true,
-      },
-    },
-    {
-      upsert: true,
-      new: true,
-      setDefaultsOnInsert: true,
-    }
-  );
+  await RefreshToken.create({
+    principalId: principalEmail,
+    role: "superadmin",
+    tokenHash: hashToken(refreshToken),
+    familyId: refreshMeta.familyId,
+    jti: refreshMeta.jti,
+    expiresAt,
+    createdByIp: req.ip || "",
+    userAgent: req.headers["user-agent"] || "",
+  });
 }
 
 async function logActivity(req, payload) {
@@ -664,7 +641,7 @@ router.post("/auth/login", LOGIN_LIMITER, async (req, res) => {
     const principalEmail = String(credential.email || email)
       .trim()
       .toLowerCase();
-    const { accessToken, refreshToken, refreshMeta, sessionId } = issueAuthTokenSet({
+    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
       principalId: principalEmail,
       role: "superadmin",
       email: principalEmail,
@@ -684,7 +661,6 @@ router.post("/auth/login", LOGIN_LIMITER, async (req, res) => {
       success: true,
       token: accessToken,
       refreshToken,
-      sessionId,
       mustChangePassword: credential.mustChangePassword === true,
       user: {
         email: principalEmail,
@@ -725,7 +701,6 @@ router.post("/auth/refresh", async (req, res) => {
     const existing = await RefreshToken.findOne({
       tokenHash: hashToken(providedRefreshToken),
       revokedAt: null,
-      isCurrentSession: { $ne: false },
     });
     if (!existing || existing.expiresAt <= new Date()) {
       return res.status(401).json({ success: false, message: "Refresh token is expired or revoked" });
@@ -735,12 +710,11 @@ router.post("/auth/refresh", async (req, res) => {
     if (!credential) {
       return res.status(401).json({ success: false, message: "Invalid refresh token principal" });
     }
-    const { accessToken, refreshToken, refreshMeta, sessionId } = issueAuthTokenSet({
+    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
       principalId: principalEmail,
       role: "superadmin",
       email: principalEmail,
       familyId: decoded.familyId,
-      sessionId: String(existing.sessionId || decoded.sid || "").trim() || undefined,
     });
 
     existing.revokedAt = new Date();
@@ -760,7 +734,6 @@ router.post("/auth/refresh", async (req, res) => {
       success: true,
       token: accessToken,
       refreshToken,
-      sessionId,
       mustChangePassword: credential.mustChangePassword === true,
     });
   } catch (error) {
@@ -833,7 +806,7 @@ router.post("/auth/logout", requireSuperAdminAuth, async (req, res) => {
     if (providedRefreshToken) {
       await RefreshToken.updateOne(
         { tokenHash: hashToken(providedRefreshToken), revokedAt: null },
-        { $set: { revokedAt: new Date(), revokedReason: "logout", isCurrentSession: false } }
+        { $set: { revokedAt: new Date(), revokedReason: "logout" } }
       );
     }
 

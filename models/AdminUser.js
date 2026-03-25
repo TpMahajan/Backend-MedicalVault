@@ -89,8 +89,6 @@ const AdminUserSchema = new mongoose.Schema(
       default: ROLE_PERMISSION_MAP.PRODUCT_ADMIN,
       enum: ADMIN_PERMISSIONS,
     },
-    resetTokenHash: { type: String, default: null },
-    resetTokenExpiry: { type: Date, default: null },
     accessExpiresAt: { type: Date, default: null, index: true },
     temporaryAccessReason: { type: String, default: "", trim: true, maxlength: 240 },
   },
