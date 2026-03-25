@@ -31,6 +31,17 @@ const refreshTokenSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    sessionId: {
+      type: String,
+      required: true,
+      index: true,
+    },
+    deviceId: {
+      type: String,
+      default: "",
+      trim: true,
+      index: true,
+    },
     expiresAt: {
       type: Date,
       required: true,
@@ -68,6 +79,11 @@ const refreshTokenSchema = new mongoose.Schema(
       default: Date.now,
       index: true,
     },
+    isCurrentSession: {
+      type: Boolean,
+      default: true,
+      index: true,
+    },
   },
   {
     timestamps: true,
@@ -76,5 +92,6 @@ const refreshTokenSchema = new mongoose.Schema(
 );
 
 refreshTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+refreshTokenSchema.index({ sessionId: 1 }, { unique: true });
 
 export const RefreshToken = mongoose.model("RefreshToken", refreshTokenSchema);

@@ -32,11 +32,16 @@ router.post("/signup", (_req, res) => {
 const persistRefreshToken = async (req, adminId, refreshToken, refreshMeta) => {
   const decoded = verifyRefreshToken(refreshToken);
   const expiresAt = new Date((decoded.exp || 0) * 1000);
+  const sessionId = String(refreshMeta?.sid || "").trim();
+  if (!sessionId) {
+    throw new Error("Missing session id for admin refresh token");
+  }
   const existingActiveSession = await RefreshToken.findOne({
     principalId: String(adminId),
     role: "admin",
     revokedAt: null,
     expiresAt: { $gt: new Date() },
+    isCurrentSession: { $ne: false },
   })
     .sort({ createdAt: -1 })
     .select("createdByIp deviceInfo userAgent")
@@ -62,18 +67,35 @@ const persistRefreshToken = async (req, adminId, refreshToken, refreshMeta) => {
     });
   }
 
-  await RefreshToken.create({
-    principalId: String(adminId),
-    role: "admin",
-    tokenHash: hashToken(refreshToken),
-    familyId: refreshMeta.familyId,
-    jti: refreshMeta.jti,
-    expiresAt,
-    createdByIp: req.ip || "",
-    userAgent: req.headers["user-agent"] || "",
-    deviceInfo: String(req.headers["sec-ch-ua-platform"] || req.headers["x-device-info"] || ""),
-    lastActiveAt: new Date(),
-  });
+  await RefreshToken.findOneAndUpdate(
+    { sessionId },
+    {
+      $set: {
+        principalId: String(adminId),
+        role: "admin",
+        tokenHash: hashToken(refreshToken),
+        familyId: refreshMeta.familyId,
+        jti: refreshMeta.jti,
+        expiresAt,
+        revokedAt: null,
+        revokedReason: "",
+        replacedByTokenHash: "",
+        createdByIp: req.ip || "",
+        userAgent: req.headers["user-agent"] || "",
+        deviceInfo: String(
+          req.headers["sec-ch-ua-platform"] || req.headers["x-device-info"] || ""
+        ),
+        deviceId: String(req.body?.deviceId || req.headers["x-device-id"] || ""),
+        lastActiveAt: new Date(),
+        isCurrentSession: true,
+      },
+    },
+    {
+      upsert: true,
+      new: true,
+      setDefaultsOnInsert: true,
+    }
+  );
 };
 
 // POST /api/admin/login
@@ -115,7 +137,7 @@ router.post("/login", authLimiter, async (req, res) => {
     admin.lastLogin = new Date();
     await admin.save();
 
-    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
+    const { accessToken, refreshToken, refreshMeta, sessionId } = issueAuthTokenSet({
       principalId: admin._id.toString(),
       role: "admin",
       email: admin.email,
@@ -138,6 +160,7 @@ router.post("/login", authLimiter, async (req, res) => {
       },
       token: accessToken,
       refreshToken,
+      sessionId,
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
@@ -176,7 +199,11 @@ router.post("/refresh", async (req, res) => {
     }
 
     const tokenHash = hashToken(provided);
-    const stored = await RefreshToken.findOne({ tokenHash, revokedAt: null });
+    const stored = await RefreshToken.findOne({
+      tokenHash,
+      revokedAt: null,
+      isCurrentSession: { $ne: false },
+    });
     if (!stored || stored.expiresAt <= new Date()) {
       return res.status(401).json({ success: false, message: "Refresh token expired or revoked" });
     }
@@ -186,11 +213,12 @@ router.post("/refresh", async (req, res) => {
       return res.status(403).json({ success: false, message: "Admin account inactive" });
     }
 
-    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
+    const { accessToken, refreshToken, refreshMeta, sessionId } = issueAuthTokenSet({
       principalId: admin._id.toString(),
       role: "admin",
       email: admin.email,
       familyId: decoded.familyId,
+      sessionId: String(stored.sessionId || decoded.sid || "").trim() || undefined,
     });
 
     stored.revokedAt = new Date();
@@ -201,7 +229,7 @@ router.post("/refresh", async (req, res) => {
     await persistRefreshToken(req, admin._id, refreshToken, refreshMeta);
     setAuthCookies(res, { accessToken, refreshToken });
 
-    return res.json({ success: true, token: accessToken, refreshToken });
+    return res.json({ success: true, token: accessToken, refreshToken, sessionId });
   } catch {
     return res.status(401).json({ success: false, message: "Invalid refresh token" });
   }
@@ -214,7 +242,7 @@ router.post("/logout", requireAdminAuth, async (req, res) => {
     if (provided) {
       await RefreshToken.updateOne(
         { tokenHash: hashToken(provided), revokedAt: null },
-        { $set: { revokedAt: new Date(), revokedReason: "logout" } }
+        { $set: { revokedAt: new Date(), revokedReason: "logout", isCurrentSession: false } }
       );
     }
 

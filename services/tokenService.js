@@ -3,6 +3,7 @@ import jwt from "jsonwebtoken";
 
 const ACCESS_TTL = process.env.JWT_ACCESS_EXPIRES_IN || "15m";
 const REFRESH_TTL = process.env.JWT_REFRESH_EXPIRES_IN || "7d";
+const LOGIN_ATTEMPT_TTL = process.env.LOGIN_ATTEMPT_TOKEN_EXPIRES_IN || "10m";
 
 const getAccessSecret = () => {
   if (!process.env.JWT_SECRET) {
@@ -16,22 +17,40 @@ const getAccessSecret = () => {
 };
 
 const getRefreshSecret = () => process.env.JWT_REFRESH_SECRET || getAccessSecret();
+const getLoginAttemptSecret = () =>
+  process.env.JWT_LOGIN_ATTEMPT_SECRET || getAccessSecret();
 
 const toRole = (role) => String(role || "").trim().toLowerCase();
 
-export const buildAccessPayload = ({ principalId, role, email = "" }) => ({
+export const buildAccessPayload = ({
+  principalId,
+  role,
+  email = "",
+  sessionId = "",
+}) => ({
   sub: String(principalId),
   userId: String(principalId),
   role: toRole(role),
+  ...(sessionId ? { sid: String(sessionId) } : {}),
   ...(email ? { email: String(email).toLowerCase() } : {}),
 });
 
-export const signAccessToken = ({ principalId, role, email = "" }) =>
-  jwt.sign(buildAccessPayload({ principalId, role, email }), getAccessSecret(), {
-    expiresIn: ACCESS_TTL,
-  });
+export const signAccessToken = ({ principalId, role, email = "", sessionId = "" }) =>
+  jwt.sign(
+    buildAccessPayload({ principalId, role, email, sessionId }),
+    getAccessSecret(),
+    {
+      expiresIn: ACCESS_TTL,
+    }
+  );
 
-export const signRefreshToken = ({ principalId, role, familyId, email = "" }) => {
+export const signRefreshToken = ({
+  principalId,
+  role,
+  familyId,
+  email = "",
+  sessionId = "",
+}) => {
   const jti = crypto.randomUUID();
   const payload = {
     sub: String(principalId),
@@ -39,6 +58,7 @@ export const signRefreshToken = ({ principalId, role, familyId, email = "" }) =>
     typ: "refresh",
     jti,
     familyId: familyId || crypto.randomUUID(),
+    ...(sessionId ? { sid: String(sessionId) } : {}),
     ...(email ? { email: String(email).toLowerCase() } : {}),
   };
   const token = jwt.sign(payload, getRefreshSecret(), { expiresIn: REFRESH_TTL });
@@ -47,6 +67,26 @@ export const signRefreshToken = ({ principalId, role, familyId, email = "" }) =>
 
 export const verifyAccessToken = (token) => jwt.verify(token, getAccessSecret());
 export const verifyRefreshToken = (token) => jwt.verify(token, getRefreshSecret());
+export const verifyLoginAttemptToken = (token) =>
+  jwt.verify(token, getLoginAttemptSecret());
+
+export const signLoginAttemptToken = ({
+  attemptId,
+  principalId,
+  role,
+  deviceId = "",
+}) =>
+  jwt.sign(
+    {
+      attemptId: String(attemptId),
+      sub: String(principalId),
+      role: toRole(role),
+      typ: "login_attempt",
+      ...(deviceId ? { deviceId: String(deviceId) } : {}),
+    },
+    getLoginAttemptSecret(),
+    { expiresIn: LOGIN_ATTEMPT_TTL }
+  );
 
 export const hashToken = (token) =>
   crypto.createHash("sha256").update(String(token)).digest("hex");
@@ -124,16 +164,36 @@ export const clearAuthCookies = (res) => {
   res.clearCookie("mv_rt", options);
 };
 
-export const issueAuthTokenSet = ({ principalId, role, email = "", familyId }) => {
-  const accessToken = signAccessToken({ principalId, role, email });
-  const refresh = signRefreshToken({ principalId, role, familyId, email });
+export const issueAuthTokenSet = ({
+  principalId,
+  role,
+  email = "",
+  familyId,
+  sessionId,
+}) => {
+  const resolvedSessionId = String(sessionId || crypto.randomUUID());
+  const accessToken = signAccessToken({
+    principalId,
+    role,
+    email,
+    sessionId: resolvedSessionId,
+  });
+  const refresh = signRefreshToken({
+    principalId,
+    role,
+    familyId,
+    email,
+    sessionId: resolvedSessionId,
+  });
   return {
     accessToken,
     refreshToken: refresh.token,
     refreshMeta: refresh.payload,
     expiresIn: ACCESS_TTL,
+    sessionId: resolvedSessionId,
   };
 };
 
 export const ACCESS_TOKEN_TTL = ACCESS_TTL;
 export const REFRESH_TOKEN_TTL = REFRESH_TTL;
+export const LOGIN_ATTEMPT_TOKEN_TTL = LOGIN_ATTEMPT_TTL;

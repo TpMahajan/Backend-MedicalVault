@@ -32,10 +32,19 @@ import {
   hashToken,
   issueAuthTokenSet,
   parseCookies,
+  signLoginAttemptToken,
   setAuthCookies,
+  verifyLoginAttemptToken,
   verifyRefreshToken,
 } from "../services/tokenService.js";
 import { RefreshToken } from "../models/RefreshToken.js";
+import { LoginAttempt } from "../models/LoginAttempt.js";
+import {
+  emitLoginApprovedEvent,
+  emitLoginAttemptEvent,
+  emitLoginDeniedEvent,
+  emitSessionInvalidatedEvent,
+} from "../services/authSessionRealtime.js";
 import {
   isActorTemporarilyBlocked,
   monitorFailedLogin,
@@ -99,99 +108,302 @@ const resolveResettableAccountByTokenPayload = async (payload) => {
   return { ...roleDefinition, account };
 };
 
-const resolveAllowMultiSession = async ({ principalId, role }) => {
-  const normalizedRole = String(role || "").toLowerCase();
+const SESSION_INVALID_CODE = "SESSION_INVALID";
+const LOGIN_APPROVAL_REQUIRED_CODE = "LOGIN_APPROVAL_REQUIRED";
+const LOGIN_ATTEMPT_TTL_MS = Number(
+  process.env.LOGIN_ATTEMPT_WINDOW_MS || 5 * 60 * 1000
+);
+const loginLocks = new Map();
 
-  if (normalizedRole === "doctor") {
-    const doctor = await DoctorUser.findById(principalId)
-      .select("securitySettings.allowMultiSession")
-      .lean();
-    return doctor?.securitySettings?.allowMultiSession !== false;
+const asText = (value) => (value == null ? "" : String(value).trim());
+
+const resolveDeviceContext = (req, overrides = {}) => ({
+  deviceId: asText(
+    overrides.deviceId ||
+      req.body?.deviceId ||
+      req.headers["x-device-id"] ||
+      ""
+  ).slice(0, 200),
+  deviceInfo: asText(
+    overrides.deviceInfo ||
+      req.headers["x-device-info"] ||
+      req.headers["sec-ch-ua-platform"] ||
+      ""
+  ).slice(0, 300),
+  userAgent: asText(overrides.userAgent || req.headers["user-agent"] || "").slice(
+    0,
+    500
+  ),
+  ipAddress: asText(overrides.ipAddress || req.ip || "").slice(0, 100),
+});
+
+const normalizeRole = (role) => asText(role).toLowerCase();
+
+const runWithLoginLock = async (lockKey, work) => {
+  while (loginLocks.has(lockKey)) {
+    try {
+      await loginLocks.get(lockKey);
+    } catch {
+      // Ignore previous lock failures.
+    }
   }
 
-  const user = await User.findById(principalId)
-    .select("securitySettings.allowMultiSession")
-    .lean();
-  return user?.securitySettings?.allowMultiSession !== false;
+  let release;
+  const waitHandle = new Promise((resolve) => {
+    release = resolve;
+  });
+  loginLocks.set(lockKey, waitHandle);
+
+  try {
+    return await work();
+  } finally {
+    release();
+    if (loginLocks.get(lockKey) === waitHandle) {
+      loginLocks.delete(lockKey);
+    }
+  }
 };
 
-const persistRefreshToken = async (req, principalId, role, refreshToken, refreshMeta) => {
+const isSameDevice = (existing, incoming) => {
+  const existingDeviceId = asText(existing?.deviceId);
+  const incomingDeviceId = asText(incoming?.deviceId);
+  if (existingDeviceId && incomingDeviceId) {
+    return existingDeviceId === incomingDeviceId;
+  }
+
+  const existingUa = asText(existing?.userAgent || "").toLowerCase();
+  const incomingUa = asText(incoming?.userAgent || "").toLowerCase();
+  const existingInfo = asText(existing?.deviceInfo || "").toLowerCase();
+  const incomingInfo = asText(incoming?.deviceInfo || "").toLowerCase();
+
+  if (!existingUa || !incomingUa) return false;
+  if (existingUa !== incomingUa) return false;
+  if (existingInfo && incomingInfo && existingInfo !== incomingInfo) {
+    return false;
+  }
+  return true;
+};
+
+const findLatestActiveSession = async ({ principalId, role }) =>
+  RefreshToken.findOne({
+    principalId: asText(principalId),
+    role: normalizeRole(role),
+    sessionId: { $exists: true, $ne: "" },
+    revokedAt: null,
+    expiresAt: { $gt: new Date() },
+    isCurrentSession: { $ne: false },
+  })
+    .sort({ lastActiveAt: -1, createdAt: -1 })
+    .lean();
+
+const revokeActiveSessions = async ({
+  principalId,
+  role,
+  reason,
+  skipSessionId = "",
+  emitRealtime = false,
+}) => {
+  const baseQuery = {
+    principalId: asText(principalId),
+    role: normalizeRole(role),
+    revokedAt: null,
+    expiresAt: { $gt: new Date() },
+    isCurrentSession: { $ne: false },
+  };
+  if (asText(skipSessionId)) {
+    baseQuery.sessionId = { $ne: asText(skipSessionId) };
+  }
+
+  const rows = await RefreshToken.find(baseQuery).select("sessionId").lean();
+  if (!rows.length) return 0;
+
+  await RefreshToken.updateMany(baseQuery, {
+    $set: {
+      revokedAt: new Date(),
+      revokedReason: asText(reason) || "session_invalidated",
+      isCurrentSession: false,
+    },
+  });
+
+  if (emitRealtime) {
+    for (const row of rows) {
+      if (!asText(row?.sessionId)) continue;
+      emitSessionInvalidatedEvent({
+        sessionId: row.sessionId,
+        reason: asText(reason) || "session_invalidated",
+      });
+    }
+  }
+
+  return rows.length;
+};
+
+const persistRefreshToken = async (
+  req,
+  principalId,
+  role,
+  refreshToken,
+  refreshMeta,
+  context = {}
+) => {
   const decoded = verifyRefreshToken(refreshToken);
   const expiresAt = new Date((decoded.exp || 0) * 1000);
-  const roleKey = String(role).toLowerCase();
-  const allowMultiSession = await resolveAllowMultiSession({
+  const roleKey = normalizeRole(role);
+  const sessionId = asText(refreshMeta?.sid || context.sessionId);
+  if (!sessionId) {
+    throw new Error("Missing session id while persisting refresh token");
+  }
+
+  const device = resolveDeviceContext(req, context);
+  const existingActiveSession = await findLatestActiveSession({
     principalId,
     role: roleKey,
   });
 
-  if (!allowMultiSession) {
-    await RefreshToken.updateMany(
-      {
-        principalId: String(principalId),
-        role: roleKey,
-        revokedAt: null,
-        expiresAt: { $gt: new Date() },
-      },
-      { $set: { revokedAt: new Date(), revokedReason: "single_session_enforced" } }
-    );
-  }
+  if (existingActiveSession && existingActiveSession.sessionId !== sessionId) {
+    if (!isSameDevice(existingActiveSession, device)) {
+      await monitorSuspiciousSession({
+        actorEmail: req.body?.email || "",
+        actorRole: roleKey,
+        ipAddress: device.ipAddress,
+        userAgent: device.userAgent,
+        metadata: {
+          previousDevice: existingActiveSession.deviceInfo || "",
+          previousIp: existingActiveSession.createdByIp || "",
+          newDevice: device.deviceInfo,
+          newIp: device.ipAddress,
+        },
+      });
+    }
 
-  const existingActiveSession = allowMultiSession
-    ? await RefreshToken.findOne({
-        principalId: String(principalId),
-        role: roleKey,
-        revokedAt: null,
-        expiresAt: { $gt: new Date() },
-      })
-        .sort({ createdAt: -1 })
-        .select("createdByIp deviceInfo userAgent")
-        .lean()
-    : null;
-
-  const incomingDevice = String(req.headers["sec-ch-ua-platform"] || req.headers["x-device-info"] || "");
-  const incomingIp = req.ip || "";
-  if (
-    existingActiveSession &&
-    ((incomingDevice && existingActiveSession.deviceInfo && incomingDevice !== existingActiveSession.deviceInfo) ||
-      (incomingIp && existingActiveSession.createdByIp && incomingIp !== existingActiveSession.createdByIp))
-  ) {
-    await monitorSuspiciousSession({
-      actorEmail: req.body?.email || "",
-      actorRole: roleKey,
-      ipAddress: incomingIp,
-      userAgent: req.headers["user-agent"] || "",
-      metadata: {
-        previousDevice: existingActiveSession.deviceInfo || "",
-        previousIp: existingActiveSession.createdByIp || "",
-        newDevice: incomingDevice,
-        newIp: incomingIp,
-      },
+    await revokeActiveSessions({
+      principalId,
+      role: roleKey,
+      reason: "single_session_enforced",
+      skipSessionId: sessionId,
+      emitRealtime: false,
     });
   }
 
-  await RefreshToken.create({
-    principalId: String(principalId),
-    role: roleKey,
-    tokenHash: hashToken(refreshToken),
-    familyId: refreshMeta.familyId,
-    jti: refreshMeta.jti,
-    expiresAt,
-    createdByIp: req.ip || "",
-    userAgent: req.headers["user-agent"] || "",
-    deviceInfo: String(req.headers["sec-ch-ua-platform"] || req.headers["x-device-info"] || ""),
-    lastActiveAt: new Date(),
-  });
+  await RefreshToken.findOneAndUpdate(
+    {
+      sessionId,
+    },
+    {
+      $set: {
+        principalId: asText(principalId),
+        role: roleKey,
+        tokenHash: hashToken(refreshToken),
+        familyId: refreshMeta.familyId,
+        jti: refreshMeta.jti,
+        expiresAt,
+        revokedAt: null,
+        revokedReason: "",
+        replacedByTokenHash: "",
+        createdByIp: device.ipAddress,
+        userAgent: device.userAgent,
+        deviceInfo: device.deviceInfo,
+        deviceId: device.deviceId,
+        lastActiveAt: new Date(),
+        isCurrentSession: true,
+      },
+      $setOnInsert: {
+        createdAt: new Date(),
+      },
+    },
+    {
+      upsert: true,
+      new: true,
+      setDefaultsOnInsert: true,
+    }
+  );
 };
 
-const issueLoginTokens = async (req, res, { principalId, role, email }) => {
-  const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
-    principalId,
-    role,
-    email,
+const issueLoginTokens = async (
+  req,
+  res,
+  { principalId, role, email, sessionId, deviceContext }
+) => {
+  const { accessToken, refreshToken, refreshMeta, sessionId: issuedSessionId } =
+    issueAuthTokenSet({
+      principalId,
+      role,
+      email,
+      sessionId,
+    });
+  await persistRefreshToken(req, principalId, role, refreshToken, refreshMeta, {
+    ...(deviceContext || {}),
+    sessionId: issuedSessionId,
   });
-  await persistRefreshToken(req, principalId, role, refreshToken, refreshMeta);
   setAuthCookies(res, { accessToken, refreshToken });
-  return { accessToken, refreshToken };
+  return { accessToken, refreshToken, sessionId: issuedSessionId };
+};
+
+const createOrReusePendingLoginAttempt = async ({
+  principalId,
+  role,
+  requestedDeviceId,
+  requestedDeviceInfo,
+  requestedUserAgent,
+  requestedIp,
+  activeSessionId,
+  activeDeviceId,
+}) => {
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + LOGIN_ATTEMPT_TTL_MS);
+  const filter = {
+    principalId: asText(principalId),
+    role: normalizeRole(role),
+    status: "pending",
+    expiresAt: { $gt: now },
+  };
+
+  const update = {
+    $set: {
+      requestedDeviceId: asText(requestedDeviceId),
+      requestedDeviceInfo: asText(requestedDeviceInfo),
+      requestedUserAgent: asText(requestedUserAgent),
+      requestedIp: asText(requestedIp),
+      activeSessionId: asText(activeSessionId),
+      activeDeviceId: asText(activeDeviceId),
+      expiresAt,
+      respondedAt: null,
+      consumedAt: null,
+    },
+    $setOnInsert: {
+      principalId: asText(principalId),
+      role: normalizeRole(role),
+      status: "pending",
+    },
+  };
+
+  try {
+    return await LoginAttempt.findOneAndUpdate(filter, update, {
+      upsert: true,
+      new: true,
+      setDefaultsOnInsert: true,
+    });
+  } catch (error) {
+    if (error?.code !== 11000) throw error;
+    return LoginAttempt.findOne(filter);
+  }
+};
+
+const resolvePrincipalAccount = async ({ principalId, role }) => {
+  const normalizedRole = normalizeRole(role);
+  if (normalizedRole === "doctor") {
+    return DoctorUser.findById(principalId).select(
+      "_id email name specialization isActive status lastLogin"
+    );
+  }
+
+  if (normalizedRole === "patient") {
+    return User.findById(principalId).select(
+      "_id email name mobile emailVerified isActive status profilePicture loginType googleId lastLogin"
+    );
+  }
+
+  return null;
 };
 
 const profilePhotoUpload = multer({
@@ -287,11 +499,15 @@ router.post("/signup", registerValidation, async (req, res) => {
       // Don't fail signup if email fails - user can resend
     }
 
-    const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
+    const { accessToken, refreshToken, sessionId } = await issueLoginTokens(
+      req,
+      res,
+      {
       principalId: newUser._id.toString(),
       role: "patient",
       email: newUser.email,
-    });
+      }
+    );
 
     res.status(201).json({
       success: true,
@@ -305,6 +521,7 @@ router.post("/signup", registerValidation, async (req, res) => {
       },
       token: accessToken,
       refreshToken,
+      sessionId,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -390,23 +607,82 @@ router.post("/google", async (req, res) => {
       safeLog("Existing user logged in via Google");
     }
 
-    const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
-      principalId: user._id.toString(),
-      role: "patient",
-      email: user.email,
-    });
+    const principalId = user._id.toString();
+    const role = "patient";
+    const lockKey = `${role}:${principalId}`;
+    const deviceContext = resolveDeviceContext(req);
 
-    // Infer loginType if not present in user document
-    const loginType = user.loginType || (user.googleId ? 'google' : 'email');
-    
-    const responseUser = await buildUserResponse(user);
+    await runWithLoginLock(lockKey, async () => {
+      const activeSession = await findLatestActiveSession({ principalId, role });
+      const sameDevice = activeSession
+        ? isSameDevice(activeSession, deviceContext)
+        : false;
 
-    res.status(200).json({
-      success: true,
-      message: user.googleId === googleId ? "Login successful" : "Account created successfully",
-      user: responseUser,
-      token: accessToken,
-      refreshToken,
+      if (activeSession && !sameDevice) {
+        const loginAttempt = await createOrReusePendingLoginAttempt({
+          principalId,
+          role,
+          requestedDeviceId: deviceContext.deviceId,
+          requestedDeviceInfo: deviceContext.deviceInfo,
+          requestedUserAgent: deviceContext.userAgent,
+          requestedIp: deviceContext.ipAddress,
+          activeSessionId: activeSession.sessionId,
+          activeDeviceId: activeSession.deviceId,
+        });
+
+        const attemptId = loginAttempt?._id?.toString() || "";
+        const attemptToken = signLoginAttemptToken({
+          attemptId,
+          principalId,
+          role,
+          deviceId: deviceContext.deviceId,
+        });
+
+        emitLoginAttemptEvent({
+          sessionId: activeSession.sessionId,
+          attemptId,
+          requestedDeviceInfo: deviceContext.deviceInfo || deviceContext.userAgent,
+          requestedIp: deviceContext.ipAddress,
+        });
+
+        return res.status(409).json({
+          success: false,
+          code: LOGIN_APPROVAL_REQUIRED_CODE,
+          message: "Another device is trying to access your account.",
+          loginAttemptId: attemptId,
+          attemptToken,
+          retryAfterSeconds: Math.max(
+            1,
+            Math.floor((loginAttempt.expiresAt.getTime() - Date.now()) / 1000)
+          ),
+        });
+      }
+
+      const { accessToken, refreshToken, sessionId } = await issueLoginTokens(
+        req,
+        res,
+        {
+          principalId,
+          role,
+          email: user.email,
+          sessionId: sameDevice ? activeSession?.sessionId : undefined,
+          deviceContext,
+        }
+      );
+
+      const responseUser = await buildUserResponse(user);
+
+      return res.status(200).json({
+        success: true,
+        message:
+          user.googleId === googleId
+            ? "Login successful"
+            : "Account created successfully",
+        user: responseUser,
+        token: accessToken,
+        refreshToken,
+        sessionId,
+      });
     });
 
   } catch (error) {
@@ -452,23 +728,81 @@ router.post("/login", authLimiter, loginValidation, async (req, res) => {
       return res.status(400).json({ message: "Invalid credentials" });
     }
 
-    const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
-      principalId: user._id.toString(),
-      role: "patient",
-      email: user.email,
-    });
+    const principalId = user._id.toString();
+    const role = "patient";
+    const lockKey = `${role}:${principalId}`;
+    const deviceContext = resolveDeviceContext(req);
 
-    user.lastLogin = new Date();
-    await user.save();
+    await runWithLoginLock(lockKey, async () => {
+      const activeSession = await findLatestActiveSession({ principalId, role });
+      const sameDevice = activeSession
+        ? isSameDevice(activeSession, deviceContext)
+        : false;
 
-    const responseUser = await buildUserResponse(user);
+      if (activeSession && !sameDevice) {
+        const loginAttempt = await createOrReusePendingLoginAttempt({
+          principalId,
+          role,
+          requestedDeviceId: deviceContext.deviceId,
+          requestedDeviceInfo: deviceContext.deviceInfo,
+          requestedUserAgent: deviceContext.userAgent,
+          requestedIp: deviceContext.ipAddress,
+          activeSessionId: activeSession.sessionId,
+          activeDeviceId: activeSession.deviceId,
+        });
+        const attemptId = loginAttempt?._id?.toString() || "";
+        const attemptToken = signLoginAttemptToken({
+          attemptId,
+          principalId,
+          role,
+          deviceId: deviceContext.deviceId,
+        });
 
-    res.status(200).json({
-      success: true,
-      message: "Login successful",
-      user: responseUser,
-      token: accessToken,
-      refreshToken,
+        emitLoginAttemptEvent({
+          sessionId: activeSession.sessionId,
+          attemptId,
+          requestedDeviceInfo: deviceContext.deviceInfo || deviceContext.userAgent,
+          requestedIp: deviceContext.ipAddress,
+        });
+
+        return res.status(409).json({
+          success: false,
+          code: LOGIN_APPROVAL_REQUIRED_CODE,
+          message: "Another device is trying to access your account.",
+          loginAttemptId: attemptId,
+          attemptToken,
+          retryAfterSeconds: Math.max(
+            1,
+            Math.floor((loginAttempt.expiresAt.getTime() - Date.now()) / 1000)
+          ),
+        });
+      }
+
+      const { accessToken, refreshToken, sessionId } = await issueLoginTokens(
+        req,
+        res,
+        {
+          principalId,
+          role,
+          email: user.email,
+          sessionId: sameDevice ? activeSession?.sessionId : undefined,
+          deviceContext,
+        }
+      );
+
+      user.lastLogin = new Date();
+      await user.save();
+
+      const responseUser = await buildUserResponse(user);
+
+      return res.status(200).json({
+        success: true,
+        message: "Login successful",
+        user: responseUser,
+        token: accessToken,
+        refreshToken,
+        sessionId,
+      });
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -501,11 +835,15 @@ router.post("/doctor/signup", doctorSignupValidation, async (req, res) => {
 
     await newDoctor.save();
 
-    const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
+    const { accessToken, refreshToken, sessionId } = await issueLoginTokens(
+      req,
+      res,
+      {
       principalId: newDoctor._id.toString(),
       role: "doctor",
       email: newDoctor.email,
-    });
+      }
+    );
 
     res.status(201).json({
       success: true,
@@ -518,6 +856,7 @@ router.post("/doctor/signup", doctorSignupValidation, async (req, res) => {
       },
       token: accessToken,
       refreshToken,
+      sessionId,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -557,29 +896,373 @@ router.post("/doctor/login", authLimiter, async (req, res) => {
       return res.status(400).json({ message: "Invalid credentials" });
     }
 
-    const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
-      principalId: doctor._id.toString(),
-      role: "doctor",
-      email: doctor.email,
-    });
+    const principalId = doctor._id.toString();
+    const role = "doctor";
+    const lockKey = `${role}:${principalId}`;
+    const deviceContext = resolveDeviceContext(req);
 
-    doctor.lastLogin = new Date();
-    await doctor.save();
+    await runWithLoginLock(lockKey, async () => {
+      const activeSession = await findLatestActiveSession({ principalId, role });
+      const sameDevice = activeSession
+        ? isSameDevice(activeSession, deviceContext)
+        : false;
 
-    res.status(200).json({
-      success: true,
-      message: "Login successful",
-      doctor: {
-        id: doctor._id.toString(),
-        name: doctor.name,
-        email: doctor.email,
-        specialization: doctor.specialization,
-      },
-      token: accessToken,
-      refreshToken,
+      if (activeSession && !sameDevice) {
+        const loginAttempt = await createOrReusePendingLoginAttempt({
+          principalId,
+          role,
+          requestedDeviceId: deviceContext.deviceId,
+          requestedDeviceInfo: deviceContext.deviceInfo,
+          requestedUserAgent: deviceContext.userAgent,
+          requestedIp: deviceContext.ipAddress,
+          activeSessionId: activeSession.sessionId,
+          activeDeviceId: activeSession.deviceId,
+        });
+        const attemptId = loginAttempt?._id?.toString() || "";
+        const attemptToken = signLoginAttemptToken({
+          attemptId,
+          principalId,
+          role,
+          deviceId: deviceContext.deviceId,
+        });
+
+        emitLoginAttemptEvent({
+          sessionId: activeSession.sessionId,
+          attemptId,
+          requestedDeviceInfo: deviceContext.deviceInfo || deviceContext.userAgent,
+          requestedIp: deviceContext.ipAddress,
+        });
+
+        return res.status(409).json({
+          success: false,
+          code: LOGIN_APPROVAL_REQUIRED_CODE,
+          message: "Another device is trying to access your account.",
+          loginAttemptId: attemptId,
+          attemptToken,
+          retryAfterSeconds: Math.max(
+            1,
+            Math.floor((loginAttempt.expiresAt.getTime() - Date.now()) / 1000)
+          ),
+        });
+      }
+
+      const { accessToken, refreshToken, sessionId } = await issueLoginTokens(
+        req,
+        res,
+        {
+          principalId,
+          role,
+          email: doctor.email,
+          sessionId: sameDevice ? activeSession?.sessionId : undefined,
+          deviceContext,
+        }
+      );
+
+      doctor.lastLogin = new Date();
+      await doctor.save();
+
+      return res.status(200).json({
+        success: true,
+        message: "Login successful",
+        doctor: {
+          id: doctor._id.toString(),
+          name: doctor.name,
+          email: doctor.email,
+          specialization: doctor.specialization,
+        },
+        token: accessToken,
+        refreshToken,
+        sessionId,
+      });
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+});
+
+router.post("/login-attempts/:attemptId/respond", auth, async (req, res) => {
+  try {
+    const attemptId = asText(req.params.attemptId);
+    const principalId = asText(req.auth?.id);
+    const role = normalizeRole(req.auth?.role);
+    const decision = asText(req.body?.decision).toLowerCase();
+    const normalizedDecision =
+      decision === "ok" || decision === "approve"
+        ? "approve"
+        : decision === "cancel" || decision === "deny"
+        ? "deny"
+        : "";
+
+    if (!["patient", "doctor"].includes(role) || !principalId) {
+      return res.status(403).json({ success: false, message: "Access denied" });
+    }
+    if (!attemptId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "attemptId is required" });
+    }
+    if (!normalizedDecision) {
+      return res.status(400).json({
+        success: false,
+        message: "decision must be approve|deny",
+      });
+    }
+
+    const attempt = await LoginAttempt.findOne({
+      _id: attemptId,
+      principalId,
+      role,
+      status: "pending",
+    });
+
+    if (!attempt) {
+      return res.status(404).json({
+        success: false,
+        message: "Login attempt not found or already resolved",
+      });
+    }
+
+    if (attempt.expiresAt <= new Date()) {
+      attempt.status = "expired";
+      await attempt.save();
+      return res.status(410).json({
+        success: false,
+        message: "Login attempt expired",
+      });
+    }
+
+    const activeSession = await findLatestActiveSession({ principalId, role });
+    if (!activeSession || activeSession.sessionId !== asText(attempt.activeSessionId)) {
+      return res.status(401).json({
+        success: false,
+        code: SESSION_INVALID_CODE,
+        message: SESSION_INVALID_CODE,
+      });
+    }
+
+    attempt.respondedAt = new Date();
+    if (normalizedDecision === "approve") {
+      attempt.status = "approved";
+      await attempt.save();
+
+      await revokeActiveSessions({
+        principalId,
+        role,
+        reason: "new_login_approved",
+        emitRealtime: true,
+      });
+
+      emitLoginApprovedEvent({
+        attemptId,
+        sessionId: asText(attempt.activeSessionId),
+      });
+
+      return res.json({
+        success: true,
+        status: "approved",
+        message: "Login approved",
+      });
+    }
+
+    attempt.status = "denied";
+    await attempt.save();
+    emitLoginDeniedEvent({ attemptId });
+
+    return res.json({
+      success: true,
+      status: "denied",
+      message: "Login denied",
+    });
+  } catch (error) {
+    if (error?.name === "CastError") {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid attempt id" });
+    }
+    return res.status(500).json({
+      success: false,
+      message: "Unable to process login attempt response",
+    });
+  }
+});
+
+router.post("/login-attempts/:attemptId/finalize", async (req, res) => {
+  try {
+    const attemptId = asText(req.params.attemptId);
+    const attemptToken = asText(
+      req.body?.attemptToken || req.headers["x-login-attempt-token"] || ""
+    );
+    if (!attemptId || !attemptToken) {
+      return res.status(400).json({
+        success: false,
+        message: "attemptId and attemptToken are required",
+      });
+    }
+
+    let tokenPayload;
+    try {
+      tokenPayload = verifyLoginAttemptToken(attemptToken);
+    } catch {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid login attempt token",
+      });
+    }
+
+    if (
+      asText(tokenPayload?.typ) !== "login_attempt" ||
+      asText(tokenPayload?.attemptId) !== attemptId
+    ) {
+      return res.status(401).json({
+        success: false,
+        message: "Login attempt token mismatch",
+      });
+    }
+
+    const principalId = asText(tokenPayload?.sub);
+    const role = normalizeRole(tokenPayload?.role);
+    if (!principalId || !["patient", "doctor"].includes(role)) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid login attempt token payload",
+      });
+    }
+
+    const lockKey = `${role}:${principalId}`;
+    await runWithLoginLock(lockKey, async () => {
+      const attempt = await LoginAttempt.findOne({
+        _id: attemptId,
+        principalId,
+        role,
+      });
+
+      if (!attempt) {
+        return res.status(404).json({
+          success: false,
+          message: "Login attempt not found",
+        });
+      }
+
+      if (attempt.expiresAt <= new Date()) {
+        attempt.status = "expired";
+        await attempt.save();
+        return res.status(410).json({
+          success: false,
+          message: "Login attempt expired",
+        });
+      }
+
+      if (attempt.status === "pending") {
+        return res.status(409).json({
+          success: false,
+          code: "LOGIN_APPROVAL_PENDING",
+          message: "Waiting for active session approval",
+        });
+      }
+
+      if (attempt.status === "denied") {
+        return res.status(403).json({
+          success: false,
+          code: "LOGIN_DENIED_BY_ACTIVE_SESSION",
+          message: "Login denied by active session",
+        });
+      }
+
+      if (attempt.status === "consumed") {
+        return res.status(409).json({
+          success: false,
+          message: "Login attempt already consumed",
+        });
+      }
+
+      if (attempt.status !== "approved") {
+        return res.status(409).json({
+          success: false,
+          message: "Login attempt is not approved",
+        });
+      }
+
+      const tokenDeviceId = asText(tokenPayload?.deviceId);
+      if (tokenDeviceId && tokenDeviceId !== asText(attempt.requestedDeviceId)) {
+        return res.status(401).json({
+          success: false,
+          message: "Login attempt token device mismatch",
+        });
+      }
+
+      const principal = await resolvePrincipalAccount({ principalId, role });
+      if (
+        !principal ||
+        principal.isActive === false ||
+        principal.status === "BLOCKED"
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "Account inactive",
+        });
+      }
+
+      const deviceContext = resolveDeviceContext(req, {
+        deviceId: attempt.requestedDeviceId || tokenDeviceId,
+        deviceInfo: attempt.requestedDeviceInfo,
+        userAgent: attempt.requestedUserAgent,
+        ipAddress: attempt.requestedIp || req.ip || "",
+      });
+
+      const { accessToken, refreshToken, sessionId } = await issueLoginTokens(
+        req,
+        res,
+        {
+          principalId,
+          role,
+          email: principal.email,
+          deviceContext,
+        }
+      );
+
+      principal.lastLogin = new Date();
+      await principal.save();
+
+      attempt.status = "consumed";
+      attempt.consumedAt = new Date();
+      await attempt.save();
+
+      if (role === "doctor") {
+        return res.json({
+          success: true,
+          message: "Login successful",
+          doctor: {
+            id: principal._id.toString(),
+            name: principal.name,
+            email: principal.email,
+            specialization: principal.specialization,
+          },
+          token: accessToken,
+          refreshToken,
+          sessionId,
+        });
+      }
+
+      const responseUser = await buildUserResponse(principal);
+      return res.json({
+        success: true,
+        message: "Login successful",
+        user: responseUser,
+        token: accessToken,
+        refreshToken,
+        sessionId,
+      });
+    });
+  } catch (error) {
+    if (error?.name === "CastError") {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid attempt id" });
+    }
+    return res.status(500).json({
+      success: false,
+      message: "Unable to finalize login attempt",
+    });
   }
 });
 
@@ -599,7 +1282,8 @@ router.post("/refresh", async (req, res) => {
     }
 
     const decoded = verifyRefreshToken(providedRefreshToken);
-    const role = String(decoded.role || "").toLowerCase();
+    const role = normalizeRole(decoded.role);
+    const tokenSessionId = asText(decoded.sid);
     if (!["patient", "doctor"].includes(role)) {
       return res.status(403).json({ success: false, message: "Invalid refresh token role" });
     }
@@ -607,9 +1291,18 @@ router.post("/refresh", async (req, res) => {
     const stored = await RefreshToken.findOne({
       tokenHash: hashToken(providedRefreshToken),
       revokedAt: null,
+      isCurrentSession: { $ne: false },
     });
-    if (!stored || stored.expiresAt <= new Date()) {
-      return res.status(401).json({ success: false, message: "Refresh token expired or revoked" });
+    if (
+      !stored ||
+      stored.expiresAt <= new Date() ||
+      (tokenSessionId && asText(stored.sessionId) !== tokenSessionId)
+    ) {
+      return res.status(401).json({
+        success: false,
+        code: SESSION_INVALID_CODE,
+        message: SESSION_INVALID_CODE,
+      });
     }
 
     let principal;
@@ -623,21 +1316,20 @@ router.post("/refresh", async (req, res) => {
       return res.status(403).json({ success: false, message: "Account inactive" });
     }
 
-    const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
+    const { accessToken, refreshToken, refreshMeta, sessionId } = issueAuthTokenSet({
       principalId: principal._id.toString(),
       role,
       email: principal.email,
       familyId: decoded.familyId,
+      sessionId: asText(stored.sessionId) || tokenSessionId,
     });
 
-    stored.revokedAt = new Date();
-    stored.revokedReason = "rotated";
-    stored.replacedByTokenHash = hashToken(refreshToken);
-    await stored.save();
-    await persistRefreshToken(req, principal._id.toString(), role, refreshToken, refreshMeta);
+    await persistRefreshToken(req, principal._id.toString(), role, refreshToken, refreshMeta, {
+      sessionId,
+    });
 
     setAuthCookies(res, { accessToken, refreshToken });
-    return res.json({ success: true, token: accessToken, refreshToken });
+    return res.json({ success: true, token: accessToken, refreshToken, sessionId });
   } catch {
     return res.status(401).json({ success: false, message: "Invalid refresh token" });
   }
@@ -651,10 +1343,22 @@ router.post("/logout", auth, async (req, res) => {
     ).trim();
 
     if (providedRefreshToken) {
+      const current = await RefreshToken.findOne({
+        tokenHash: hashToken(providedRefreshToken),
+        revokedAt: null,
+      })
+        .select("sessionId")
+        .lean();
       await RefreshToken.updateOne(
         { tokenHash: hashToken(providedRefreshToken), revokedAt: null },
-        { $set: { revokedAt: new Date(), revokedReason: "logout" } }
+        { $set: { revokedAt: new Date(), revokedReason: "logout", isCurrentSession: false } }
       );
+      if (asText(current?.sessionId)) {
+        emitSessionInvalidatedEvent({
+          sessionId: current.sessionId,
+          reason: "logout",
+        });
+      }
     }
 
     clearAuthCookies(res);
@@ -733,6 +1437,7 @@ router.post("/debug-login", async (req, res) => {
       },
       token,
       refreshToken: tokens.refreshToken,
+      sessionId: tokens.sessionId,
       debug: {
         userType: userType,
         role: role,
@@ -977,11 +1682,15 @@ router.post("/test-patient", async (req, res) => {
       patient = testPatient;
     }
 
-    const { accessToken, refreshToken } = await issueLoginTokens(req, res, {
-      principalId: patient._id.toString(),
-      role: "patient",
-      email: patient.email,
-    });
+    const { accessToken, refreshToken, sessionId } = await issueLoginTokens(
+      req,
+      res,
+      {
+        principalId: patient._id.toString(),
+        role: "patient",
+        email: patient.email,
+      }
+    );
 
     const responseUser = await buildUserResponse(patient);
 
@@ -990,6 +1699,7 @@ router.post("/test-patient", async (req, res) => {
       message: "Test patient token generated",
       token: accessToken,
       refreshToken,
+      sessionId,
       patient: responseUser,
     });
   } catch (error) {

@@ -20,6 +20,88 @@ const hasAWSCredentials =
 
 const asText = (value) => (value == null ? "" : String(value).trim());
 
+const normalizeSpace = (value) =>
+  asText(value)
+    .replace(/\s+/g, " ")
+    .trim();
+
+const toTitleCase = (value) =>
+  normalizeSpace(value)
+    .toLowerCase()
+    .split(" ")
+    .filter(Boolean)
+    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+
+const inferDeviceName = ({ deviceInfo, userAgent }) => {
+  const source = `${normalizeSpace(deviceInfo)} ${normalizeSpace(userAgent)}`.toLowerCase();
+  if (source.includes("android")) return "Android";
+  if (source.includes("iphone")) return "iPhone";
+  if (source.includes("ipad")) return "iPad";
+  if (source.includes("ios")) return "iOS";
+  if (source.includes("windows")) return "Windows";
+  if (source.includes("mac os") || source.includes("macintosh") || source.includes("darwin")) {
+    return "macOS";
+  }
+  if (source.includes("linux")) return "Linux";
+  if (
+    source.includes("mozilla") ||
+    source.includes("chrome") ||
+    source.includes("safari") ||
+    source.includes("firefox")
+  ) {
+    return "Web browser";
+  }
+  return "Unknown device";
+};
+
+const inferDeviceLocation = (deviceInfo) => {
+  const raw = normalizeSpace(deviceInfo);
+  if (!raw) return "";
+
+  const inMatch = raw.match(/\bin\s+([a-z0-9][a-z0-9\s,.\-]{1,80})$/i);
+  if (inMatch?.[1]) {
+    return toTitleCase(inMatch[1]);
+  }
+
+  const separatorMatch = raw.match(
+    /^(?:android|iphone|ipad|ios|windows|macos|linux|web browser|web)\s*[-|,:]\s*(.+)$/i
+  );
+  if (separatorMatch?.[1]) {
+    return toTitleCase(separatorMatch[1]);
+  }
+
+  return "";
+};
+
+const buildDevicePresentation = ({ deviceInfo, userAgent }) => {
+  const deviceName = inferDeviceName({ deviceInfo, userAgent });
+  const deviceLocation = inferDeviceLocation(deviceInfo);
+  const deviceLabel = deviceLocation
+    ? `${deviceName} in ${deviceLocation}`
+    : deviceName;
+
+  return {
+    deviceName,
+    deviceLocation,
+    deviceLabel,
+  };
+};
+
+const buildDeviceDedupeKey = (row) => {
+  const deviceId = normalizeSpace(row?.deviceId).toLowerCase();
+  if (deviceId) return `device:${deviceId}`;
+
+  const deviceInfo = normalizeSpace(row?.deviceInfo).toLowerCase();
+  const userAgent = normalizeSpace(row?.userAgent).toLowerCase();
+  if (deviceInfo || userAgent) return `meta:${deviceInfo}|${userAgent}`;
+
+  const ipAddress = normalizeSpace(row?.createdByIp).toLowerCase();
+  if (ipAddress) return `ip:${ipAddress}`;
+
+  return `row:${asText(row?._id).toLowerCase()}`;
+};
+
 const resolveDoctorSpecialization = (doctor) =>
   asText(doctor?.specialization || doctor?.specialty);
 
@@ -704,8 +786,11 @@ router.get("/settings", async (req, res) => {
       return res.status(403).json({ success: false, message: "Access denied" });
     }
 
-    const allowMultiSession = await resolveAllowMultiSession({ role, principalId });
-    return res.json({ success: true, allowMultiSession });
+    return res.json({
+      success: true,
+      allowMultiSession: false,
+      strictSingleDevice: true,
+    });
   } catch {
     return res
       .status(500)
@@ -730,10 +815,17 @@ router.put("/settings", async (req, res) => {
       });
     }
 
+    if (allowMultiSession === true) {
+      return res.status(400).json({
+        success: false,
+        message: "Strict single-device session mode is enforced",
+      });
+    }
+
     const persistedValue = await updateAllowMultiSession({
       role,
       principalId,
-      allowMultiSession,
+      allowMultiSession: false,
     });
 
     let revokedCount = 0;
@@ -757,7 +849,13 @@ router.put("/settings", async (req, res) => {
             revokedAt: null,
             _id: { $ne: keepTokenId },
           },
-          { $set: { revokedAt: new Date(), revokedReason: "single_session_enforced" } }
+          {
+            $set: {
+              revokedAt: new Date(),
+              revokedReason: "single_session_enforced",
+              isCurrentSession: false,
+            },
+          }
         );
         revokedCount = revokeResult.modifiedCount || 0;
       }
@@ -765,12 +863,10 @@ router.put("/settings", async (req, res) => {
 
     return res.json({
       success: true,
-      allowMultiSession: persistedValue,
+      allowMultiSession: false,
+      strictSingleDevice: true,
       revokedCount,
-      message:
-        persistedValue
-          ? "Multi-device sessions enabled"
-          : "Single-device session mode enabled",
+      message: "Strict single-device session mode enabled",
     });
   } catch {
     return res
@@ -793,24 +889,53 @@ router.get("/", async (req, res) => {
       role,
       revokedAt: null,
       expiresAt: { $gt: new Date() },
+      isCurrentSession: { $ne: false },
     })
       .sort({ lastActiveAt: -1, createdAt: -1 })
-      .select("jti createdByIp userAgent deviceInfo lastActiveAt createdAt expiresAt")
+      .select(
+        "sessionId jti deviceId createdByIp userAgent deviceInfo lastActiveAt createdAt expiresAt"
+      )
       .lean();
 
-    const sessions = rows.map((row) => ({
-      id: row._id?.toString(),
-      sessionId: row._id?.toString(),
-      jti: row.jti || "",
-      ipAddress: row.createdByIp || "",
-      userAgent: row.userAgent || "",
-      deviceInfo: row.deviceInfo || "",
-      lastActiveAt: row.lastActiveAt || row.updatedAt || row.createdAt,
-      createdAt: row.createdAt,
-      expiresAt: row.expiresAt,
-    }));
+    const seenDeviceKeys = new Set();
+    const sessions = [];
 
-    return res.json({ success: true, sessions, count: sessions.length });
+    for (const row of rows) {
+      const deviceKey = buildDeviceDedupeKey(row);
+      if (seenDeviceKeys.has(deviceKey)) {
+        continue;
+      }
+      seenDeviceKeys.add(deviceKey);
+
+      const devicePresentation = buildDevicePresentation({
+        deviceInfo: row.deviceInfo,
+        userAgent: row.userAgent,
+      });
+
+      sessions.push({
+        id: row._id?.toString(),
+        sessionId: asText(row.sessionId) || row._id?.toString(),
+        jti: row.jti || "",
+        deviceId: row.deviceId || "",
+        deviceKey,
+        ipAddress: row.createdByIp || "",
+        userAgent: row.userAgent || "",
+        deviceInfo: row.deviceInfo || "",
+        deviceName: devicePresentation.deviceName,
+        deviceLocation: devicePresentation.deviceLocation,
+        deviceLabel: devicePresentation.deviceLabel,
+        lastActiveAt: row.lastActiveAt || row.updatedAt || row.createdAt,
+        createdAt: row.createdAt,
+        expiresAt: row.expiresAt,
+      });
+    }
+
+    return res.json({
+      success: true,
+      sessions,
+      count: sessions.length,
+      totalActiveSessions: rows.length,
+    });
   } catch (error) {
     return res.status(500).json({ success: false, message: "Failed to fetch sessions" });
   }
@@ -830,20 +955,45 @@ router.delete("/:id", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid session id" });
     }
 
-    const updated = await RefreshToken.updateOne(
-      {
-        _id: sessionId,
-        principalId,
-        role,
-        revokedAt: null,
-      },
-      { $set: { revokedAt: new Date(), revokedReason: "device_logout" } }
-    );
+    const target = await RefreshToken.findOne({
+      _id: sessionId,
+      principalId,
+      role,
+      revokedAt: null,
+    })
+      .select("_id deviceId")
+      .lean();
 
-    if (!updated.matchedCount) {
+    if (!target?._id) {
       return res.status(404).json({ success: false, message: "Session not found" });
     }
-    return res.json({ success: true, message: "Device session logged out" });
+
+    const revokeFilter = {
+      principalId,
+      role,
+      revokedAt: null,
+    };
+
+    const targetDeviceId = asText(target.deviceId);
+    if (targetDeviceId) {
+      revokeFilter.deviceId = targetDeviceId;
+    } else {
+      revokeFilter._id = target._id;
+    }
+
+    const updated = await RefreshToken.updateMany(revokeFilter, {
+      $set: {
+        revokedAt: new Date(),
+        revokedReason: "device_logout",
+        isCurrentSession: false,
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: "Device session logged out",
+      revokedCount: updated.modifiedCount || 0,
+    });
   } catch {
     return res.status(500).json({ success: false, message: "Failed to logout session" });
   }
@@ -865,7 +1015,13 @@ router.delete("/", async (req, res) => {
         role,
         revokedAt: null,
       },
-      { $set: { revokedAt: now, revokedReason: "logout_all_devices" } }
+      {
+        $set: {
+          revokedAt: now,
+          revokedReason: "logout_all_devices",
+          isCurrentSession: false,
+        },
+      }
     );
 
     return res.json({
@@ -2942,5 +3098,3 @@ router.patch('/:sessionId/update', async (req, res) => {
 
 
 export default router;
-
-

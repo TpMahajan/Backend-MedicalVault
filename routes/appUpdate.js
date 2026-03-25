@@ -53,6 +53,27 @@ function requestBase(req) {
   return `${protocol}://${host}`;
 }
 
+function withVersionQuery(urlValue, version) {
+  const raw = String(urlValue || "").trim();
+  if (!raw) return raw;
+
+  try {
+    const absolute = raw.startsWith("http://") || raw.startsWith("https://");
+    const base = absolute ? undefined : "http://localhost";
+    const parsed = new URL(raw, base);
+    parsed.searchParams.set("v", String(version || "").trim());
+    if (absolute) {
+      return parsed.toString();
+    }
+    const pathname = parsed.pathname || "";
+    const query = parsed.search || "";
+    return `${pathname}${query}`;
+  } catch {
+    const separator = raw.includes("?") ? "&" : "?";
+    return `${raw}${separator}v=${encodeURIComponent(String(version || "").trim())}`;
+  }
+}
+
 function loadUpdateConfig() {
   if (!fs.existsSync(updateConfigPath)) {
     throw new Error("app-update.json not found");
@@ -72,7 +93,9 @@ function loadUpdateConfig() {
     parsed.minimumSupportedVersion || ""
   ).trim();
   const releaseNotes = String(parsed.releaseNotes || "").trim();
-  const sha256 = String(parsed.sha256 || "").trim().toLowerCase();
+  const sha256 = String(parsed.sha256 || parsed.checksum || "")
+    .trim()
+    .toLowerCase();
   const apkUrl = String(parsed.apkUrl || "").trim();
 
   if (!VERSION_REGEX.test(latestVersion)) {
@@ -90,15 +113,18 @@ function loadUpdateConfig() {
     minimumSupportedVersion,
     releaseNotes,
     sha256,
+    checksum: sha256,
     apkUrl,
   };
 }
 
 function resolveApkUrl(req, config) {
-  if (config.apkUrl) return config.apkUrl;
+  if (config.apkUrl) {
+    return withVersionQuery(config.apkUrl, config.latestVersion);
+  }
   const envBase = normalizeApiBase(process.env.APP_API_BASE_URL);
   const base = envBase || normalizeApiBase(requestBase(req));
-  return `${base}/api/app/apk/${config.latestVersion}`;
+  return withVersionQuery(`${base}/api/app/apk/${config.latestVersion}`, config.latestVersion);
 }
 
 function resolveApkFilePath(version) {
@@ -134,16 +160,19 @@ router.get("/update", (req, res) => {
   try {
     const currentVersion = String(req.query.currentVersion || "0.0.0").trim();
     const config = loadUpdateConfig();
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
 
     const hasUpdate = compareVersions(currentVersion, config.latestVersion) < 0;
     const forceUpdate =
       compareVersions(currentVersion, config.minimumSupportedVersion) < 0;
 
     res.json({
+      version: config.latestVersion,
       latestVersion: config.latestVersion,
       minimumSupportedVersion: config.minimumSupportedVersion,
       apkUrl: resolveApkUrl(req, config),
       releaseNotes: config.releaseNotes,
+      checksum: config.sha256,
       sha256: config.sha256,
       hasUpdate,
       forceUpdate,
@@ -174,7 +203,7 @@ router.get("/apk/:version", (req, res) => {
 
     const downloadName = path.basename(apkPath);
     res.setHeader("Content-Type", "application/vnd.android.package-archive");
-    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
 
     return res.download(apkPath, downloadName, (error) => {
       if (error && !res.headersSent) {

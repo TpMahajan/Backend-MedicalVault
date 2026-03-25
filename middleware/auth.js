@@ -1,6 +1,7 @@
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { AdminUser } from "../models/AdminUser.js";
+import { RefreshToken } from "../models/RefreshToken.js";
 import { parseBearerToken, parseCookies, verifyAccessToken } from "../services/tokenService.js";
 
 const normalizeRole = (role) => String(role || "").trim().toLowerCase();
@@ -27,6 +28,7 @@ const extractPrincipalFromPayload = (payload) => {
     role: mappedRole,
     id: String(principalId),
     email: payload.email ? String(payload.email).toLowerCase() : "",
+    sessionId: payload.sid ? String(payload.sid) : "",
   };
 };
 
@@ -45,14 +47,41 @@ const resolveTokenCandidates = (req) => {
 const hydratePrincipal = async (principal) => {
   if (!principal) return null;
 
-  const { id, role, email } = principal;
+  const { id, role, email, sessionId } = principal;
+
+  const requiresBoundSession = role === "patient" || role === "doctor";
+  if (requiresBoundSession) {
+    if (!sessionId) {
+      return { invalidReason: "SESSION_INVALID" };
+    }
+
+    const activeSession = await RefreshToken.findOne({
+      sessionId,
+      principalId: id,
+      role,
+      revokedAt: null,
+      expiresAt: { $gt: new Date() },
+      isCurrentSession: { $ne: false },
+    })
+      .select("_id")
+      .lean();
+
+    if (!activeSession) {
+      return { invalidReason: "SESSION_INVALID" };
+    }
+
+    void RefreshToken.updateOne(
+      { sessionId },
+      { $set: { lastActiveAt: new Date() } }
+    ).catch(() => {});
+  }
 
   if (role === "patient") {
     const user = await User.findById(id).select("-password");
     if (!user || user.isActive === false || user.status === "BLOCKED") {
       return null;
     }
-    return { auth: { id, role, email: user.email || email }, user };
+    return { auth: { id, role, email: user.email || email, sessionId }, user };
   }
 
   if (role === "doctor") {
@@ -60,7 +89,7 @@ const hydratePrincipal = async (principal) => {
     if (!doctor || doctor.isActive === false || doctor.status === "BLOCKED") {
       return null;
     }
-    return { auth: { id, role, email: doctor.email || email }, doctor };
+    return { auth: { id, role, email: doctor.email || email, sessionId }, doctor };
   }
 
   if (role === "admin") {
@@ -102,7 +131,9 @@ const applyPrincipalToRequest = (req, hydrated) => {
 
 const verifyTokenAndHydrate = async (req) => {
   const { ordered } = resolveTokenCandidates(req);
-  if (!ordered.length) return { token: "", principal: null, hydrated: null };
+  if (!ordered.length) {
+    return { token: "", principal: null, hydrated: null, invalidReason: "" };
+  }
 
   let lastError = null;
   for (const token of ordered) {
@@ -114,8 +145,11 @@ const verifyTokenAndHydrate = async (req) => {
       }
 
       const hydrated = await hydratePrincipal(principal);
-      if (hydrated) {
+      if (hydrated?.auth) {
         return { token, principal, hydrated };
+      }
+      if (hydrated?.invalidReason) {
+        return { token, principal, hydrated: null, invalidReason: hydrated.invalidReason };
       }
     } catch (error) {
       lastError = error;
@@ -126,15 +160,22 @@ const verifyTokenAndHydrate = async (req) => {
     throw lastError;
   }
 
-  return { token: "", principal: null, hydrated: null };
+  return { token: "", principal: null, hydrated: null, invalidReason: "" };
 };
 
 // Middleware for required authentication
 export const auth = async (req, res, next) => {
   try {
-    const { hydrated } = await verifyTokenAndHydrate(req);
+    const { hydrated, invalidReason } = await verifyTokenAndHydrate(req);
 
     if (!hydrated) {
+      if (invalidReason === "SESSION_INVALID") {
+        return res.status(401).json({
+          success: false,
+          code: "SESSION_INVALID",
+          message: "SESSION_INVALID",
+        });
+      }
       return res.status(401).json({
         success: false,
         message: "Access denied. Invalid or missing token.",
@@ -170,7 +211,7 @@ export const optionalAuth = async (req, res, next) => {
         }
 
         const hydrated = await hydratePrincipal(principal);
-        if (!hydrated) {
+        if (!hydrated?.auth) {
           continue;
         }
 

@@ -59,9 +59,9 @@ export function initPublicConfigRealtime(server) {
     try {
       const url = new URL(request.url || "", `http://${request.headers.host}`);
       if (url.pathname !== "/api/public/ws") {
-        socket.destroy();
         return;
       }
+      request.__wsHandled = true;
 
       wss.handleUpgrade(request, socket, head, (ws) => {
         const platforms = normalizeValues(

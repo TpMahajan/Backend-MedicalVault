@@ -42,6 +42,7 @@ import { Session } from "./models/Session.js";
 import { checkEmailConfig } from "./utils/emailService.js";
 import patientAppointmentRoutes from "./routes/patientAppointments.js"; // patient appointments (Flutter)
 import { initPublicConfigRealtime } from "./services/publicConfigRealtime.js";
+import { initAuthSessionRealtime } from "./services/authSessionRealtime.js";
 import { apiLimiter } from "./middleware/rateLimit.js";
 
 const app = express();
@@ -77,6 +78,12 @@ const defaultCorsOrigins = [
   "http://localhost:3000",
   "http://127.0.0.1:3000",
   "https://health-vault-web.vercel.app",
+  "https://medicalvault-aially.vercel.app",
+];
+
+const defaultCorsOriginPatterns = [
+  /^https:\/\/health-vault-web(?:-[a-z0-9-]+)?\.vercel\.app$/i,
+  /^https:\/\/medicalvault-aially(?:-[a-z0-9-]+)?\.vercel\.app$/i,
 ];
 
 const envCorsOrigins = (process.env.CORS_ORIGINS || "")
@@ -84,23 +91,54 @@ const envCorsOrigins = (process.env.CORS_ORIGINS || "")
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+const envCorsOriginPatterns = (process.env.CORS_ORIGIN_PATTERNS || "")
+  .split(",")
+  .map((entry) => entry.trim())
+  .filter(Boolean)
+  .map((pattern) => {
+    try {
+      return new RegExp(pattern, "i");
+    } catch {
+      return null;
+    }
+  })
+  .filter(Boolean);
+
 const allowedCorsOrigins = new Set([
   ...defaultCorsOrigins,
   ...envCorsOrigins,
 ]);
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin || allowedCorsOrigins.has(origin)) {
-        callback(null, true);
-        return;
-      }
-      callback(new Error(`Not allowed by CORS: ${origin}`));
-    },
-    credentials: true,
-  })
-);
+const allowedCorsOriginPatterns = [
+  ...defaultCorsOriginPatterns,
+  ...envCorsOriginPatterns,
+];
+
+const normalizeOrigin = (origin) => String(origin || "").trim().replace(/\/+$/, "");
+
+const isAllowedCorsOrigin = (origin) => {
+  const normalized = normalizeOrigin(origin);
+  if (!normalized) return true;
+  if (allowedCorsOrigins.has(normalized)) return true;
+  return allowedCorsOriginPatterns.some((pattern) => pattern.test(normalized));
+};
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (isAllowedCorsOrigin(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error(`Not allowed by CORS: ${origin}`));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-device-id", "x-session-id"],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 if (String(process.env.ENFORCE_HTTPS || "false").toLowerCase() === "true") {
   app.use((req, res, next) => {
     const forwardedProto = String(req.headers["x-forwarded-proto"] || "").toLowerCase();
@@ -132,7 +170,7 @@ app.use(
   "/uploads",
   (req, res, next) => {
     const requestOrigin = req.headers.origin;
-    if (requestOrigin && allowedCorsOrigins.has(requestOrigin)) {
+    if (requestOrigin && isAllowedCorsOrigin(requestOrigin)) {
       res.setHeader("Access-Control-Allow-Origin", requestOrigin);
     }
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
@@ -245,6 +283,14 @@ const startServer = async () => {
     });
 
     initPublicConfigRealtime(server);
+    initAuthSessionRealtime(server);
+
+    server.on("upgrade", (request, socket) => {
+      if (request.__wsHandled === true) {
+        return;
+      }
+      socket.destroy();
+    });
   } catch (err) {
     console.error("❌ Failed to start server:", err);
     process.exit(1);
@@ -262,5 +308,3 @@ process.on("uncaughtException", (err) => {
 });
 
 startServer();
-
-
