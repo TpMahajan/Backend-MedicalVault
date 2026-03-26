@@ -3,6 +3,7 @@ import axios from "axios";
 import { auth } from "../middleware/auth.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
+import { AdminUser } from "../models/AdminUser.js";
 import { Document } from "../models/File.js";
 import { Appointment } from "../models/Appointment.js";
 import { AIChat } from "../models/AIChat.js";
@@ -10,6 +11,16 @@ import DocumentReader from "../services/documentReader.js";
 import { ok, fail } from "../utils/apiResponse.js";
 import { canDoctorAccessPatient } from "../services/accessControl.js";
 import { aiLimiter } from "../middleware/rateLimit.js";
+import {
+  buildAuthorizedScope,
+  buildSafetyPayload,
+  estimateExtractionConfidence,
+  isOperationalIntent,
+  isPatientSensitiveIntent,
+  normalizeRole,
+  resolveLanguage,
+  resolvePersona,
+} from "../services/aiAssistantPolicy.js";
 
 const router = express.Router();
 router.use(aiLimiter);
@@ -276,12 +287,108 @@ const formatAppointmentsForAI = (appointments) => {
   }));
 };
 
+const asLowerText = (value) => String(value || "").trim().toLowerCase();
+
+const asBoolean = (value, fallback = false) => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "on"].includes(normalized)) return true;
+    if (["false", "0", "no", "off"].includes(normalized)) return false;
+  }
+  return fallback;
+};
+
+const buildResponseSections = ({
+  persona,
+  reply,
+  structuredData,
+  responseType,
+  documentMetadata,
+  safety,
+}) => {
+  const sections = [];
+  sections.push({
+    key: persona === "doctor" ? "clinical_summary" : "summary",
+    title: persona === "doctor" ? "Clinical Summary" : "Summary",
+    content: reply,
+  });
+
+  if (structuredData) {
+    sections.push({
+      key: "structured_data",
+      title: "Structured Data",
+      type: responseType || "table",
+      data: structuredData,
+    });
+  }
+
+  if (documentMetadata) {
+    sections.push({
+      key: "document_details",
+      title: "Document Details",
+      data: documentMetadata,
+    });
+  }
+
+  if (safety?.warnings?.length) {
+    sections.push({
+      key: "safety",
+      title: "Safety",
+      warnings: safety.warnings,
+    });
+  }
+
+  return sections;
+};
+
 // Helper function to generate system prompt with user context
 const generateSystemPrompt = (user, documents, isDocumentQuery = false, language = 'english', documentContent = null, wantsStructured = false, userRole = 'doctor', patientId = null, conversationContext = null) => {
   const userName = user.name || "User";
-  const userRoleContext = userRole === 'doctor' ? 'medical professional' : 'patient';
-  
-  const platform = userRole === 'doctor' ? 'Web Dashboard' : 'Mobile App';
+  const role = asLowerText(userRole);
+  const userRoleContext =
+    role === "doctor"
+      ? "medical professional"
+      : role === "patient"
+        ? "patient"
+        : "operations user";
+
+  const platform =
+    role === "doctor"
+      ? "Web Dashboard"
+      : role === "patient"
+        ? "Mobile App"
+        : "Admin Console";
+
+  const roleInstructions =
+    role === "doctor"
+      ? `
+IF userRole == DOCTOR:
+- Clinical, concise language
+- Highlight trends and abnormalities
+- Use medical terminology appropriately
+- Never override medical judgment
+- Focus on actionable insights
+- Provide comparison tables for lab values
+- Identify patterns and trends across reports
+`
+      : role === "patient"
+        ? `
+IF userRole == PATIENT:
+- Simple, reassuring language
+- Explain terms in plain words
+- Never diagnose or prescribe
+- Use encouraging tone when values improve
+- Always recommend doctor consultation when needed
+- Make complex medical data understandable
+`
+        : `
+IF userRole == ADMIN or SUPERADMIN:
+- Provide operational and compliance-aware assistance
+- Avoid patient-sensitive details unless explicit patient context is present
+- Keep language concise, structured, and policy-safe
+- Distinguish facts from recommendations
+`;
   
   const basePrompt = `You are a Medical Data Analysis and Explanation AI embedded inside a secure Medical Vault platform.
 
@@ -309,24 +416,7 @@ CURRENT USER NAME: ${userName}
 PLATFORM: ${platform}
 ${patientId ? `CURRENT PATIENT ID: ${patientId}` : ''}
 
-${userRole === 'doctor' ? `
-IF userRole == DOCTOR:
-- Clinical, concise language
-- Highlight trends and abnormalities
-- Use medical terminology appropriately
-- Never override medical judgment
-- Focus on actionable insights
-- Provide comparison tables for lab values
-- Identify patterns and trends across reports
-` : `
-IF userRole == PATIENT:
-- Simple, reassuring language
-- Explain terms in plain words
-- Never diagnose or prescribe
-- Use encouraging tone when values improve
-- Always recommend doctor consultation when needed
-- Make complex medical data understandable
-`}
+${roleInstructions}
 
 --------------------------------------------------
 LANGUAGE HANDLING
@@ -742,54 +832,166 @@ Always prioritize accuracy, safety, and appropriate medical boundaries.`;
 // POST /api/ai/ask - Main AI Assistant endpoint
 router.post("/ask", auth, async (req, res) => {
   try {
-    const { prompt, documentId, userRole = 'doctor', patientId, conversationContext, conversationId } = req.body;
+    const { prompt, documentId, patientId, conversationContext, conversationId } =
+      req.body || {};
+    const requestContext =
+      req.body && typeof req.body.context === "object" && req.body.context
+        ? req.body.context
+        : {};
+    const incomingConversationId =
+      conversationId || requestContext.conversationId || null;
     
     if (!prompt || typeof prompt !== "string" || prompt.trim().length === 0) {
       return res.status(400).json({
         success: false,
-        message: "Please provide a valid prompt"
+        message: "Please provide a valid prompt",
       });
     }
 
-    // Resolve authenticated principal and role
-    const role = req.auth?.role;
-    let currentUser = null; // entity used for prompt context (doctor or patient)
-    if (role === 'doctor') {
+    // Resolve authenticated principal and persona from auth only.
+    const role = normalizeRole(req.auth?.role);
+    const persona = resolvePersona(role);
+    const requesterId = String(req.auth?.id || "");
+
+    let currentUser = null;
+    if (role === "doctor") {
       const doctor = await DoctorUser.findById(req.auth.id).select("-password");
       if (!doctor) {
         return res.status(404).json({ success: false, message: "Doctor not found" });
       }
-      // Normalize to a minimal shape expected by prompt generator
-      currentUser = { _id: doctor._id, name: doctor.name };
-    } else {
-      const patient = await User.findById(req.user?._id).select("-password");
+      currentUser = doctor;
+    } else if (role === "patient") {
+      const patient = await User.findById(req.user?._id || req.auth?.id).select("-password");
       if (!patient) {
         return res.status(404).json({ success: false, message: "User not found" });
       }
       currentUser = patient;
+    } else if (role === "admin") {
+      const admin = await AdminUser.findById(req.auth.id).select("-password");
+      if (!admin) {
+        return res.status(404).json({ success: false, message: "Admin not found" });
+      }
+      currentUser = admin;
+    } else if (role === "superadmin") {
+      currentUser = {
+        _id: req.auth?.id || req.superAdmin?.email || "superadmin",
+        name: req.superAdmin?.email || req.auth?.email || "Super Admin",
+        preferences: {},
+      };
+    } else {
+      return res.status(403).json({ success: false, message: "Unsupported role" });
     }
 
-    // Detect language and other parameters
-    const language = detectLanguage(prompt);
+    // Resolve language with preference-first behavior + per-message override.
+    const languageResolution = resolveLanguage({
+      prompt,
+      context: {
+        preferredLanguage:
+          requestContext.preferredLanguage ||
+          requestContext.language ||
+          requestContext.locale ||
+          null,
+        userInputLanguage: requestContext.userInputLanguage || null,
+      },
+      principal: currentUser,
+    });
+    const language = languageResolution.resolvedLanguage;
     const wantsStructured = wantsStructuredData(prompt);
     const isDocumentRequest = isDocumentQuery(prompt);
     const isScheduleRequest = isScheduleQuery(prompt);
     const isUrgent = isUrgentQuery(prompt);
     const isPatientsList = isPatientsQuery(prompt);
-    
+
+    const selectedPatientProfile = String(
+      requestContext.selectedPatientProfile || patientId || ""
+    ).trim();
+    const activeProfile = String(requestContext.activeProfile || "").trim();
+
+    let targetPatientId = null;
+    if (role === "patient") {
+      targetPatientId = String(currentUser?._id || req.auth?.id || "");
+    } else if (["doctor", "admin", "superadmin"].includes(role)) {
+      targetPatientId = selectedPatientProfile || null;
+    }
+
+    const targetUserId =
+      role === "patient" ? String(currentUser?._id || "") : targetPatientId;
+
+    // Try to infer document by explicit id or fuzzy title
+    let requestedDocumentId = documentId || extractDocumentIdFromPrompt(prompt);
+    let requestedTitle = !requestedDocumentId ? extractDocumentTitleFromPrompt(prompt) : null;
+
+    const patientSensitiveIntent = isPatientSensitiveIntent(prompt, {
+      isDocumentRequest,
+      requestedDocumentId,
+      requestedTitle,
+      isScheduleRequest,
+      isPatientsList,
+    });
+
+    if (role === "doctor") {
+      if (targetPatientId) {
+        const allowed = await canDoctorAccessPatient(requesterId, String(targetPatientId));
+        if (!allowed) {
+          return res.status(403).json({
+            success: false,
+            code: "NO_ACTIVE_SESSION",
+            message: "No active doctor-patient relationship",
+          });
+        }
+      } else if (patientSensitiveIntent) {
+        return res.status(400).json({
+          success: false,
+          code: "PATIENT_CONTEXT_REQUIRED",
+          message: "Please select a patient profile to continue with patient-specific assistance.",
+          context: {
+            resolvedPersona: persona,
+            resolvedLanguage: language,
+          },
+        });
+      }
+    }
+
+    if (role === "admin" || role === "superadmin") {
+      if (!targetPatientId && patientSensitiveIntent) {
+        return res.status(403).json({
+          success: false,
+          code: "PATIENT_CONTEXT_REQUIRED",
+          message:
+            "Patient-sensitive analysis requires an explicit patient context in this admin workflow.",
+        });
+      }
+      if (!targetPatientId && !isOperationalIntent(prompt)) {
+        return res.status(403).json({
+          success: false,
+          code: "ADMIN_OPERATIONAL_ONLY",
+          message:
+            "Admin assistant is limited to operational/compliance guidance unless a patient context is explicitly selected.",
+        });
+      }
+      if (targetPatientId) {
+        const patientExists = await User.findById(targetPatientId).select("_id").lean();
+        if (!patientExists) {
+          return res.status(404).json({
+            success: false,
+            message: "Selected patient profile was not found",
+          });
+        }
+      }
+    }
+
+    const authorizedScope = buildAuthorizedScope({
+      role,
+      requesterId,
+      patientId: targetPatientId,
+      sessionScope: requestContext.authorizedSessionScope || null,
+    });
+
     let documents = [];
     let documentData = [];
     let documentContent = null;
     let documentMetadata = null;
-    // Determine which userId to fetch documents for
-    const targetUserId = (req.auth?.role === 'doctor')
-      ? (patientId || null)
-      : (currentUser?._id?.toString() || null);
-
-    // If specific document ID is provided, analyze that document
-    // Try to infer document by explicit id or fuzzy title
-    let requestedDocumentId = documentId || extractDocumentIdFromPrompt(prompt);
-    let requestedTitle = !requestedDocumentId ? extractDocumentTitleFromPrompt(prompt) : null;
+    const missingDataWarnings = [];
 
     if (requestedDocumentId) {
       try {
@@ -804,20 +1006,18 @@ router.post("/ask", auth, async (req, res) => {
           });
         }
 
-        // Access control: patients can access their own docs; doctors need patientId and must match
-        if (req.auth?.role === 'doctor') {
-          if (!patientId) {
-            return res.status(403).json({ success: false, message: "Patient ID required for document analysis" });
-          }
-          if (document.userId !== String(patientId)) {
-            console.log(`❌ Access denied for doctor ${req.auth.id} to document ${requestedDocumentId} for patient ${patientId}`);
-            return res.status(403).json({ success: false, message: "Access denied to this document" });
-          }
-        } else {
-          if (document.userId !== currentUser._id.toString()) {
-            console.log(`❌ Access denied for user: ${currentUser._id} to document: ${requestedDocumentId}`);
-            return res.status(403).json({ success: false, message: "Access denied to this document" });
-          }
+        const documentOwnerId = String(document.userId || "");
+        const selfUserId = String(currentUser?._id || "");
+        let hasDocumentAccess = false;
+        if (role === "patient") {
+          hasDocumentAccess = documentOwnerId === selfUserId;
+        } else if (role === "doctor") {
+          hasDocumentAccess = !!targetPatientId && documentOwnerId === String(targetPatientId);
+        } else if (role === "admin" || role === "superadmin") {
+          hasDocumentAccess = !!targetPatientId && documentOwnerId === String(targetPatientId);
+        }
+        if (!hasDocumentAccess) {
+          return res.status(403).json({ success: false, message: "Access denied to this document" });
         }
 
         console.log(`📋 Document details:`, {
@@ -866,16 +1066,24 @@ router.post("/ask", auth, async (req, res) => {
 
         if (extractionResult.success) {
           documentContent = extractionResult.text;
+          const extractionConfidence = estimateExtractionConfidence({
+            metadata: extractionResult.metadata,
+            text: extractionResult.text,
+          });
           documentMetadata = {
             ...extractionResult.metadata,
             fileName: document.title || document.originalName,
             documentType: document.type,
-            uploadedAt: document.uploadedAt
+            uploadedAt: document.uploadedAt,
+            extractionConfidence,
           };
           
           // Add to documents array for context
           documents = [document];
           documentData = generatePreviewUrls(formatDocumentsForAI([document], document.type));
+          if (extractionConfidence.level !== "high") {
+            missingDataWarnings.push(...extractionConfidence.reasons);
+          }
         } else {
           console.error(`❌ Text extraction failed: ${extractionResult.error}`);
           return res.status(500).json({
@@ -893,9 +1101,12 @@ router.post("/ask", auth, async (req, res) => {
       }
     } else if (requestedTitle) {
       // Fuzzy title match within patient's docs
-      const targetUserIdForTitle = (req.auth?.role === 'doctor') ? patientId : currentUser._id.toString();
+      const targetUserIdForTitle = targetUserId;
       if (!targetUserIdForTitle) {
-        console.log('No target user for title-based document search');
+        return res.status(400).json({
+          success: false,
+          message: "Patient context is required for title-based document analysis",
+        });
       } else {
         const candidates = await Document.find({ userId: targetUserIdForTitle }).sort({ uploadedAt: -1 }).limit(50);
         const target = normalizeTitle(requestedTitle);
@@ -917,9 +1128,22 @@ router.post("/ask", auth, async (req, res) => {
             const extractionResult = await documentReader.extractTextFromS3(doc.s3Key, bucketName);
             if (extractionResult.success) {
               documentContent = extractionResult.text;
-              documentMetadata = { ...extractionResult.metadata, fileName: doc.title || doc.originalName, documentType: doc.type, uploadedAt: doc.uploadedAt };
+              const extractionConfidence = estimateExtractionConfidence({
+                metadata: extractionResult.metadata,
+                text: extractionResult.text,
+              });
+              documentMetadata = {
+                ...extractionResult.metadata,
+                fileName: doc.title || doc.originalName,
+                documentType: doc.type,
+                uploadedAt: doc.uploadedAt,
+                extractionConfidence,
+              };
               documents = [doc];
               documentData = generatePreviewUrls(formatDocumentsForAI([doc], doc.type));
+              if (extractionConfidence.level !== "high") {
+                missingDataWarnings.push(...extractionConfidence.reasons);
+              }
             } else {
               return res.status(500).json({ success: false, message: `Failed to extract text from document: ${extractionResult.error}` });
             }
@@ -928,6 +1152,7 @@ router.post("/ask", auth, async (req, res) => {
           }
         } else {
           console.log('No fuzzy match found for title:', requestedTitle);
+          missingDataWarnings.push(`Could not find a matching document for "${requestedTitle}".`);
         }
       }
     } else if (isDocumentRequest) {
@@ -936,7 +1161,11 @@ router.post("/ask", auth, async (req, res) => {
       const dateRange = parseDateRangeFromPrompt(lowerPrompt);
       // If doctor without patient context, skip fetching documents (no target)
       if (!targetUserId) {
-        console.log("ℹ️ Document query received but no target patientId for doctor. Skipping document fetch.");
+        return res.status(400).json({
+          success: false,
+          code: "PATIENT_CONTEXT_REQUIRED",
+          message: "Please select a patient profile for document-specific queries.",
+        });
       } else {
       
       const baseFilter = { userId: targetUserId };
@@ -967,6 +1196,9 @@ router.post("/ask", auth, async (req, res) => {
       }
       // Format documents for response with preview URLs
       documentData = generatePreviewUrls(formatDocumentsForAI(documents, "general"));
+      if (!documents || documents.length === 0) {
+        missingDataWarnings.push("No matching documents were found in the current authorized scope.");
+      }
       // If user asked for structured outputs, prepare simple aggregations for charts/tables
       if (documents && documents.length > 0) {
         const aggs = buildDocumentAggregations(documents);
@@ -978,7 +1210,7 @@ router.post("/ask", auth, async (req, res) => {
 
     // Optionally fetch today's appointments for doctor schedule queries
     let appointmentData = [];
-    if (isScheduleRequest && req.auth?.role === 'doctor') {
+    if (isScheduleRequest && role === 'doctor') {
       const { start, end } = getTodayRange();
       const todays = await Appointment.find({
         doctorId: req.auth.id,
@@ -993,7 +1225,7 @@ router.post("/ask", auth, async (req, res) => {
 
     // Optionally fetch recent patients list for doctor
     let patientsData = [];
-    if (isPatientsList && req.auth?.role === 'doctor') {
+    if (isPatientsList && role === 'doctor') {
       const since = new Date();
       since.setDate(since.getDate() - 30);
       const recent = await Appointment.find({
@@ -1016,7 +1248,7 @@ router.post("/ask", auth, async (req, res) => {
           const time = a.date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
           return `${i + 1}. ${time} - ${a.name} (${a.type}, ${a.status}) - ${a.reason}`;
         }).join('\n')
-      : (isScheduleRequest && req.auth?.role === 'doctor' ? '\n\nToday: No appointments found.' : '');
+      : (isScheduleRequest && role === 'doctor' ? '\n\nToday: No appointments found.' : '');
 
     const patientsContext = patientsData.length > 0
       ? `\n\nActive Patients (last 30 days):\n` + patientsData.map((p, i) => `${i + 1}. ${p.name} - Last appointment: ${new Date(p.lastAppointmentDate).toLocaleDateString()}`).join('\n')
@@ -1029,16 +1261,27 @@ router.post("/ask", auth, async (req, res) => {
       language,
       documentContent,
       wantsStructured,
-      userRole,
-      patientId,
+      persona,
+      targetPatientId,
       conversationContext
     ) + appointmentContext + patientsContext;
+
+    let effectiveSystemPrompt = systemPrompt;
+    if (role === "admin" || role === "superadmin") {
+      if (targetPatientId) {
+        effectiveSystemPrompt +=
+          "\n\nADMIN CONTEXT:\n- Explicit patient context was selected.\n- Use only authorized patient data.\n- Keep response compliance-aware and concise.";
+      } else {
+        effectiveSystemPrompt +=
+          "\n\nADMIN CONTEXT:\n- Operational mode only.\n- Do not disclose patient-sensitive details.\n- Focus on compliance, workflows, and high-level operational guidance.";
+      }
+    }
 
     // Prepare messages for OpenAI API
     const messages = [
       {
         role: "system",
-        content: systemPrompt
+        content: effectiveSystemPrompt
       },
       {
         role: "user",
@@ -1140,19 +1383,43 @@ router.post("/ask", auth, async (req, res) => {
       };
     }
 
+    const extractionConfidence = documentMetadata?.extractionConfidence || null;
+    const safety = buildSafetyPayload({
+      prompt,
+      reply: aiReply,
+      extractionConfidence,
+      missingData: missingDataWarnings,
+    });
+    const sections = buildResponseSections({
+      persona,
+      reply: aiReply,
+      structuredData,
+      responseType,
+      documentMetadata,
+      safety,
+    });
+
     // Persist chat with 24h TTL
-    let savedConversationId = conversationId;
+    let savedConversationId = incomingConversationId;
     try {
       const now = new Date();
       const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
       const chatFilter = {
-        userId: req.auth.role === 'doctor' ? req.auth.id : currentUser._id.toString(),
-        userRole: req.auth.role === 'doctor' ? 'doctor' : 'patient',
-        ...(patientId ? { patientId: String(patientId) } : { patientId: null })
+        userId: String(req.auth?.id || currentUser?._id || ""),
+        userRole: persona,
+        ...(targetPatientId ? { patientId: String(targetPatientId) } : { patientId: null })
       };
       let chatDoc = null;
-      if (conversationId) {
-        chatDoc = await AIChat.findById(conversationId);
+      if (incomingConversationId) {
+        const candidate = await AIChat.findById(incomingConversationId);
+        if (
+          candidate &&
+          candidate.userId === chatFilter.userId &&
+          candidate.userRole === chatFilter.userRole &&
+          String(candidate.patientId || "") === String(chatFilter.patientId || "")
+        ) {
+          chatDoc = candidate;
+        }
       }
       if (!chatDoc) {
         chatDoc = await AIChat.findOne(chatFilter).sort({ updatedAt: -1 });
@@ -1162,10 +1429,21 @@ router.post("/ask", auth, async (req, res) => {
       }
       chatDoc.messages.push(
         { role: 'user', content: prompt, timestamp: new Date() },
-        { role: 'assistant', content: aiReply, timestamp: new Date(), metadata: { language, responseType } }
+        { role: 'assistant', content: aiReply, timestamp: new Date(), metadata: { language, responseType, safety } }
       );
       chatDoc.lastActivityAt = new Date();
       chatDoc.expiresAt = expiresAt;
+      chatDoc.context = {
+        resolvedPersona: persona,
+        resolvedLanguage: language,
+        preferredLanguage: languageResolution.preferredLanguage,
+        userInputLanguage: languageResolution.userInputLanguage,
+        detectedLanguage: languageResolution.detectedLanguage,
+        authorizedScope,
+        voiceMode: asBoolean(requestContext.voiceMode, false),
+        activeProfile: activeProfile || null,
+        selectedPatientProfile: selectedPatientProfile || null,
+      };
       await chatDoc.save();
       savedConversationId = chatDoc._id.toString();
     } catch (persistErr) {
@@ -1175,21 +1453,29 @@ router.post("/ask", auth, async (req, res) => {
     // Prepare response with enhanced context
     const response = {
       success: true,
-      user: currentUser.name,
+      user: currentUser.name || "User",
       assistant: "AI Ally Assistant",
       reply: aiReply,
       language,
       responseType,
       structuredData,
+      sections,
+      safety,
       documentMetadata,
       data: documentData.length > 0 ? documentData : (appointmentData.length > 0 ? appointmentData : (patientsData.length > 0 ? patientsData : null)),
       model: (openaiResponse?.data?.model || 'gpt-4o-mini'),
       context: {
-        userRole,
-        patientId,
+        userRole: persona, // backward-compat field name
+        resolvedPersona: persona,
+        resolvedLanguage: language,
+        authorizedScope,
+        patientId: targetPatientId,
         sessionId: Date.now(),
         timestamp: new Date().toISOString(),
-        conversationId: savedConversationId
+        conversationId: savedConversationId,
+        voiceMode: asBoolean(requestContext.voiceMode, false),
+        preferredLanguage: languageResolution.preferredLanguage,
+        userInputLanguage: languageResolution.userInputLanguage,
       }
     };
 
@@ -1363,14 +1649,31 @@ router.get("/status", auth, async (req, res) => {
 // Load recent chat (last 24h) for current principal
 router.get("/chat", auth, async (req, res) => {
   try {
+    const role = normalizeRole(req.auth?.role);
+    const queryPatientId = String(req.query.patientId || "").trim();
+    if (role === "doctor" && queryPatientId) {
+      const allowed = await canDoctorAccessPatient(String(req.auth?.id || ""), queryPatientId);
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          code: "NO_ACTIVE_SESSION",
+          message: "No active doctor-patient relationship",
+        });
+      }
+    }
     const filter = {
-      userId: req.auth.role === 'doctor' ? req.auth.id : (req.user?._id?.toString() || ''),
-      userRole: req.auth.role === 'doctor' ? 'doctor' : 'patient',
-      ...(req.query.patientId ? { patientId: String(req.query.patientId) } : { patientId: null })
+      userId: String(req.auth?.id || req.user?._id?.toString() || ""),
+      userRole: resolvePersona(role),
+      ...(queryPatientId ? { patientId: queryPatientId } : { patientId: null }),
     };
     const chat = await AIChat.findOne(filter).sort({ updatedAt: -1 }).lean();
     if (!chat) return res.json({ success: true, messages: [], conversationId: null });
-    res.json({ success: true, messages: chat.messages || [], conversationId: chat._id });
+    res.json({
+      success: true,
+      messages: chat.messages || [],
+      conversationId: chat._id,
+      context: chat.context || null,
+    });
   } catch (error) {
     console.error('Chat load error:', error);
     res.status(500).json({ success: false, message: 'Failed to load chat' });
@@ -1380,10 +1683,22 @@ router.get("/chat", auth, async (req, res) => {
 // Clear chat for current principal
 router.delete("/chat", auth, async (req, res) => {
   try {
+    const role = normalizeRole(req.auth?.role);
+    const queryPatientId = String(req.query.patientId || "").trim();
+    if (role === "doctor" && queryPatientId) {
+      const allowed = await canDoctorAccessPatient(String(req.auth?.id || ""), queryPatientId);
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          code: "NO_ACTIVE_SESSION",
+          message: "No active doctor-patient relationship",
+        });
+      }
+    }
     const filter = {
-      userId: req.auth.role === 'doctor' ? req.auth.id : (req.user?._id?.toString() || ''),
-      userRole: req.auth.role === 'doctor' ? 'doctor' : 'patient',
-      ...(req.query.patientId ? { patientId: String(req.query.patientId) } : { patientId: null })
+      userId: String(req.auth?.id || req.user?._id?.toString() || ""),
+      userRole: resolvePersona(role),
+      ...(queryPatientId ? { patientId: queryPatientId } : { patientId: null }),
     };
     await AIChat.deleteMany(filter);
     res.json({ success: true, message: 'Chat cleared' });
@@ -1585,3 +1900,5 @@ router.get('/patient/:patientId/analyze', auth, async (req, res) => {
 });
 
 export default router;
+
+

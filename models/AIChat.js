@@ -13,9 +13,14 @@ const messageSchema = new mongoose.Schema(
 const aiChatSchema = new mongoose.Schema(
   {
     userId: { type: String, required: true }, // doctorId or patient userId
-    userRole: { type: String, enum: ["doctor", "patient"], required: true },
+    userRole: {
+      type: String,
+      enum: ["doctor", "patient", "admin", "superadmin"],
+      required: true,
+    },
     patientId: { type: String }, // optional context for doctor chats
     messages: { type: [messageSchema], default: [] },
+    context: { type: Object, default: {} }, // resolved persona/language/scope metadata
     lastActivityAt: { type: Date, default: Date.now },
     expiresAt: { type: Date, required: true }, // TTL cutoff
   },
