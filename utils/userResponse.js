@@ -13,6 +13,19 @@ const toPlainObject = (doc) => {
   return { ...doc };
 };
 
+const isEncryptedBlob = (value) =>
+  String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .startsWith("enc:v");
+
+const decryptSensitive = (value) => {
+  const decrypted = decryptField(value ?? "");
+  // If decryption fails (missing/wrong key), never leak encrypted blob to UI.
+  if (isEncryptedBlob(decrypted)) return "";
+  return decrypted ?? "";
+};
+
 export const buildUserResponse = async (doc) => {
   const plain = toPlainObject(doc);
   if (!plain) return null;
@@ -20,13 +33,18 @@ export const buildUserResponse = async (doc) => {
     plain.emergencyContact && typeof plain.emergencyContact === "object"
       ? plain.emergencyContact
       : {};
+  const emergencyPhoneRaw =
+    emergencyContactRaw.phone ??
+    emergencyContactRaw.mobile ??
+    emergencyContactRaw.number ??
+    "";
 
   const user = {
     id: (plain._id || plain.id)?.toString?.() ?? plain.id ?? null,
     name: plain.name ?? "",
     email: plain.email ?? "",
-    mobile: plain.mobile ?? "",
-    aadhaar: decryptField(plain.aadhaar ?? ""),
+    mobile: decryptSensitive(plain.mobile ?? ""),
+    aadhaar: decryptSensitive(plain.aadhaar ?? ""),
     dateOfBirth: plain.dateOfBirth ?? null,
     age: plain.age ?? null,
     gender: plain.gender ?? "",
@@ -37,13 +55,13 @@ export const buildUserResponse = async (doc) => {
     nextAppointment: plain.nextAppointment ?? null,
     emergencyContact: {
       ...emergencyContactRaw,
-      phone: decryptField(emergencyContactRaw.phone ?? ""),
+      phone: decryptSensitive(emergencyPhoneRaw),
     },
     medicalHistory: plain.medicalHistory ?? [],
     medications: plain.medications ?? [],
     medicalRecords: plain.medicalRecords ?? [],
     profilePicture: plain.profilePicture ?? null,
-    allergies: decryptField(plain.allergies ?? ""),
+    allergies: decryptSensitive(plain.allergies ?? ""),
     emailVerified: plain.emailVerified ?? false,
     loginType: plain.loginType ?? "email",
     googleId: plain.googleId ?? null,
