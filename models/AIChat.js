@@ -22,13 +22,10 @@ const aiChatSchema = new mongoose.Schema(
     messages: { type: [messageSchema], default: [] },
     context: { type: Object, default: {} }, // resolved persona/language/scope metadata
     lastActivityAt: { type: Date, default: Date.now },
-    expiresAt: { type: Date, required: true }, // TTL cutoff
   },
   { timestamps: true }
 );
 
-// TTL index to auto-delete after expiresAt passes
-aiChatSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 aiChatSchema.index({ userId: 1, userRole: 1, patientId: 1 });
 
 export const AIChat = mongoose.model("AIChat", aiChatSchema, "ai_chats");

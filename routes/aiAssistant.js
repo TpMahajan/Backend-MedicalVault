@@ -68,6 +68,24 @@ const wantsStructuredData = (prompt) => {
   return structuredKeywords.some(keyword => lowerPrompt.includes(keyword));
 };
 
+// Helper: detect explicit document analytics/count intent.
+// This prevents metadata counts from being shown as clinical file findings.
+const isDocumentAnalyticsQuery = (prompt) => {
+  const lowerPrompt = String(prompt || "").toLowerCase();
+  if (!lowerPrompt) return false;
+
+  const explicitPatterns = [
+    /how many\s+(documents|docs|files)/i,
+    /(document|file)\s+count(s)?/i,
+    /(count|counts)\s+by\s+(type|category|day|date)/i,
+    /(document|file)\s+(analytics|stats|statistics|distribution|breakdown)/i,
+    /(vault|dashboard)\s+(analytics|stats|statistics|counts)/i,
+    /(number|total)\s+of\s+(documents|docs|files)/i,
+  ];
+
+  return explicitPatterns.some((pattern) => pattern.test(lowerPrompt));
+};
+
 // Helper function to get date range for current month
 const getCurrentMonthRange = () => {
   const now = new Date();
@@ -787,14 +805,13 @@ Structure Order:
 FORMATTING RULES (STRICT)
 --------------------------------------------------
 
-- Plain text only
-- No markdown syntax
-- No emojis or symbols
-- No asterisks, hash symbols, or backticks
-- Use hyphen (-) for bullets
-- Tables only where appropriate (comparisons, trends)
-- Clean spacing and readability
-- Consistent alignment in tables
+- Keep output presentation-ready and easy to scan on mobile and web
+- Use short headings (markdown-style headings allowed)
+- Use concise bullets for key points
+- Use tables only when real row-level structured data exists
+- Never use category counts or metadata as clinical findings
+- Keep spacing clean and avoid large text blocks
+- Keep labels and units exactly as extracted
 
 --------------------------------------------------
 CHART COMPATIBILITY (IMPORTANT)
@@ -878,7 +895,53 @@ Deliver hospital-grade report analysis that is:
 - Trusted (by both patients and doctors)
 
 Always prioritize:
-Accuracy > Relevance > Clarity > Safety`;
+Accuracy > Relevance > Clarity > Safety
+
+--------------------------------------------------
+HIGH PRIORITY PRODUCT OVERRIDES
+--------------------------------------------------
+
+- Use authorized context only.
+- Prefer extracted file content over metadata and over document counts.
+- Never present category counts, dashboard stats, or file inventory as clinical findings.
+- If extracted row-level data is unavailable, clearly say that only metadata is available.
+- Distinguish clearly:
+  1) facts from file/context
+  2) interpretation
+  3) safe next steps
+- Never fabricate diagnoses, values, medicines, dates, or report findings.
+
+OUTPUT STYLE (DEFAULT):
+1. Summary
+2. Key Points
+3. Important Details
+4. Structured Table only if real row-level data exists
+5. Interpretation / Meaning
+6. Next Steps
+7. Urgent Warning if relevant
+8. 3-5 concise follow-up options when useful
+
+FORMATTING:
+- Keep responses scannable and mobile-friendly
+- Use short headings and bullets
+- Use tables only when truly structured data exists
+- Avoid large unstructured text blocks
+- Keep token usage efficient by using only relevant context
+
+CHART RULES:
+- Use charts only when multiple dated numeric values exist and trend is useful
+- Do not generate charts for single values or metadata-only content
+- Do not generate count-based charts/tables unless user explicitly asks for document analytics/counts
+
+LANGUAGE RULES:
+- Respond in preferred or detected user language
+- Preserve medical names, values, units, and proper nouns accurately
+- Do not require manual language dropdown selection
+
+SAFETY:
+- Not a replacement for licensed clinical judgment
+- No unsafe treatment instructions
+- Flag urgent red flags clearly and recommend urgent care when needed`;
 
   if (isDocumentQuery && documents && documents.length > 0) {
     if (documentContent) {
@@ -946,7 +1009,7 @@ ${wantsStructured ? `
 RESPONSE FORMAT:
 - Respond in ${language}
 - Follow the structure: Table → Files → Analysis
-- Use plain text with hyphen bullets (no markdown)
+- Use short headings and bullets for readability
 - Maintain medical accuracy above all
 
 Remember: This is a real medical document. Hospital-grade accuracy is required.`;
@@ -989,7 +1052,7 @@ RESPONSE REQUIREMENTS:
    - If user asked for condition-specific → identify and list relevant reports
 
 3. RESPONSE FORMAT:
-   - Use plain text with hyphen bullets (no markdown)
+   - Use short headings and bullets
    - Keep response focused and scannable
    - Include dates for each document
    - Mention total count
@@ -1106,6 +1169,7 @@ router.post("/ask", auth, async (req, res) => {
     const language = languageResolution.resolvedLanguage;
     const wantsStructured = wantsStructuredData(prompt);
     const isDocumentRequest = isDocumentQuery(prompt);
+    const wantsDocumentAnalytics = isDocumentAnalyticsQuery(prompt);
     const isScheduleRequest = isScheduleQuery(prompt);
     const isUrgent = isUrgentQuery(prompt);
     const isPatientsList = isPatientsQuery(prompt);
@@ -1407,8 +1471,8 @@ router.post("/ask", auth, async (req, res) => {
       if (!documents || documents.length === 0) {
         missingDataWarnings.push("No matching documents were found in the current authorized scope.");
       }
-      // If user asked for structured outputs, prepare simple aggregations for charts/tables
-      if (documents && documents.length > 0) {
+      // Prepare document count analytics only when explicitly requested.
+      if (wantsDocumentAnalytics && documents && documents.length > 0) {
         const aggs = buildDocumentAggregations(documents);
         // Attach aggregations so frontend can render charts even if LLM didn't return JSON
         // We'll include these in the response later if needed
@@ -1575,8 +1639,8 @@ router.post("/ask", auth, async (req, res) => {
       }
     }
 
-    // Fallback: if user seems to want structured data or asked about documents and we computed aggregations
-    if (!structuredData && (wantsStructured || isDocumentRequest) && req._docAggregations) {
+    // Fallback: use document count analytics only for explicit analytics/count intent.
+    if (!structuredData && wantsDocumentAnalytics && req._docAggregations) {
       // Prefer a chart showing counts by type, and a table of daily counts
       responseType = wantsStructured ? 'chart' : 'table';
       structuredData = wantsStructured
@@ -1625,11 +1689,9 @@ router.post("/ask", auth, async (req, res) => {
       safety,
     });
 
-    // Persist chat with 24h TTL
+    // Persist chat history until user clears manually.
     let savedConversationId = incomingConversationId;
     try {
-      const now = new Date();
-      const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
       const chatFilter = {
         userId: String(req.auth?.id || currentUser?._id || ""),
         userRole: persona,
@@ -1651,14 +1713,30 @@ router.post("/ask", auth, async (req, res) => {
         chatDoc = await AIChat.findOne(chatFilter).sort({ updatedAt: -1 });
       }
       if (!chatDoc) {
-        chatDoc = new AIChat({ ...chatFilter, messages: [], expiresAt });
+        chatDoc = new AIChat({ ...chatFilter, messages: [] });
       }
       chatDoc.messages.push(
         { role: 'user', content: prompt, timestamp: new Date() },
-        { role: 'assistant', content: aiReply, timestamp: new Date(), metadata: { language, responseType, safety } }
+        {
+          role: 'assistant',
+          content: aiReply,
+          timestamp: new Date(),
+          metadata: {
+            language,
+            responseType,
+            structuredData,
+            sections,
+            safety,
+            documentMetadata,
+            data: documentData.length > 0
+              ? documentData
+              : (appointmentData.length > 0
+                  ? appointmentData
+                  : (patientsData.length > 0 ? patientsData : null)),
+          },
+        }
       );
       chatDoc.lastActivityAt = new Date();
-      chatDoc.expiresAt = expiresAt;
       chatDoc.context = {
         resolvedPersona: persona,
         resolvedLanguage: language,
@@ -1671,6 +1749,8 @@ router.post("/ask", auth, async (req, res) => {
         selectedPatientProfile: selectedPatientProfile || null,
       };
       await chatDoc.save();
+      // Remove legacy TTL field if present on older chat documents.
+      await AIChat.updateOne({ _id: chatDoc._id }, { $unset: { expiresAt: 1 } });
       savedConversationId = chatDoc._id.toString();
     } catch (persistErr) {
       console.warn('⚠️ Failed to persist AI chat:', persistErr.message);
@@ -1872,7 +1952,7 @@ router.get("/status", auth, async (req, res) => {
   }
 });
 
-// Load recent chat (last 24h) for current principal
+// Load chat history for current principal (persists until manually cleared)
 router.get("/chat", auth, async (req, res) => {
   try {
     const role = normalizeRole(req.auth?.role);
@@ -1894,6 +1974,7 @@ router.get("/chat", auth, async (req, res) => {
     };
     const chat = await AIChat.findOne(filter).sort({ updatedAt: -1 }).lean();
     if (!chat) return res.json({ success: true, messages: [], conversationId: null });
+    await AIChat.updateOne({ _id: chat._id }, { $unset: { expiresAt: 1 } });
     res.json({
       success: true,
       messages: chat.messages || [],

@@ -78,6 +78,8 @@ const defaultCorsOrigins = [
   "http://localhost:3000",
   "http://127.0.0.1:3000",
   "https://health-vault-web.vercel.app",
+  "https://medicalvault-aially.vercel.app",
+  "https://www.medicalvault-aially.vercel.app",
 ];
 
 const envCorsOrigins = (process.env.CORS_ORIGINS || "")
@@ -86,8 +88,8 @@ const envCorsOrigins = (process.env.CORS_ORIGINS || "")
   .filter(Boolean);
 
 const defaultCorsOriginPatterns = [
-  /^https:\/\/health-vault-web-[a-z0-9-]+\.vercel\.app$/i,
-  /^https:\/\/medicalvault-aially-[a-z0-9-]+\.vercel\.app$/i,
+  /^https:\/\/health-vault-web(?:-[a-z0-9-]+)?\.vercel\.app$/i,
+  /^https:\/\/medicalvault-aially(?:-[a-z0-9-]+)?\.vercel\.app$/i,
 ];
 
 const envCorsOriginPatterns = (process.env.CORS_ORIGIN_PATTERNS || "")
@@ -119,18 +121,22 @@ const isAllowedCorsOrigin = (origin) => {
   return allowedCorsOriginPatterns.some((pattern) => pattern.test(origin));
 };
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (isAllowedCorsOrigin(origin)) {
-        callback(null, true);
-        return;
-      }
-      callback(new Error(`Not allowed by CORS: ${origin}`));
-    },
-    credentials: true,
-  })
-);
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (isAllowedCorsOrigin(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error(`Not allowed by CORS: ${origin}`));
+  },
+  credentials: true,
+  methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 if (String(process.env.ENFORCE_HTTPS || "false").toLowerCase() === "true") {
   app.use((req, res, next) => {
     const forwardedProto = String(req.headers["x-forwarded-proto"] || "").toLowerCase();

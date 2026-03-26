@@ -8,7 +8,11 @@ import { ok, fail } from "../utils/apiResponse.js";
 const router = express.Router();
 
 const SHARE_TTL_MS = 15 * 60 * 1000;
-const FRONTEND_URL = String(process.env.WEB_APP_URL || "https://health-vault-web.vercel.app").replace(/\/+$/, "");
+const FRONTEND_URL = String(
+  process.env.WEB_APP_URL ||
+    process.env.FRONTEND_URL ||
+    "https://medicalvault-aially.vercel.app"
+).replace(/\/+$/, "");
 
 const normalizeRole = (role) => String(role || "").trim().toLowerCase();
 const isPrivilegedRole = (role) => role === "admin" || role === "superadmin";
