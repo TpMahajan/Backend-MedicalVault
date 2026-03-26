@@ -1054,10 +1054,24 @@ router.post("/session/heartbeat", auth, async (req, res) => {
       return res.status(403).json({ success: false, message: "Access denied" });
     }
     if (!sessionId) {
-      return res.status(400).json({
-        success: false,
-        message: "Session id missing in access token",
-        code: "SESSION_ID_MISSING",
+      // Backward compatibility: older access tokens may not carry `sid`.
+      // Treat heartbeat as a soft success to avoid noisy 400s from legacy clients.
+      if (role === patientRole) {
+        await User.updateOne(
+          { _id: principalId },
+          {
+            $set: {
+              lastActiveAt: now,
+              currentDeviceId: getDeviceId(req),
+            },
+          }
+        );
+      }
+      return res.json({
+        success: true,
+        message: "Heartbeat accepted (legacy session token)",
+        code: "SESSION_ID_MISSING_LEGACY",
+        lastActiveAt: now.toISOString(),
       });
     }
 

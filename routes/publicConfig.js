@@ -5,9 +5,11 @@ import { Advertisement } from "../models/Advertisement.js";
 import { AdvertisementClickLog } from "../models/AdvertisementClickLog.js";
 import { Product } from "../models/Product.js";
 import { UIConfig } from "../models/UIConfig.js";
+import { User } from "../models/User.js";
 import { PUBLIC_ALERT_PLATFORMS } from "../services/publicConfigRealtime.js";
 import { BUCKET_NAME } from "../config/s3.js";
 import { generateSignedUrl } from "../utils/s3Utils.js";
+import { buildUserResponse } from "../utils/userResponse.js";
 
 const router = express.Router();
 const hasAWSCredentials =
@@ -170,6 +172,47 @@ function matchesGeoTargets(entity, { country, state, region }) {
 
   return true;
 }
+
+// Public emergency medical-card endpoint for QR scans.
+// Intentionally accessible without authentication.
+router.get("/medical-card/:id", async (req, res) => {
+  try {
+    const userId = String(req.params.id || "").trim();
+    if (!/^[a-fA-F0-9]{24}$/.test(userId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid patient id",
+      });
+    }
+
+    const selectFields =
+      "name profilePicture age gender dateOfBirth bloodType height weight email mobile medications allergies emergencyContact";
+    const user = await User.findById(userId).select(selectFields).lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "Medical card not found",
+      });
+    }
+
+    const processedUser = await buildUserResponse(user);
+    if (processedUser && !processedUser._id && processedUser.id) {
+      processedUser._id = processedUser.id;
+    }
+
+    return res.json({
+      success: true,
+      data: { user: processedUser },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch medical card",
+      error: error.message,
+    });
+  }
+});
 
 router.get("/ads", async (req, res) => {
   try {
