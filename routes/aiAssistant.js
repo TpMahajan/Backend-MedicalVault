@@ -299,28 +299,224 @@ const asBoolean = (value, fallback = false) => {
   return fallback;
 };
 
+const normalizeSectionKey = (title = "") =>
+  String(title || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+const parsePipeTable = (rawText = "") => {
+  const lines = String(rawText || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  const candidateLines = lines.filter((line) => line.includes("|"));
+  if (candidateLines.length < 2) return null;
+
+  const parseRow = (line) =>
+    line
+      .split("|")
+      .map((cell) => cell.trim())
+      .filter((cell) => cell.length > 0);
+
+  let headerIndex = -1;
+  for (let i = 0; i < candidateLines.length - 1; i += 1) {
+    const current = candidateLines[i];
+    const next = candidateLines[i + 1];
+    if (
+      current.includes("|") &&
+      (/^-{2,}\s*\|/.test(next) || /\|\s*-{2,}/.test(next))
+    ) {
+      headerIndex = i;
+      break;
+    }
+  }
+
+  const tableLines =
+    headerIndex >= 0 ? candidateLines.slice(headerIndex) : candidateLines;
+  if (tableLines.length < 2) return null;
+
+  const headerCells = parseRow(tableLines[0]);
+  if (headerCells.length < 2) return null;
+
+  const bodyStart =
+    tableLines.length > 1 &&
+    (/^-{2,}\s*\|/.test(tableLines[1]) || /\|\s*-{2,}/.test(tableLines[1]))
+      ? 2
+      : 1;
+
+  const rows = tableLines
+    .slice(bodyStart)
+    .map(parseRow)
+    .filter((row) => row.length > 0)
+    .map((row) => {
+      const normalized = row.slice(0, headerCells.length);
+      while (normalized.length < headerCells.length) normalized.push("—");
+      return normalized;
+    });
+
+  if (rows.length === 0) return null;
+
+  return {
+    columns: headerCells,
+    rows,
+  };
+};
+
+const parseSectionsFromReply = (reply, persona = "patient") => {
+  const rawLines = String(reply || "").split(/\r?\n/);
+  const knownHeadings = new Set([
+    "summary",
+    "clinical summary",
+    "key points",
+    "key findings",
+    "important details",
+    "structured data",
+    "table",
+    "what this means",
+    "clinical relevance",
+    "what to do next",
+    "next steps",
+    "follow-up considerations",
+    "pertinent history",
+    "missing / unclear information",
+    "missing or unclear information",
+    "missing information",
+    "urgent warning signs",
+    "get urgent help now if",
+    "safety",
+    "plain language summary",
+    "document type",
+    "source details",
+    "extracted data",
+    "important / abnormal flags",
+    "important flags",
+    "extraction confidence",
+  ]);
+
+  const isHeadingLine = (line) => {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) return false;
+
+    const noHashes = trimmed.replace(/^#{1,3}\s*/, "");
+    const withColon = noHashes.replace(/[:\-]\s*$/, "").trim();
+    const lowered = withColon.toLowerCase();
+    if (knownHeadings.has(lowered)) return true;
+
+    // Generic heading fallback (short standalone title line).
+    if (
+      /^[A-Za-z][A-Za-z0-9\s/&()_-]{2,50}$/.test(withColon) &&
+      trimmed.length <= 60 &&
+      !trimmed.startsWith("- ") &&
+      !/^\d+\./.test(trimmed)
+    ) {
+      return true;
+    }
+    return false;
+  };
+
+  const toTitle = (line) => {
+    const trimmed = String(line || "").trim().replace(/^#{1,3}\s*/, "");
+    return trimmed.replace(/[:\-]\s*$/, "").trim();
+  };
+
+  const fallbackTitle = persona === "doctor" ? "Clinical Summary" : "Summary";
+  const blocks = [];
+  let current = { title: fallbackTitle, lines: [] };
+
+  for (const rawLine of rawLines) {
+    const line = rawLine ?? "";
+    if (isHeadingLine(line)) {
+      if (current.lines.length > 0 || current.title !== fallbackTitle) {
+        blocks.push(current);
+      }
+      current = { title: toTitle(line), lines: [] };
+      continue;
+    }
+    current.lines.push(line);
+  }
+  if (current.lines.length > 0 || blocks.length === 0) {
+    blocks.push(current);
+  }
+
+  const normalizedSections = [];
+  for (const block of blocks) {
+    const content = block.lines.join("\n").trim();
+    if (!content) continue;
+
+    const tableData = parsePipeTable(content);
+    if (tableData) {
+      normalizedSections.push({
+        key: normalizeSectionKey(block.title) || "table",
+        title: block.title || "Table",
+        type: "table",
+        data: tableData,
+      });
+      continue;
+    }
+
+    const bullets = block.lines
+      .map((line) => String(line || "").trim())
+      .filter((line) => /^[-*•]\s+/.test(line) || /^\d+\.\s+/.test(line))
+      .map((line) => line.replace(/^[-*•]\s+/, "").replace(/^\d+\.\s+/, "").trim())
+      .filter(Boolean);
+
+    if (bullets.length >= 2) {
+      normalizedSections.push({
+        key: normalizeSectionKey(block.title) || "key_points",
+        title: block.title || "Key Points",
+        type: "bullets",
+        items: bullets,
+      });
+      continue;
+    }
+
+    normalizedSections.push({
+      key: normalizeSectionKey(block.title) || "summary",
+      title: block.title || fallbackTitle,
+      content,
+    });
+  }
+
+  return normalizedSections;
+};
+
 const buildResponseSections = ({
   persona,
   reply,
+  parsedSections,
   structuredData,
   responseType,
   documentMetadata,
   safety,
 }) => {
-  const sections = [];
-  sections.push({
-    key: persona === "doctor" ? "clinical_summary" : "summary",
-    title: persona === "doctor" ? "Clinical Summary" : "Summary",
-    content: reply,
-  });
+  const sections = Array.isArray(parsedSections) && parsedSections.length > 0
+    ? [...parsedSections]
+    : [
+        {
+          key: persona === "doctor" ? "clinical_summary" : "summary",
+          title: persona === "doctor" ? "Clinical Summary" : "Summary",
+          content: reply,
+        },
+      ];
 
   if (structuredData) {
-    sections.push({
-      key: "structured_data",
-      title: "Structured Data",
-      type: responseType || "table",
-      data: structuredData,
-    });
+    const hasStructuredSection = sections.some(
+      (section) =>
+        String(section?.type || "").toLowerCase() === "table" ||
+        String(section?.type || "").toLowerCase() === "chart" ||
+        section?.key === "structured_data"
+    );
+    if (!hasStructuredSection) {
+      sections.push({
+        key: "structured_data",
+        title: "Structured Data",
+        type: responseType || "table",
+        data: structuredData,
+      });
+    }
   }
 
   if (documentMetadata) {
@@ -332,11 +528,16 @@ const buildResponseSections = ({
   }
 
   if (safety?.warnings?.length) {
-    sections.push({
-      key: "safety",
-      title: "Safety",
-      warnings: safety.warnings,
-    });
+    const hasSafetySection = sections.some(
+      (section) => section?.key === "safety"
+    );
+    if (!hasSafetySection) {
+      sections.push({
+        key: "safety",
+        title: "Safety",
+        warnings: safety.warnings,
+      });
+    }
   }
 
   return sections;
@@ -824,6 +1025,13 @@ RESPONSE GUIDELINES:
 - Keep responses concise and relevant
 - Respond in ${language}
 - Follow the medical data analysis principles above
+- Keep output presentation-ready for mobile screens:
+  - Start with a short summary
+  - Then add short section headings
+  - Use hyphen bullets for key points
+  - Use plain-text pipe tables only when structured values exist
+  - Keep each bullet short and scannable
+  - End with practical next steps
 
 Remember: You are a medical-grade analytical assistant, not a replacement for professional medical judgment.
 Always prioritize accuracy, safety, and appropriate medical boundaries.`;
@@ -1322,14 +1530,16 @@ router.post("/ask", auth, async (req, res) => {
       throw openaiError;
     }
 
-    // Sanitize reply to plain text bullets
-    const rawReply = openaiResponse.data.choices[0].message.content || '';
-    let aiReply = rawReply
-      .replace(/[\*#`]+/g, '')            // remove markdown symbols
-      .replace(/^[\s\-\d\.]+\s*/gm, (m) => m.startsWith('-') ? m : `- `) // normalize leading markers to hyphen
-      .replace(/[\u2022\u25CF\u25A0]/g, '-') // convert bullet chars to hyphen
-      .replace(/[\t]+/g, ' ')             // tabs to spaces
+    // Keep formatting stable for frontend section/table rendering.
+    const rawReply = openaiResponse.data.choices[0].message.content || "";
+    let aiReply = String(rawReply || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\u00A0/g, " ")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
       .trim();
+
+    const parsedSections = parseSectionsFromReply(aiReply, persona);
 
     // Parse response for structured data
     let responseType = "text";
@@ -1347,6 +1557,21 @@ router.post("/ask", auth, async (req, res) => {
       } catch (e) {
         // If JSON parsing fails, keep as text
         console.log("Could not parse structured data from AI response");
+      }
+    }
+
+    // If the model responded with a text table, convert first table for UI rendering.
+    if (!structuredData) {
+      const tableSection = parsedSections.find(
+        (section) =>
+          String(section?.type || "").toLowerCase() === "table" &&
+          section?.data &&
+          Array.isArray(section.data.columns) &&
+          Array.isArray(section.data.rows)
+      );
+      if (tableSection) {
+        responseType = "table";
+        structuredData = tableSection.data;
       }
     }
 
@@ -1393,6 +1618,7 @@ router.post("/ask", auth, async (req, res) => {
     const sections = buildResponseSections({
       persona,
       reply: aiReply,
+      parsedSections,
       structuredData,
       responseType,
       documentMetadata,
