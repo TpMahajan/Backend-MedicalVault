@@ -1,5 +1,9 @@
 import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
+
+const BCRYPT_HASH_PATTERN = /^\$2[aby]\$\d{2}\$.{53}$/;
+const isBcryptHash = (value) => BCRYPT_HASH_PATTERN.test(String(value || ""));
+
 const doctorUserSchema = new mongoose.Schema({
   // Required fields for signup
   name: { type: String, required: [true, "Name is required"], trim: true },
@@ -132,9 +136,26 @@ doctorUserSchema.pre("save", async function (next) {
   }
 });
 
-// Compare password
-doctorUserSchema.methods.comparePassword = function (candidatePassword) {
-  return bcrypt.compare(candidatePassword, this.password);
+// Compare password (supports legacy non-bcrypt values for migration safety)
+doctorUserSchema.methods.comparePassword = async function (candidatePassword) {
+  const incomingPassword = String(candidatePassword ?? "");
+  const storedPassword = String(this.password ?? "");
+  if (!incomingPassword || !storedPassword) return false;
+
+  if (isBcryptHash(storedPassword)) {
+    return bcrypt.compare(incomingPassword, storedPassword);
+  }
+
+  const trimmedIncomingPassword = incomingPassword.trim();
+  return (
+    incomingPassword === storedPassword ||
+    (trimmedIncomingPassword !== incomingPassword &&
+      trimmedIncomingPassword === storedPassword)
+  );
+};
+
+doctorUserSchema.methods.hasBcryptPassword = function () {
+  return isBcryptHash(this.password);
 };
 
 // Check if password expired

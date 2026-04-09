@@ -90,6 +90,10 @@ const envCorsOrigins = (process.env.CORS_ORIGINS || "")
 const defaultCorsOriginPatterns = [
   /^https:\/\/health-vault-web(?:-[a-z0-9-]+)?\.vercel\.app$/i,
   /^https:\/\/medicalvault-aially(?:-[a-z0-9-]+)?\.vercel\.app$/i,
+  // Allow local Microsoft Dev Tunnels during development only.
+  ...(ENV === "production"
+    ? []
+    : [/^https:\/\/[a-z0-9-]+-\d+\.[a-z0-9-]+\.devtunnels\.ms$/i]),
 ];
 
 const envCorsOriginPatterns = (process.env.CORS_ORIGIN_PATTERNS || "")
@@ -273,10 +277,10 @@ const startServer = async () => {
       sessionCleanupTimer.unref();
     }
 
-    const server = app.listen(PORT, "0.0.0.0", () => {
-      console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
-      console.log(`📚 Health check: http://0.0.0.0:${PORT}/health`);
-      console.log(`📂 Serving uploads at: http://0.0.0.0:${PORT}/uploads`);
+    const server = app.listen(PORT, () => {
+      console.log(`🚀 Server running on http://localhost:${PORT}`);
+      console.log(`📚 Health check: http://localhost:${PORT}/health`);
+      console.log(`📂 Serving uploads at: http://localhost:${PORT}/uploads`);
       console.log(`⏰ Cron jobs initialized for reminders`);
     });
 

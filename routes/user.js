@@ -89,7 +89,10 @@ router.get('/:id/records', auth, checkSession, auditTrail({
       return res.status(404).json({ success: false, msg: "User not found" });
     }
 
-    const records = user.medicalRecords || [];
+    const patientId = String(req.params.id || "");
+    const records = (user.medicalRecords || []).filter(
+      (record) => String(record?.userId || "") === patientId
+    );
 
     const grouped = {
       reports: records.filter((record) => record.category?.toLowerCase() === "report"),
@@ -99,6 +102,7 @@ router.get('/:id/records', auth, checkSession, auditTrail({
     };
 
     const { generateSignedUrl } = await import("../utils/s3Utils.js");
+    const apiBaseUrl = `${req.protocol}://${req.get("host")}`;
     const groupedWithUrl = Object.fromEntries(
       await Promise.all(
         Object.entries(grouped).map(async ([key, docs]) => [
@@ -110,12 +114,18 @@ router.get('/:id/records', auth, checkSession, auditTrail({
                 return {
                   ...doc.toObject(),
                   url: signedUrl,
+                  fileUrl: signedUrl,
+                  documentUrl: signedUrl,
                 };
               } catch (error) {
                 console.error(`Error generating URL for doc ${doc._id}:`, error);
+                const proxyUrl = `${apiBaseUrl}/api/files/${doc._id}/proxy?disposition=inline`;
                 return {
                   ...doc.toObject(),
-                  url: null,
+                  url: proxyUrl,
+                  fileUrl: proxyUrl,
+                  documentUrl: proxyUrl,
+                  source: "proxy_fallback",
                   error: "Failed to generate access URL"
                 };
               }

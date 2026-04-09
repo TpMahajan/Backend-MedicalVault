@@ -1,7 +1,9 @@
 import express from "express";
 import multer from "multer";
 import multerS3 from "multer-s3";
+import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 import { DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import axios from "axios";
 import { auth } from "../middleware/auth.js";
@@ -9,6 +11,7 @@ import { requireVerified } from "../middleware/requireVerified.js";
 import { Document } from "../models/File.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
+import { Session } from "../models/Session.js";
 import { checkSession, checkSessionByEmail } from "../middleware/checkSession.js";
 import s3Client, { BUCKET_NAME, REGION } from "../config/s3.js";
 import { generateSignedUrl, generatePreviewUrl, generateDownloadUrl } from "../utils/s3Utils.js";
@@ -47,6 +50,149 @@ const validateUploadFilename = (name = "") => {
 const isValidObjectId = (value) => /^[a-fA-F0-9]{24}$/.test(String(value || ""));
 
 const isRole = (req, role) => String(req.auth?.role || "").toLowerCase() === role;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const localUploadsRoot = path.resolve(__dirname, "../uploads");
+const localMedicalVaultUploadsRoot = path.resolve(localUploadsRoot, "medical-vault");
+
+const getApiBaseUrl = (req) => {
+  const protoHeader = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+  const hostHeader = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
+  const proto = protoHeader || req.protocol || "http";
+  const host = hostHeader || `localhost:${process.env.PORT || 5000}`;
+  return `${proto}://${host}`;
+};
+
+const buildProxyUrl = (req, docId, disposition = "inline") => {
+  const safeDisposition = disposition === "attachment" ? "attachment" : "inline";
+  return `${getApiBaseUrl(req)}/api/files/${docId}/proxy?disposition=${safeDisposition}`;
+};
+
+const buildLocalUploadUrl = (req, fileName) =>
+  `${getApiBaseUrl(req)}/uploads/medical-vault/${encodeURIComponent(String(fileName || "").trim())}`;
+
+const getOptionalDocumentField = (doc, key) => doc?.get?.(key) ?? doc?.[key] ?? null;
+
+const resolveStoredDocumentUrl = (req, doc) => {
+  const candidates = [
+    getOptionalDocumentField(doc, "url"),
+    getOptionalDocumentField(doc, "fileUrl"),
+    getOptionalDocumentField(doc, "documentUrl"),
+    getOptionalDocumentField(doc, "location"),
+  ].filter((value) => typeof value === "string" && value.trim());
+
+  for (const candidate of candidates) {
+    const trimmed = candidate.trim();
+    if (/^https?:\/\//i.test(trimmed)) {
+      return trimmed;
+    }
+    if (trimmed.startsWith("/uploads/")) {
+      return `${getApiBaseUrl(req)}${trimmed}`;
+    }
+    if (trimmed.startsWith("uploads/")) {
+      return `${getApiBaseUrl(req)}/${trimmed}`;
+    }
+  }
+
+  return null;
+};
+
+const resolveLocalDocumentPath = (doc) => {
+  const candidates = [];
+
+  const addUploadRelativePath = (rawValue) => {
+    if (!rawValue) return;
+    const normalized = rawValue.replace(/\\/g, "/").replace(/^\/+/, "").replace(/^uploads\//i, "");
+    if (!normalized) return;
+    candidates.push(path.resolve(process.cwd(), "uploads", normalized));
+    candidates.push(path.resolve(localUploadsRoot, normalized));
+  };
+
+  const addCandidate = (rawValue) => {
+    if (!rawValue || typeof rawValue !== "string") return;
+    const trimmed = rawValue.trim();
+    if (!trimmed) return;
+
+    try {
+      if (/^https?:\/\//i.test(trimmed)) {
+        const pathname = decodeURIComponent(new URL(trimmed).pathname || "");
+        const uploadsIndex = pathname.toLowerCase().lastIndexOf("/uploads/");
+        if (uploadsIndex >= 0) {
+          addUploadRelativePath(pathname.slice(uploadsIndex + "/uploads/".length));
+        }
+        return;
+      }
+    } catch {
+      // Fall through to direct path resolution.
+    }
+
+    const normalized = trimmed.replace(/\\/g, "/");
+    const uploadsIndex = normalized.toLowerCase().lastIndexOf("/uploads/");
+    if (uploadsIndex >= 0) {
+      addUploadRelativePath(normalized.slice(uploadsIndex + "/uploads/".length));
+    } else if (normalized.toLowerCase().startsWith("uploads/")) {
+      addUploadRelativePath(normalized.slice("uploads/".length));
+    }
+
+    candidates.push(path.resolve(trimmed));
+    candidates.push(path.resolve(process.cwd(), normalized.replace(/^\/+/, "")));
+    candidates.push(path.resolve(localUploadsRoot, normalized.replace(/^uploads\/+/i, "").replace(/^\/+/, "")));
+  };
+
+  [
+    "path",
+    "filePath",
+    "localFilePath",
+    "url",
+    "fileUrl",
+    "documentUrl",
+    "location",
+  ].forEach((field) => addCandidate(getOptionalDocumentField(doc, field)));
+
+  const fileName =
+    getOptionalDocumentField(doc, "filename") ||
+    getOptionalDocumentField(doc, "fileName") ||
+    getOptionalDocumentField(doc, "originalName");
+
+  if (typeof fileName === "string" && fileName.trim()) {
+    candidates.push(path.resolve(process.cwd(), "uploads", fileName.trim()));
+    candidates.push(path.resolve(process.cwd(), "uploads", "medical-vault", fileName.trim()));
+    candidates.push(path.resolve(localUploadsRoot, fileName.trim()));
+    candidates.push(path.resolve(localUploadsRoot, "medical-vault", fileName.trim()));
+  }
+
+  return [...new Set(candidates.filter(Boolean))].find((candidatePath) => fs.existsSync(candidatePath)) || "";
+};
+
+const resolvePreviewFallbackUrl = (req, doc) => {
+  if (resolveLocalDocumentPath(doc)) {
+    return buildProxyUrl(req, doc._id.toString(), "inline");
+  }
+  return resolveStoredDocumentUrl(req, doc) || buildProxyUrl(req, doc._id.toString(), "inline");
+};
+
+const resolveDownloadFallbackUrl = (req, doc) =>
+  buildProxyUrl(req, doc._id.toString(), "attachment");
+
+const tryProxyStoredDocument = async (req, res, doc, disposition = "inline") => {
+  const storedUrl = resolveStoredDocumentUrl(req, doc);
+  if (!storedUrl) return false;
+
+  try {
+    const response = await axios.get(storedUrl, {
+      responseType: "arraybuffer",
+      timeout: 10000,
+    });
+    res.setHeader("Content-Type", response.headers["content-type"] || doc.fileType || "application/octet-stream");
+    res.setHeader("Content-Disposition", disposition === "attachment" ? "attachment" : "inline");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.end(Buffer.from(response.data));
+    return true;
+  } catch (error) {
+    console.error(`Stored URL proxy failed for doc ${doc?._id}:`, error?.message || error);
+    return false;
+  }
+};
 
 const canAccessDocument = async (req, doc) => {
   const role = String(req.auth?.role || "").toLowerCase();
@@ -111,7 +257,7 @@ const validateMagicBytes = async ({ bucket, key, mimeType }) => {
 };
 
 // ---------------- AWS S3 Storage ----------------
-const storage = multerS3({
+const s3Storage = multerS3({
   s3: s3Client,
   bucket: BUCKET_NAME,
   key: (req, file, cb) => {
@@ -125,27 +271,97 @@ const storage = multerS3({
     cb(null, {
       fieldName: file.fieldname,
       originalName: file.originalname,
-      uploadedBy: req.auth?.id || 'unknown'
+      uploadedBy: req.auth?.id || "unknown",
     });
-  }
-});
-
-const upload = multer({
-  storage,
-  limits: { fileSize: 50 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    if (!allowedMimeTypes.has(String(file.mimetype || "").toLowerCase())) {
-      return cb(new Error("Unsupported file type"), false);
-    }
-    if (!validateUploadFilename(file.originalname)) {
-      return cb(new Error("Unsupported file extension"), false);
-    }
-    return cb(null, true);
   },
 });
 
+const localDiskStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    fs.mkdirSync(localMedicalVaultUploadsRoot, { recursive: true });
+    cb(null, localMedicalVaultUploadsRoot);
+  },
+  filename: (req, file, cb) => {
+    const baseName = path.parse(file.originalname).name.replace(/\s+/g, "_");
+    const ext = path.extname(file.originalname).toLowerCase();
+    cb(null, `${Date.now()}-${baseName}${ext}`);
+  },
+});
+
+const createUploadMiddleware = (storage) =>
+  multer({
+    storage,
+    limits: { fileSize: 50 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+      if (!allowedMimeTypes.has(String(file.mimetype || "").toLowerCase())) {
+        return cb(new Error("Unsupported file type"), false);
+      }
+      if (!validateUploadFilename(file.originalname)) {
+        return cb(new Error("Unsupported file extension"), false);
+      }
+      return cb(null, true);
+    },
+  });
+
+const s3Upload = createUploadMiddleware(s3Storage);
+const localUpload = createUploadMiddleware(localDiskStorage);
+
+const canUseS3Upload = async () => {
+  try {
+    const credentialProvider = s3Client?.config?.credentials;
+    if (!credentialProvider) return false;
+    const credentials =
+      typeof credentialProvider === "function" ? await credentialProvider() : await credentialProvider;
+    return Boolean(credentials?.accessKeyId && credentials?.secretAccessKey);
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message) {
+      console.warn(`[document-upload] S3 credentials unavailable, using local storage fallback: ${message}`);
+    }
+    return false;
+  }
+};
+
+const singleDocumentUpload = (req, res, next) => {
+  canUseS3Upload()
+    .then((useS3Upload) => {
+      req.documentUploadStorage = useS3Upload ? "s3" : "local";
+      const selectedUpload = useS3Upload ? s3Upload : localUpload;
+
+      selectedUpload.single("file")(req, res, (err) => {
+        if (!err) {
+          if (req.file && req.documentUploadStorage === "local") {
+            const storedFileName = req.file.filename || path.basename(req.file.path || "");
+            req.file.key = `medical-vault/${storedFileName}`;
+            req.file.bucket = "local";
+            req.file.location = buildLocalUploadUrl(req, storedFileName);
+          }
+          return next();
+        }
+
+        const statusCode = err?.code === "LIMIT_FILE_SIZE" ? 400 : 500;
+        const message = err?.message || "Upload failed";
+        console.error("Document upload middleware error:", err);
+        return res.status(statusCode).json({
+          success: false,
+          msg: message,
+          error: message,
+        });
+      });
+    })
+    .catch((err) => {
+      const message = err?.message || "Upload failed";
+      console.error("Document upload middleware bootstrap error:", err);
+      return res.status(500).json({
+        success: false,
+        msg: message,
+        error: message,
+      });
+    });
+};
+
 // ---------------- Upload ----------------
-router.post("/upload", auth, requireVerified, uploadLimiter, upload.single("file"), async (req, res) => {
+router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUpload, async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
 
@@ -167,13 +383,17 @@ router.post("/upload", auth, requireVerified, uploadLimiter, upload.single("file
     }
 
     // ✅ Store S3 information
+    const usingS3Storage = req.documentUploadStorage !== "local";
     const s3Key = req.file.key;
     const s3Bucket = req.file.bucket;
+    const storedUrl =
+      req.file.location ||
+      (req.file.filename ? buildLocalUploadUrl(req, req.file.filename) : "");
 
     // ✅ Support both doctor uploads (userId from req.body) and patient uploads (userId from req.auth.id)
     const requesterRole = String(req.auth?.role || "").toLowerCase();
     const requesterId = String(req.auth?.id || "");
-    const requestedTargetId = String(req.body.userId || "").trim();
+    const requestedTargetId = String(req.body.userId || req.body.patientId || "").trim();
     let targetUserId = requesterId;
 
     if (requesterRole === "patient") {
@@ -182,7 +402,22 @@ router.post("/upload", auth, requireVerified, uploadLimiter, upload.single("file
       }
       targetUserId = requesterId;
     } else if (requesterRole === "doctor") {
-      targetUserId = requestedTargetId || "";
+      let activeSessionPatientId = "";
+      if (requestedTargetId && isValidObjectId(requestedTargetId)) {
+        const activeSession = await Session.findOne({
+          doctorId: requesterId,
+          patientId: requestedTargetId,
+          status: "accepted",
+          isActive: true,
+          expiresAt: { $gt: new Date() },
+        })
+          .select("patientId")
+          .lean();
+
+        activeSessionPatientId = String(activeSession?.patientId || "").trim();
+      }
+
+      targetUserId = activeSessionPatientId || requestedTargetId || "";
       if (!targetUserId) {
         return res.status(400).json({ success: false, msg: "Doctors must provide target patient userId" });
       }
@@ -210,37 +445,39 @@ router.post("/upload", auth, requireVerified, uploadLimiter, upload.single("file
       return res.status(404).json({ success: false, msg: "Target user not found" });
     }
 
-    try {
-      const magicOk = await validateMagicBytes({
-        bucket: s3Bucket,
-        key: s3Key,
-        mimeType: req.file.mimetype,
-      });
-      if (!magicOk) {
-        throw new Error("Magic-byte validation failed");
-      }
-      await runMalwareScan({
-        bucket: s3Bucket,
-        key: s3Key,
-        mimeType: req.file.mimetype,
-        size: req.file.size,
-      });
-    } catch (scanError) {
+    if (usingS3Storage) {
       try {
-        await s3Client.send(
-          new DeleteObjectCommand({
-            Bucket: s3Bucket,
-            Key: s3Key,
-          })
-        );
-      } catch (cleanupError) {
-        console.error("Failed to cleanup untrusted upload:", cleanupError.message);
-      }
+        const magicOk = await validateMagicBytes({
+          bucket: s3Bucket,
+          key: s3Key,
+          mimeType: req.file.mimetype,
+        });
+        if (!magicOk) {
+          throw new Error("Magic-byte validation failed");
+        }
+        await runMalwareScan({
+          bucket: s3Bucket,
+          key: s3Key,
+          mimeType: req.file.mimetype,
+          size: req.file.size,
+        });
+      } catch (scanError) {
+        try {
+          await s3Client.send(
+            new DeleteObjectCommand({
+              Bucket: s3Bucket,
+              Key: s3Key,
+            })
+          );
+        } catch (cleanupError) {
+          console.error("Failed to cleanup untrusted upload:", cleanupError.message);
+        }
 
-      return res.status(400).json({
-        success: false,
-        msg: "Uploaded file failed security checks",
-      });
+        return res.status(400).json({
+          success: false,
+          msg: "Uploaded file failed security checks",
+        });
+      }
     }
 
     // ✅ Properly handle date conversion
@@ -271,7 +508,7 @@ router.post("/upload", auth, requireVerified, uploadLimiter, upload.single("file
       s3Key: s3Key,
       s3Bucket: s3Bucket,
       s3Region: REGION,
-      url: req.file.location, // S3 public URL (if bucket is public) or will be replaced with signed URL
+      url: storedUrl,
       uploadedAt: uploadDate,
     });
 
@@ -280,7 +517,7 @@ router.post("/upload", auth, requireVerified, uploadLimiter, upload.single("file
 
 
     // Send notification to patient if doctor uploaded the document
-    if (req.auth?.role === "doctor" && req.body.userId) {
+    if (req.auth?.role === "doctor" && (req.body.userId || req.body.patientId)) {
       try {
         // Get doctor info for the notification
         const doctor = await DoctorUser.findById(req.auth.id);
@@ -635,7 +872,38 @@ router.get("/:id/preview", auth, checkSession, async (req, res) => {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
-    const previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket, doc.mimeType);
+    const localFilePath = resolveLocalDocumentPath(doc);
+    let previewUrl;
+    if (localFilePath) {
+      previewUrl = buildProxyUrl(req, doc._id.toString(), "inline");
+    } else {
+      try {
+        previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket, doc.mimeType);
+      } catch (error) {
+        console.error(`Preview signed URL fallback for doc ${doc?._id}:`, error?.message || error);
+        previewUrl = resolvePreviewFallbackUrl(req, doc);
+      }
+    }
+
+    const isDocumentNavigation =
+      String(req.headers["sec-fetch-dest"] || "").toLowerCase() === "document";
+    if (isDocumentNavigation) {
+      try {
+        if (localFilePath && fs.existsSync(localFilePath)) {
+          res.setHeader("Content-Type", doc.mimeType || doc.fileType || "application/octet-stream");
+          res.setHeader("Content-Disposition", "inline");
+
+          return fs.createReadStream(localFilePath).pipe(res);
+        }
+      } catch (err) {
+        console.error("Preview error:", err);
+      }
+
+      if (previewUrl) {
+        return res.redirect(previewUrl);
+      }
+    }
+
     const mode = String(req.auth?.role || "patient").toLowerCase();
     await writeAuditLog({
       req,
@@ -645,7 +913,13 @@ router.get("/:id/preview", auth, checkSession, async (req, res) => {
       patientId: doc.userId?.toString?.() || "",
       statusCode: 200,
     });
-    res.json({ success: true, signedUrl: previewUrl, mode });
+    res.json({
+      success: true,
+      signedUrl: previewUrl,
+      fileUrl: previewUrl,
+      proxyUrl: buildProxyUrl(req, doc._id.toString(), "inline"),
+      mode,
+    });
   } catch (err) {
     res.status(500).json({ msg: "Preview failed", error: err.message });
   }
@@ -665,12 +939,17 @@ router.get("/:id/download", auth, checkSession, async (req, res) => {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
-    if (!doc.s3Key) {
-      return res.status(400).json({ msg: "Missing S3 key" });
+    let downloadUrl;
+    if (doc.s3Key) {
+      try {
+        downloadUrl = await generateDownloadUrl(doc.s3Key, doc.s3Bucket);
+      } catch (error) {
+        console.error(`Download signed URL fallback for doc ${doc?._id}:`, error?.message || error);
+        downloadUrl = resolveDownloadFallbackUrl(req, doc);
+      }
+    } else {
+      downloadUrl = resolveDownloadFallbackUrl(req, doc);
     }
-
-    // Generate a signed URL for download with attachment flag
-    const downloadUrl = await generateDownloadUrl(doc.s3Key, doc.s3Bucket);
 
     // If client prefers JSON (e.g., web app), return the URL instead of redirecting
     const acceptHeader = String(req.headers["accept"] || "").toLowerCase();
@@ -684,7 +963,13 @@ router.get("/:id/download", auth, checkSession, async (req, res) => {
         patientId: doc.userId?.toString?.() || "",
         statusCode: 200,
       });
-      return res.json({ success: true, signedUrl: downloadUrl, mode });
+      return res.json({
+        success: true,
+        signedUrl: downloadUrl,
+        fileUrl: downloadUrl,
+        proxyUrl: buildProxyUrl(req, doc._id.toString(), "attachment"),
+        mode,
+      });
     }
 
     // Default behavior: redirect (good for mobile clients following redirects)
@@ -717,29 +1002,96 @@ router.get("/:id/proxy", auth, checkSession, async (req, res) => {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
 
-    if (!doc.s3Key) {
-      return res.status(400).json({ msg: "Missing S3 key" });
+    const localFilePath = resolveLocalDocumentPath(doc);
+    if (localFilePath) {
+      res.setHeader("Content-Type", doc.mimeType || doc.fileType || "application/octet-stream");
+      res.setHeader(
+        "Content-Disposition",
+        req.query.disposition === "attachment" ? "attachment" : "inline"
+      );
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      await writeAuditLog({
+        req,
+        action: "PROXY_DOCUMENT",
+        resourceType: "DOCUMENT",
+        resourceId: doc._id?.toString(),
+        patientId: doc.userId?.toString?.() || "",
+        statusCode: 200,
+      });
+      return fs.createReadStream(localFilePath).pipe(res);
     }
 
-    // Generate a signed URL for preview
-    const previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket, doc.mimeType);
+    if (doc.s3Key) {
+      try {
+        const previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket, doc.mimeType);
 
-    const response = await axios.get(previewUrl, {
-      responseType: "arraybuffer",
-      timeout: 10000 // 10 second timeout
-    });
+        const response = await axios.get(previewUrl, {
+          responseType: "arraybuffer",
+          timeout: 10000 // 10 second timeout
+        });
 
-    res.setHeader("Content-Type", doc.fileType || "application/octet-stream");
-    res.setHeader("Cache-Control", "public, max-age=3600"); // Cache for 1 hour
+        res.setHeader("Content-Type", doc.fileType || "application/octet-stream");
+        res.setHeader(
+          "Content-Disposition",
+          req.query.disposition === "attachment" ? "attachment" : "inline"
+        );
+        res.setHeader("Cache-Control", "public, max-age=3600"); // Cache for 1 hour
+        await writeAuditLog({
+          req,
+          action: "PROXY_DOCUMENT",
+          resourceType: "DOCUMENT",
+          resourceId: doc._id?.toString(),
+          patientId: doc.userId?.toString?.() || "",
+          statusCode: 200,
+        });
+        return res.end(Buffer.from(response.data));
+      } catch (error) {
+        console.error(`Proxy S3 fallback for doc ${doc?._id}:`, error?.message || error);
+      }
+    }
+
+    if (await tryProxyStoredDocument(req, res, doc, req.query.disposition)) {
+      await writeAuditLog({
+        req,
+        action: "PROXY_DOCUMENT",
+        resourceType: "DOCUMENT",
+        resourceId: doc._id?.toString(),
+        patientId: doc.userId?.toString?.() || "",
+        statusCode: 200,
+      });
+      return;
+    }
+
+    try {
+      const file = await Document.findById(req.params.id);
+      const filePath = file?.path ? path.resolve(file.path) : "";
+
+      if (filePath && fs.existsSync(filePath)) {
+        res.setHeader("Content-Type", file.mimeType || "application/octet-stream");
+        res.setHeader("Content-Disposition", "inline");
+        await writeAuditLog({
+          req,
+          action: "PROXY_DOCUMENT",
+          resourceType: "DOCUMENT",
+          resourceId: doc._id?.toString(),
+          patientId: doc.userId?.toString?.() || "",
+          statusCode: 200,
+        });
+        return fs.createReadStream(filePath).pipe(res);
+      }
+    } catch (err) {
+      console.error("Preview error:", err);
+    }
+
     await writeAuditLog({
       req,
       action: "PROXY_DOCUMENT",
       resourceType: "DOCUMENT",
       resourceId: doc._id?.toString(),
       patientId: doc.userId?.toString?.() || "",
-      statusCode: 200,
+      statusCode: 400,
     });
-    res.send(response.data);
+    return res.status(404).end();
   } catch (err) {
     console.error("Proxy error:", err);
     res.status(500).json({ msg: "Proxy failed", error: err.message });

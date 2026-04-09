@@ -111,6 +111,45 @@ if (String(process.env.NODE_ENV || "").toLowerCase() !== "production") {
 
 const router = express.Router();
 
+const normalizeEmailInput = (value) => String(value || "").trim().toLowerCase();
+
+const findDoctorByEmailWithLegacyFallback = async (normalizedEmail) => {
+  let doctor = await DoctorUser.findOne({ email: normalizedEmail });
+  if (doctor) return doctor;
+
+  const legacyCollectionNames = ["doctorusers", "doctors"];
+  for (const collectionName of legacyCollectionNames) {
+    try {
+      const legacyDoctor = await DoctorUser.db
+        .collection(collectionName)
+        .findOne({ email: normalizedEmail });
+      if (!legacyDoctor) continue;
+      const { _id, ...legacyDoctorWithoutId } = legacyDoctor;
+
+      await DoctorUser.collection.updateOne(
+        { _id },
+        { $setOnInsert: legacyDoctorWithoutId },
+        { upsert: true }
+      );
+
+      doctor = await DoctorUser.findById(_id);
+      if (doctor) {
+        console.log(
+          `[doctorAuth] Migrated legacy doctor record from '${collectionName}' to 'doctor_users' for ${normalizedEmail}`
+        );
+        return doctor;
+      }
+    } catch (error) {
+      console.warn(
+        `[doctorAuth] Legacy doctor lookup failed for '${collectionName}':`,
+        error.message
+      );
+    }
+  }
+
+  return null;
+};
+
 const persistRefreshToken = async (req, doctorId, refreshToken, refreshMeta) => {
   const decoded = verifyRefreshToken(refreshToken);
   const expiresAt = new Date((decoded.exp || 0) * 1000);
@@ -163,15 +202,19 @@ const persistRefreshToken = async (req, doctorId, refreshToken, refreshMeta) => 
 router.post("/signup", async (req, res) => {
   try {
     const { name, email, mobile, password } = req.body;
+    const normalizedName = String(name || "").trim();
+    const normalizedEmail = normalizeEmailInput(email);
+    const normalizedMobile = String(mobile || "").trim();
+    const rawPassword = String(password ?? "");
 
-    if (!name || !email || !mobile || !password) {
+    if (!normalizedName || !normalizedEmail || !normalizedMobile || !rawPassword) {
       return res.status(400).json({
         success: false,
         message: "Name, email, mobile number, and password are required.",
       });
     }
 
-    const existingDoctor = await DoctorUser.findOne({ email: email.toLowerCase() });
+    const existingDoctor = await DoctorUser.findOne({ email: normalizedEmail });
     if (existingDoctor) {
       return res.status(400).json({
         success: false,
@@ -180,10 +223,10 @@ router.post("/signup", async (req, res) => {
     }
 
     const doctor = new DoctorUser({
-      name,
-      email: email.toLowerCase(),
-      mobile,
-      password,
+      name: normalizedName,
+      email: normalizedEmail,
+      mobile: normalizedMobile,
+      password: rawPassword,
     });
 
     await doctor.save();
@@ -224,22 +267,28 @@ router.post("/signup", async (req, res) => {
 router.post("/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
-    const blockState = await isActorTemporarilyBlocked({ actorEmail: email, actorRole: "doctor" });
+    const normalizedEmail = normalizeEmailInput(email);
+    const rawPassword = String(password ?? "");
+
+    const blockState = await isActorTemporarilyBlocked({
+      actorEmail: normalizedEmail,
+      actorRole: "doctor",
+    });
     if (blockState.isBlocked) {
       return res.status(429).json({ success: false, message: "Account temporarily blocked due to suspicious activity." });
     }
 
-    if (!email || !password) {
+    if (!normalizedEmail || !rawPassword) {
       return res.status(400).json({
         success: false,
         message: "Email and password are required.",
       });
     }
 
-    const doctor = await DoctorUser.findOne({ email: email.toLowerCase() });
+    const doctor = await findDoctorByEmailWithLegacyFallback(normalizedEmail);
     if (!doctor) {
       await monitorFailedLogin({
-        actorEmail: email,
+        actorEmail: normalizedEmail,
         actorRole: "doctor",
         ipAddress: req.ip || "",
         userAgent: req.headers["user-agent"] || "",
@@ -248,16 +297,36 @@ router.post("/login", authLimiter, async (req, res) => {
       return res.status(401).json({ success: false, message: "Invalid email or password." });
     }
 
-    const isPasswordValid = await doctor.comparePassword(password);
+    let passwordForVerification = rawPassword;
+    let isPasswordValid = await doctor.comparePassword(passwordForVerification);
+    if (!isPasswordValid && rawPassword !== rawPassword.trim()) {
+      passwordForVerification = rawPassword.trim();
+      isPasswordValid = await doctor.comparePassword(passwordForVerification);
+    }
+
     if (!isPasswordValid) {
       await monitorFailedLogin({
-        actorEmail: email,
+        actorEmail: normalizedEmail,
         actorRole: "doctor",
         ipAddress: req.ip || "",
         userAgent: req.headers["user-agent"] || "",
         source: "doctor_portal_login",
       });
       return res.status(401).json({ success: false, message: "Invalid email or password." });
+    }
+
+    let shouldPersistDoctor = false;
+    if (doctor.email !== normalizedEmail) {
+      doctor.email = normalizedEmail;
+      shouldPersistDoctor = true;
+    }
+    if (!doctor.hasBcryptPassword?.()) {
+      doctor.password = passwordForVerification;
+      shouldPersistDoctor = true;
+      console.log(`[doctorAuth] Upgrading password hash for ${normalizedEmail}`);
+    }
+    if (shouldPersistDoctor) {
+      await doctor.save();
     }
 
     const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
@@ -784,6 +853,413 @@ router.delete("/profile/avatar", auth, async (req, res) => {
   }
 });
 
+// ================= Add Patient for Doctor =================
+// POST /api/doctors/patients
+router.post("/patients", auth, async (req, res) => {
+  try {
+    if (req.auth?.role !== "doctor") {
+      return res.status(403).json({
+        success: false,
+        message: "Only doctors can access this endpoint.",
+      });
+    }
+
+    const doctorId = req.auth?.id?.toString();
+    if (!doctorId) {
+      return res.status(401).json({
+        success: false,
+        message: "Doctor authentication failed.",
+      });
+    }
+
+    const rawName = String(req.body?.name || "").trim();
+    const rawPhone = String(req.body?.phone || "").trim();
+    const normalizedPhone = rawPhone.replace(/\s+/g, "");
+    const rawGender = String(req.body?.gender || "").trim();
+    const rawNotes = String(req.body?.notes || "").trim();
+    const ageInput = req.body?.age;
+
+    if (!rawName || !rawPhone) {
+      return res.status(400).json({
+        success: false,
+        message: "Name and phone are required.",
+      });
+    }
+
+    const validPhone = /^\+?[0-9]{7,15}$/.test(normalizedPhone);
+    if (!validPhone) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid phone number.",
+      });
+    }
+
+    const allowedGenders = new Set(["Male", "Female", "Other"]);
+    const normalizedGender = allowedGenders.has(rawGender) ? rawGender : null;
+
+    let normalizedAge = null;
+    if (ageInput !== undefined && ageInput !== null && String(ageInput).trim() !== "") {
+      normalizedAge = Number(ageInput);
+      if (!Number.isFinite(normalizedAge) || normalizedAge < 0 || normalizedAge > 130) {
+        return res.status(400).json({
+          success: false,
+          message: "Please provide a valid age.",
+        });
+      }
+    }
+
+    let patient = await User.findOne({ mobile: normalizedPhone });
+    let created = false;
+
+    if (!patient) {
+      const phoneDigits = normalizedPhone.replace(/\D/g, "") || Date.now().toString();
+      const uniqueSuffix = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+      const generatedEmail = `patient.${phoneDigits}.${uniqueSuffix}@medicalvault.com`;
+      const generatedPassword = `Temp@${phoneDigits.slice(-4) || "0000"}${Math.floor(Math.random() * 10000)
+        .toString()
+        .padStart(4, "0")}`;
+
+      patient = new User({
+        name: rawName,
+        email: generatedEmail,
+        mobile: normalizedPhone,
+        password: generatedPassword,
+        age: normalizedAge,
+        gender: normalizedGender,
+        allergies: rawNotes || "",
+      });
+
+      await patient.save();
+      created = true;
+    } else {
+      let hasChanges = false;
+      if (patient.name !== rawName) {
+        patient.name = rawName;
+        hasChanges = true;
+      }
+      if (normalizedAge !== null && patient.age !== normalizedAge) {
+        patient.age = normalizedAge;
+        hasChanges = true;
+      }
+      if (normalizedGender && patient.gender !== normalizedGender) {
+        patient.gender = normalizedGender;
+        hasChanges = true;
+      }
+      if (rawNotes && !patient.allergies) {
+        patient.allergies = rawNotes;
+        hasChanges = true;
+      }
+      if (hasChanges) {
+        await patient.save();
+      }
+    }
+
+    const patientId = patient._id.toString();
+    const linkResult = await DoctorUser.updateOne(
+      { _id: doctorId, linkedPatients: { $ne: patient._id } },
+      {
+        $addToSet: { linkedPatients: patient._id },
+        $inc: { totalPatients: 1 },
+      }
+    );
+
+    if (!linkResult.matchedCount) {
+      const doctorExists = await DoctorUser.exists({ _id: doctorId });
+      if (!doctorExists) {
+        return res.status(401).json({
+          success: false,
+          message: "Doctor authentication failed.",
+        });
+      }
+    }
+
+    return res.status(created ? 201 : 200).json({
+      success: true,
+      message: "Patient added successfully",
+      patient: {
+        id: patientId,
+        name: patient.name,
+        phone: patient.mobile || "N/A",
+        age: patient.age ?? "N/A",
+        gender: patient.gender || "N/A",
+        notes: rawNotes || "",
+      },
+    });
+  } catch (error) {
+    console.error("❌ Add patient error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error adding patient",
+      error: error.message,
+    });
+  }
+});
+
+const validateDoctorPatientAccess = async (doctorId, patientId) => {
+  const doctor = await DoctorUser.findById(doctorId).select("linkedPatients").lean();
+  if (!doctor) {
+    return { doctorExists: false, allowed: false };
+  }
+
+  const isLinked =
+    Array.isArray(doctor.linkedPatients) &&
+    doctor.linkedPatients.some((id) => id?.toString() === patientId);
+  if (isLinked) {
+    return { doctorExists: true, allowed: true };
+  }
+
+  const [{ Session }, hasAppointment] = await Promise.all([
+    import("../models/Session.js"),
+    Appointment.exists({ doctorId, patientId }),
+  ]);
+
+  const hasSession = await Session.exists({ doctorId, patientId });
+  return { doctorExists: true, allowed: Boolean(hasSession || hasAppointment) };
+};
+
+// ================= Update Patient for Doctor =================
+// PUT /api/doctors/patients/:id
+router.put("/patients/:id", auth, async (req, res) => {
+  try {
+    if (req.auth?.role !== "doctor") {
+      return res.status(403).json({
+        success: false,
+        message: "Only doctors can access this endpoint.",
+      });
+    }
+
+    const doctorId = req.auth?.id?.toString();
+    const patientId = String(req.params?.id || "").trim();
+
+    if (!doctorId) {
+      return res.status(401).json({
+        success: false,
+        message: "Doctor authentication failed.",
+      });
+    }
+
+    if (!/^[a-fA-F0-9]{24}$/.test(patientId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid patient id.",
+      });
+    }
+
+    const access = await validateDoctorPatientAccess(doctorId, patientId);
+    if (!access.doctorExists) {
+      return res.status(401).json({
+        success: false,
+        message: "Doctor authentication failed.",
+      });
+    }
+
+    if (!access.allowed) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not authorized to update this patient.",
+      });
+    }
+
+    const patient = await User.findById(patientId);
+    if (!patient) {
+      return res.status(404).json({
+        success: false,
+        message: "Patient not found.",
+      });
+    }
+
+    let hasChanges = false;
+
+    if (req.body?.name !== undefined) {
+      const name = String(req.body.name || "").trim();
+      if (!name) {
+        return res.status(400).json({
+          success: false,
+          message: "Full name is required.",
+        });
+      }
+      if (patient.name !== name) {
+        patient.name = name;
+        hasChanges = true;
+      }
+    }
+
+    if (req.body?.phone !== undefined) {
+      const normalizedPhone = String(req.body.phone || "").trim().replace(/\s+/g, "");
+      if (!normalizedPhone) {
+        return res.status(400).json({
+          success: false,
+          message: "Phone number is required.",
+        });
+      }
+      const validPhone = /^\+?[0-9]{7,15}$/.test(normalizedPhone);
+      if (!validPhone) {
+        return res.status(400).json({
+          success: false,
+          message: "Please provide a valid phone number.",
+        });
+      }
+      if (patient.mobile !== normalizedPhone) {
+        patient.mobile = normalizedPhone;
+        hasChanges = true;
+      }
+    }
+
+    if (req.body?.age !== undefined) {
+      const ageInput = req.body.age;
+      if (ageInput === null || String(ageInput).trim() === "") {
+        if (patient.age !== null) {
+          patient.age = null;
+          hasChanges = true;
+        }
+      } else {
+        const normalizedAge = Number(ageInput);
+        if (!Number.isFinite(normalizedAge) || normalizedAge < 0 || normalizedAge > 130) {
+          return res.status(400).json({
+            success: false,
+            message: "Please provide a valid age.",
+          });
+        }
+        if (patient.age !== normalizedAge) {
+          patient.age = normalizedAge;
+          hasChanges = true;
+        }
+      }
+    }
+
+    if (req.body?.gender !== undefined) {
+      const rawGender = String(req.body.gender || "").trim();
+      const allowedGenders = new Set(["Male", "Female", "Other"]);
+      const normalizedGender = rawGender ? rawGender : null;
+      if (normalizedGender && !allowedGenders.has(normalizedGender)) {
+        return res.status(400).json({
+          success: false,
+          message: "Please provide a valid gender.",
+        });
+      }
+      if (patient.gender !== normalizedGender) {
+        patient.gender = normalizedGender;
+        hasChanges = true;
+      }
+    }
+
+    if (req.body?.notes !== undefined) {
+      const notes = String(req.body.notes || "").trim();
+      if (patient.allergies !== notes) {
+        patient.allergies = notes;
+        hasChanges = true;
+      }
+    }
+
+    if (hasChanges) {
+      await patient.save();
+    }
+
+    await DoctorUser.updateOne(
+      { _id: doctorId },
+      { $addToSet: { linkedPatients: patient._id } }
+    );
+
+    return res.json({
+      success: true,
+      message: "Patient updated successfully",
+      patient: {
+        id: patient._id.toString(),
+        name: patient.name,
+        phone: patient.mobile || "N/A",
+        age: patient.age ?? "N/A",
+        gender: patient.gender || "N/A",
+        notes: patient.allergies || "",
+      },
+    });
+  } catch (error) {
+    console.error("❌ Update patient error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating patient",
+      error: error.message,
+    });
+  }
+});
+
+// ================= Delete Patient for Doctor =================
+// DELETE /api/doctors/patients/:id
+router.delete("/patients/:id", auth, async (req, res) => {
+  try {
+    if (req.auth?.role !== "doctor") {
+      return res.status(403).json({
+        success: false,
+        message: "Only doctors can access this endpoint.",
+      });
+    }
+
+    const doctorId = req.auth?.id?.toString();
+    const patientId = String(req.params?.id || "").trim();
+
+    if (!doctorId) {
+      return res.status(401).json({
+        success: false,
+        message: "Doctor authentication failed.",
+      });
+    }
+
+    if (!/^[a-fA-F0-9]{24}$/.test(patientId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid patient id.",
+      });
+    }
+
+    const access = await validateDoctorPatientAccess(doctorId, patientId);
+    if (!access.doctorExists) {
+      return res.status(401).json({
+        success: false,
+        message: "Doctor authentication failed.",
+      });
+    }
+
+    if (!access.allowed) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not authorized to delete this patient.",
+      });
+    }
+
+    const deletedPatient = await User.findByIdAndDelete(patientId).lean();
+    if (!deletedPatient) {
+      return res.status(404).json({
+        success: false,
+        message: "Patient not found.",
+      });
+    }
+
+    await DoctorUser.updateOne(
+      { _id: doctorId, linkedPatients: deletedPatient._id },
+      {
+        $pull: { linkedPatients: deletedPatient._id },
+        $inc: { totalPatients: -1 },
+      }
+    );
+
+    await DoctorUser.updateOne(
+      { _id: doctorId, totalPatients: { $lt: 0 } },
+      { $set: { totalPatients: 0 } }
+    );
+
+    return res.json({
+      success: true,
+      message: "Patient deleted successfully",
+    });
+  } catch (error) {
+    console.error("❌ Delete patient error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error deleting patient",
+      error: error.message,
+    });
+  }
+});
+
 // ================= Get All Patients for Doctor =================
 // GET /api/doctors/patients
 router.get("/patients", auth, async (req, res) => {
@@ -884,6 +1360,7 @@ router.get("/patients", auth, async (req, res) => {
           gender: patient.gender || "N/A",
           bloodType: patient.bloodType || "N/A",
           lastVisit: patient.lastVisit || "N/A",
+          notes: patient.allergies || "",
           documents: Array.isArray(patient.medicalRecords) ? patient.medicalRecords.length : 0,
           status: patient.isActive === false ? "Inactive" : "Active",
           sessionId: sessionStats?.sessionId || null,
