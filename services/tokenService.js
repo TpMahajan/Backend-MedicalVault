@@ -25,10 +25,14 @@ export const buildAccessPayload = ({
   role,
   email = "",
   sessionId = "",
+  tokenVersion = 0,
 }) => ({
   sub: String(principalId),
   userId: String(principalId),
   role: toRole(role),
+  tokenVersion: Number.isFinite(Number(tokenVersion))
+    ? Number(tokenVersion)
+    : 0,
   ...(email ? { email: String(email).toLowerCase() } : {}),
   ...(String(sessionId || "").trim() ? { sid: String(sessionId).trim() } : {}),
 });
@@ -38,16 +42,29 @@ export const signAccessToken = ({
   role,
   email = "",
   sessionId = "",
+  tokenVersion = 0,
 }) =>
   jwt.sign(
-    buildAccessPayload({ principalId, role, email, sessionId }),
+    buildAccessPayload({
+      principalId,
+      role,
+      email,
+      sessionId,
+      tokenVersion,
+    }),
     getAccessSecret(),
     {
       expiresIn: ACCESS_TTL,
     }
   );
 
-export const signRefreshToken = ({ principalId, role, familyId, email = "" }) => {
+export const signRefreshToken = ({
+  principalId,
+  role,
+  familyId,
+  email = "",
+  tokenVersion = 0,
+}) => {
   const jti = crypto.randomUUID();
   const payload = {
     sub: String(principalId),
@@ -55,6 +72,9 @@ export const signRefreshToken = ({ principalId, role, familyId, email = "" }) =>
     typ: "refresh",
     jti,
     familyId: familyId || crypto.randomUUID(),
+    tokenVersion: Number.isFinite(Number(tokenVersion))
+      ? Number(tokenVersion)
+      : 0,
     ...(email ? { email: String(email).toLowerCase() } : {}),
   };
   const token = jwt.sign(payload, getRefreshSecret(), { expiresIn: REFRESH_TTL });
@@ -160,14 +180,22 @@ export const issueAuthTokenSet = ({
   email = "",
   familyId,
   sessionId = "",
+  tokenVersion = 0,
 }) => {
-  const refresh = signRefreshToken({ principalId, role, familyId, email });
+  const refresh = signRefreshToken({
+    principalId,
+    role,
+    familyId,
+    email,
+    tokenVersion,
+  });
   const resolvedSessionId = String(sessionId || "").trim() || refresh.payload.jti;
   const accessToken = signAccessToken({
     principalId,
     role,
     email,
     sessionId: resolvedSessionId,
+    tokenVersion,
   });
   return {
     accessToken,

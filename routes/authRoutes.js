@@ -170,6 +170,9 @@ const persistRefreshToken = async (
     tokenHash: hashToken(refreshToken),
     familyId: refreshMeta.familyId,
     jti: refreshMeta.jti,
+    tokenVersion: Number.isFinite(Number(refreshMeta?.tokenVersion))
+      ? Number(refreshMeta.tokenVersion)
+      : 0,
     expiresAt,
     createdByIp: incomingIp,
     userAgent: asText(req.headers["user-agent"]),
@@ -182,12 +185,20 @@ const persistRefreshToken = async (
 const issueLoginTokens = async (
   req,
   res,
-  { principalId, role, email, deviceId = "", deviceInfo = "" }
+  {
+    principalId,
+    role,
+    email,
+    deviceId = "",
+    deviceInfo = "",
+    tokenVersion = 0,
+  }
 ) => {
   const tokenSet = issueAuthTokenSet({
     principalId,
     role,
     email,
+    tokenVersion,
   });
   await persistRefreshToken(req, principalId, role, tokenSet.refreshToken, tokenSet.refreshMeta, {
     deviceId,
@@ -394,6 +405,9 @@ const completePatientLogin = async ({ req, res, user, message = "Login successfu
     email: user.email,
     deviceId: requestedDeviceId,
     deviceInfo: requestedDeviceInfo,
+    tokenVersion: Number.isFinite(Number(user?.tokenVersion))
+      ? Number(user.tokenVersion)
+      : 0,
   });
 
   await setCurrentPatientSession({
@@ -733,6 +747,14 @@ router.post("/google", async (req, res) => {
       safeLog("Existing user logged in via Google");
     }
 
+    if (user.isActive === false || user.status === "BLOCKED") {
+      return res.status(403).json({
+        success: false,
+        code: "USER_DISABLED",
+        message: "Your account has been deactivated by admin.",
+      });
+    }
+
     const loginResult = await handlePatientLoginWithSessionPolicy({
       req,
       res,
@@ -777,6 +799,14 @@ router.post("/login", authLimiter, loginValidation, async (req, res) => {
         source: "patient_login",
       });
       return res.status(400).json({ message: "Invalid credentials" });
+    }
+
+    if (user.isActive === false || user.status === "BLOCKED") {
+      return res.status(403).json({
+        success: false,
+        code: "USER_DISABLED",
+        message: "Your account has been deactivated by admin.",
+      });
     }
 
     const isValid = await user.comparePassword(password);
@@ -840,6 +870,9 @@ router.post("/doctor/signup", doctorSignupValidation, async (req, res) => {
       principalId: newDoctor._id.toString(),
       role: "doctor",
       email: newDoctor.email,
+      tokenVersion: Number.isFinite(Number(newDoctor?.tokenVersion))
+        ? Number(newDoctor.tokenVersion)
+        : 0,
     });
 
     res.status(201).json({
@@ -880,6 +913,14 @@ router.post("/doctor/login", authLimiter, async (req, res) => {
       return res.status(400).json({ message: "Invalid credentials" });
     }
 
+    if (doctor.isActive === false || doctor.status === "BLOCKED") {
+      return res.status(403).json({
+        success: false,
+        code: "USER_DISABLED",
+        message: "Your account has been deactivated by admin.",
+      });
+    }
+
     const isValid = await doctor.comparePassword(password);
     if (!isValid) {
       await monitorFailedLogin({
@@ -896,6 +937,9 @@ router.post("/doctor/login", authLimiter, async (req, res) => {
       principalId: doctor._id.toString(),
       role: "doctor",
       email: doctor.email,
+      tokenVersion: Number.isFinite(Number(doctor?.tokenVersion))
+        ? Number(doctor.tokenVersion)
+        : 0,
     });
 
     doctor.lastLogin = new Date();
@@ -949,13 +993,35 @@ router.post("/refresh", async (req, res) => {
 
     let principal;
     if (role === "doctor") {
-      principal = await DoctorUser.findById(stored.principalId).select("_id email isActive status");
+      principal = await DoctorUser.findById(stored.principalId).select(
+        "_id email isActive status tokenVersion"
+      );
     } else {
-      principal = await User.findById(stored.principalId).select("_id email isActive status");
+      principal = await User.findById(stored.principalId).select(
+        "_id email isActive status tokenVersion"
+      );
     }
 
     if (!principal || principal.isActive === false || principal.status === "BLOCKED") {
-      return res.status(403).json({ success: false, message: "Account inactive" });
+      return res.status(401).json({
+        success: false,
+        code: "USER_DISABLED",
+        message: "Your account has been deactivated by admin.",
+      });
+    }
+
+    const tokenVersion = Number.isFinite(Number(principal.tokenVersion))
+      ? Number(principal.tokenVersion)
+      : 0;
+    const incomingTokenVersion = Number.isFinite(Number(decoded.tokenVersion))
+      ? Number(decoded.tokenVersion)
+      : 0;
+    if (incomingTokenVersion !== tokenVersion) {
+      return res.status(401).json({
+        success: false,
+        code: "TOKEN_VERSION_MISMATCH",
+        message: "Your session is no longer valid. Please login again.",
+      });
     }
 
     const { accessToken, refreshToken, refreshMeta, sessionId } = issueAuthTokenSet({
@@ -963,6 +1029,7 @@ router.post("/refresh", async (req, res) => {
       role,
       email: principal.email,
       familyId: decoded.familyId,
+      tokenVersion,
     });
 
     stored.revokedAt = new Date();
@@ -1437,6 +1504,9 @@ router.post("/debug-login", async (req, res) => {
       principalId: user._id.toString(),
       role,
       email: user.email,
+      tokenVersion: Number.isFinite(Number(user?.tokenVersion))
+        ? Number(user.tokenVersion)
+        : 0,
     });
     token = tokens.accessToken;
 
@@ -1715,6 +1785,9 @@ router.post("/test-patient", async (req, res) => {
       principalId: patient._id.toString(),
       role: "patient",
       email: patient.email,
+      tokenVersion: Number.isFinite(Number(patient?.tokenVersion))
+        ? Number(patient.tokenVersion)
+        : 0,
     });
 
     const responseUser = await buildUserResponse(patient);

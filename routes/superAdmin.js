@@ -43,6 +43,7 @@ import {
 } from "../services/tokenService.js";
 import { RefreshToken } from "../models/RefreshToken.js";
 import { writeAuditLog } from "../middleware/auditLogger.js";
+import { emitSessionInvalidatedEvent } from "../services/authSessionRealtime.js";
 import {
   PUBLIC_AD_SURFACES,
   PUBLIC_ALERT_PLATFORMS,
@@ -419,6 +420,9 @@ async function persistRefreshTokenForSuperAdmin(req, principalEmail, refreshToke
     tokenHash: hashToken(refreshToken),
     familyId: refreshMeta.familyId,
     jti: refreshMeta.jti,
+    tokenVersion: Number.isFinite(Number(refreshMeta?.tokenVersion))
+      ? Number(refreshMeta.tokenVersion)
+      : 0,
     expiresAt,
     createdByIp: req.ip || "",
     userAgent: req.headers["user-agent"] || "",
@@ -463,6 +467,66 @@ async function findEntityByRole(role, id) {
     return { modelRole: role, entity: admin };
   }
   return { modelRole: role, entity: null };
+}
+
+function mapEntityRoleToTokenRole(role) {
+  const normalized = String(role || "")
+    .trim()
+    .toUpperCase();
+  if (normalized === "PATIENT") return "patient";
+  if (normalized === "DOCTOR") return "doctor";
+  if (normalized === "ADMIN") return "admin";
+  return "";
+}
+
+function toTokenVersion(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : 0;
+}
+
+async function revokeAllPrincipalSessions({
+  principalId,
+  role,
+  reason = "account_deactivated",
+}) {
+  const normalizedPrincipalId = String(principalId || "").trim();
+  const normalizedRole = String(role || "").trim().toLowerCase();
+  if (!normalizedPrincipalId || !normalizedRole) return 0;
+
+  const now = new Date();
+  const activeSessions = await RefreshToken.find({
+    principalId: normalizedPrincipalId,
+    role: normalizedRole,
+    revokedAt: null,
+    expiresAt: { $gt: now },
+  })
+    .select("jti")
+    .lean();
+
+  const result = await RefreshToken.updateMany(
+    {
+      principalId: normalizedPrincipalId,
+      role: normalizedRole,
+      revokedAt: null,
+    },
+    {
+      $set: {
+        revokedAt: now,
+        revokedReason: String(reason || "account_deactivated").slice(0, 200),
+      },
+    }
+  );
+
+  for (const session of activeSessions) {
+    const sessionId = String(session?.jti || "").trim();
+    if (!sessionId) continue;
+    emitSessionInvalidatedEvent({
+      sessionId,
+      reason: String(reason || "account_deactivated"),
+    });
+  }
+
+  return Number(result?.modifiedCount || 0);
 }
 
 function validateDateOrder(startDate, endDate) {
@@ -645,6 +709,7 @@ router.post("/auth/login", LOGIN_LIMITER, async (req, res) => {
       principalId: principalEmail,
       role: "superadmin",
       email: principalEmail,
+      tokenVersion: 0,
     });
 
     await persistRefreshTokenForSuperAdmin(
@@ -715,6 +780,7 @@ router.post("/auth/refresh", async (req, res) => {
       role: "superadmin",
       email: principalEmail,
       familyId: decoded.familyId,
+      tokenVersion: 0,
     });
 
     existing.revokedAt = new Date();
@@ -2197,6 +2263,9 @@ router.put("/users/:role/:id", requireSuperAdminAuth, async (req, res) => {
         .status(404)
         .json({ success: false, message: `${role} not found` });
     }
+    const wasBlocked =
+      normalizeStatus(entity.status || (entity.isActive === false ? "BLOCKED" : "ACTIVE")) ===
+      "BLOCKED";
 
     if (req.body.name != null) entity.name = String(req.body.name).trim();
     if (req.body.email != null) entity.email = String(req.body.email).trim().toLowerCase();
@@ -2240,13 +2309,39 @@ router.put("/users/:role/:id", requireSuperAdminAuth, async (req, res) => {
       }
     }
 
+    const nextStatus = normalizeStatus(entity.status || "ACTIVE");
+    const shouldForceDeactivate = nextStatus === "BLOCKED" && !wasBlocked;
+    if (shouldForceDeactivate) {
+      entity.isActive = false;
+      entity.tokenVersion = toTokenVersion(entity.tokenVersion) + 1;
+      if (role === "PATIENT") {
+        entity.currentSessionId = "";
+        entity.currentDeviceId = "";
+      }
+    }
+
     await entity.save();
+
+    if (shouldForceDeactivate) {
+      const tokenRole = mapEntityRoleToTokenRole(role);
+      if (tokenRole) {
+        await revokeAllPrincipalSessions({
+          principalId: entity._id?.toString(),
+          role: tokenRole,
+          reason: "account_deactivated",
+        });
+      }
+    }
 
     await logActivity(req, {
       action: "UPDATE_USER",
       targetType: role,
       targetId: entity._id?.toString(),
-      details: { fields: Object.keys(req.body || {}) },
+      details: {
+        fields: Object.keys(req.body || {}),
+        status: nextStatus,
+        tokenVersion: toTokenVersion(entity.tokenVersion),
+      },
     });
 
     const mapped =
@@ -2278,14 +2373,38 @@ router.patch("/users/:role/:id/status", requireSuperAdminAuth, async (req, res) 
         .json({ success: false, message: `${role} not found` });
     }
 
+    const wasBlocked =
+      normalizeStatus(entity.status || (entity.isActive === false ? "BLOCKED" : "ACTIVE")) ===
+      "BLOCKED";
+
     entity.status = status;
+    const shouldForceDeactivate = status === "BLOCKED" && !wasBlocked;
+    if (shouldForceDeactivate) {
+      entity.isActive = false;
+      entity.tokenVersion = toTokenVersion(entity.tokenVersion) + 1;
+      if (role === "PATIENT") {
+        entity.currentSessionId = "";
+        entity.currentDeviceId = "";
+      }
+    }
     await entity.save();
+
+    if (shouldForceDeactivate) {
+      const tokenRole = mapEntityRoleToTokenRole(role);
+      if (tokenRole) {
+        await revokeAllPrincipalSessions({
+          principalId: entity._id?.toString(),
+          role: tokenRole,
+          reason: "account_deactivated",
+        });
+      }
+    }
 
     await logActivity(req, {
       action: "CHANGE_USER_STATUS",
       targetType: role,
       targetId: entity._id?.toString(),
-      details: { status },
+      details: { status, tokenVersion: toTokenVersion(entity.tokenVersion) },
     });
 
     const mapped =
@@ -2461,14 +2580,31 @@ router.patch("/admins/:id/status", requireSuperAdminAuth, async (req, res) => {
       return res.status(404).json({ success: false, message: "Admin not found" });
     }
 
+    const wasBlocked =
+      normalizeStatus(admin.status || (admin.isActive === false ? "BLOCKED" : "ACTIVE")) ===
+      "BLOCKED";
+
     admin.status = status;
+    const shouldForceDeactivate = status === "BLOCKED" && !wasBlocked;
+    if (shouldForceDeactivate) {
+      admin.isActive = false;
+      admin.tokenVersion = toTokenVersion(admin.tokenVersion) + 1;
+    }
     await admin.save();
+
+    if (shouldForceDeactivate) {
+      await revokeAllPrincipalSessions({
+        principalId: admin._id?.toString(),
+        role: "admin",
+        reason: "account_deactivated",
+      });
+    }
 
     await logActivity(req, {
       action: "UPDATE_ADMIN_STATUS",
       targetType: "ADMIN",
       targetId: admin._id?.toString(),
-      details: { status },
+      details: { status, tokenVersion: toTokenVersion(admin.tokenVersion) },
     });
 
     return res.json({ success: true, admin: mapAdmin(admin) });

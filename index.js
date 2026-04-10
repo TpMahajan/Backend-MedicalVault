@@ -38,6 +38,8 @@ import lostFoundRoutes from "./routes/lostFound.js";    // lost & found (user)
 import adminLostFoundRoutes from "./routes/adminLostFound.js"; // lost & found admin
 import adminInventoryRoutes from "./routes/adminInventory.js"; // admin inventory
 import inventoryRoutes from "./routes/inventory.js";           // public inventory (checkout)
+import storeRoutes from "./routes/store.js";                   // store (products/cart/orders)
+import nearbyRoutes from "./routes/nearby.js";                 // nearby healthcare services
 import { Session } from "./models/Session.js";
 import { checkEmailConfig } from "./utils/emailService.js";
 import patientAppointmentRoutes from "./routes/patientAppointments.js"; // patient appointments (Flutter)
@@ -204,6 +206,8 @@ app.use("/api/admin/lost-found", adminLostFoundRoutes); // admin lost & found
 app.use("/api/admin/inventory", adminInventoryRoutes);  // admin inventory ✅
 app.use("/api", inventoryRoutes);                       // inventory/order API
 app.use("/api/inventory", inventoryRoutes);             // compatibility mount
+app.use("/api", storeRoutes);                           // store API
+app.use("/api/nearby", nearbyRoutes);                   // nearby services API
 
 // Non-breaking versioned API mounts (v1)
 app.use("/api/v1/auth", authRoutes);
@@ -227,6 +231,8 @@ app.use("/api/v1/lost-found", lostFoundRoutes);
 app.use("/api/v1/admin/lost-found", adminLostFoundRoutes);
 app.use("/api/v1/admin/inventory", adminInventoryRoutes);
 app.use("/api/v1", inventoryRoutes);
+app.use("/api/v1", storeRoutes);
+app.use("/api/v1/nearby", nearbyRoutes);
 
 // -------------------- Health Check --------------------
 app.get("/health", (req, res) =>
@@ -249,6 +255,10 @@ app.get("/health", (req, res) =>
       "/api/admin",
       "/api/superadmin",
       "/api/public",
+      "/api/products",
+      "/api/cart",
+      "/api/orders",
+      "/api/nearby/services",
     ],
   })
 );

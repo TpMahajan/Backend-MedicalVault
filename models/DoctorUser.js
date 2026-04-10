@@ -96,6 +96,7 @@ const doctorUserSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
   isActive: { type: Boolean, default: true },
+  tokenVersion: { type: Number, default: 0, min: 0 },
   role: {
     type: String,
     enum: ["DOCTOR"],

@@ -31,6 +31,12 @@ const refreshTokenSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    tokenVersion: {
+      type: Number,
+      default: 0,
+      min: 0,
+      index: true,
+    },
     expiresAt: {
       type: Date,
       required: true,

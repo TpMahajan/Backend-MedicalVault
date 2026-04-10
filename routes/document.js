@@ -19,6 +19,7 @@ import { sendNotification } from "../utils/notifications.js";
 import { canDoctorAccessPatient } from "../services/accessControl.js";
 import { writeAuditLog } from "../middleware/auditLogger.js";
 import { uploadLimiter } from "../middleware/rateLimit.js";
+import DocumentReader from "../services/documentReader.js";
 
 const router = express.Router();
 
@@ -26,28 +27,62 @@ const privilegedRoles = new Set(["admin", "superadmin"]);
 const MALWARE_SCAN_API_URL = String(process.env.MALWARE_SCAN_API_URL || "").trim();
 const MALWARE_SCAN_FAIL_CLOSED =
   String(process.env.MALWARE_SCAN_FAIL_CLOSED || "false").toLowerCase() === "true";
+const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || "").trim();
+const DOCUMENT_CLASSIFIER_MODEL = String(
+  process.env.DOCUMENT_CLASSIFIER_MODEL || "gpt-4o-mini"
+).trim();
+const DOCUMENT_REJECT_MESSAGE =
+  "Only medical-related documents are allowed. Please upload valid reports, prescriptions, or health records.";
+const MIN_MEDICAL_TEXT_LENGTH = 40;
+const MAX_AI_CLASSIFIER_CHARS = 800;
 const allowedMimeTypes = new Set([
   "application/pdf",
   "image/jpeg",
   "image/png",
-  "image/webp",
-  "application/msword",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 ]);
 const magicSignatureByMime = {
   "application/pdf": [[0x25, 0x50, 0x44, 0x46]],
   "image/jpeg": [[0xff, 0xd8, 0xff]],
   "image/png": [[0x89, 0x50, 0x4e, 0x47]],
-  "image/webp": [[0x52, 0x49, 0x46, 0x46]], // RIFF....WEBP
-  "application/msword": [[0xd0, 0xcf, 0x11, 0xe0]],
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [[0x50, 0x4b, 0x03, 0x04]],
 };
 
 const validateUploadFilename = (name = "") => {
   const normalized = String(name || "").toLowerCase();
-  return /\.(pdf|jpg|jpeg|png|webp|doc|docx)$/.test(normalized);
+  return /\.(pdf|jpg|jpeg|png)$/.test(normalized);
 };
 const isValidObjectId = (value) => /^[a-fA-F0-9]{24}$/.test(String(value || ""));
+const documentReader = new DocumentReader();
+
+const medicalKeywords = [
+  "prescription",
+  "diagnosis",
+  "doctor",
+  "hospital",
+  "blood test",
+  "report",
+  "x-ray",
+  "xray",
+  "mri",
+  "ct scan",
+  "patient name",
+  "patient",
+  "medication",
+  "medicine",
+  "lab",
+  "clinic",
+];
+
+const highSignalMedicalPhrases = [
+  "medical report",
+  "radiology report",
+  "discharge summary",
+  "blood test",
+  "x-ray",
+  "mri",
+  "ct scan",
+  "prescription",
+  "patient name",
+];
 
 const isRole = (req, role) => String(req.auth?.role || "").toLowerCase() === role;
 const __filename = fileURLToPath(import.meta.url);
@@ -70,6 +105,202 @@ const buildProxyUrl = (req, docId, disposition = "inline") => {
 
 const buildLocalUploadUrl = (req, fileName) =>
   `${getApiBaseUrl(req)}/uploads/medical-vault/${encodeURIComponent(String(fileName || "").trim())}`;
+
+const cleanupRejectedUpload = async ({
+  usingS3Storage,
+  s3Bucket,
+  s3Key,
+  localFilePath,
+}) => {
+  if (usingS3Storage && s3Bucket && s3Key) {
+    try {
+      await s3Client.send(
+        new DeleteObjectCommand({
+          Bucket: s3Bucket,
+          Key: s3Key,
+        })
+      );
+    } catch (cleanupError) {
+      console.error("Failed to cleanup rejected S3 upload:", cleanupError.message);
+    }
+    return;
+  }
+
+  if (localFilePath && fs.existsSync(localFilePath)) {
+    try {
+      fs.unlinkSync(localFilePath);
+    } catch (cleanupError) {
+      console.error("Failed to cleanup rejected local upload:", cleanupError.message);
+    }
+  }
+};
+
+const normalizeExtractedText = (value) =>
+  String(value || "")
+    .replace(/\s+/g, " ")
+    .replace(/[^\x20-\x7E]+/g, " ")
+    .trim()
+    .toLowerCase();
+
+const evaluateMedicalKeywordConfidence = (normalizedText) => {
+  if (!normalizedText) {
+    return { level: "none", keywordHits: 0, highSignal: false, matched: [] };
+  }
+
+  const matchedKeywords = medicalKeywords.filter((keyword) =>
+    normalizedText.includes(keyword)
+  );
+  const highSignal = highSignalMedicalPhrases.some((phrase) =>
+    normalizedText.includes(phrase)
+  );
+  const keywordHits = matchedKeywords.length;
+  const level = highSignal || keywordHits >= 2 ? "strong" : keywordHits === 1 ? "weak" : "none";
+
+  return {
+    level,
+    keywordHits,
+    highSignal,
+    matched: matchedKeywords.slice(0, 12),
+  };
+};
+
+const classifyMedicalTextWithAI = async (normalizedText) => {
+  if (!OPENAI_API_KEY) {
+    return { success: false, label: "UNKNOWN", reason: "missing_openai_key" };
+  }
+
+  const textSample = String(normalizedText || "").slice(0, MAX_AI_CLASSIFIER_CHARS);
+  if (!textSample) {
+    return { success: false, label: "UNKNOWN", reason: "empty_text" };
+  }
+
+  try {
+    const response = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: DOCUMENT_CLASSIFIER_MODEL,
+        temperature: 0,
+        max_tokens: 5,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Classify text strictly as MEDICAL or NON_MEDICAL. Return only one word.",
+          },
+          {
+            role: "user",
+            content: `Classify this text as:\\n- MEDICAL\\n- NON_MEDICAL\\n\\nText: ${textSample}\\n\\nReturn only one word.`,
+          },
+        ],
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        timeout: Number(process.env.DOCUMENT_CLASSIFIER_TIMEOUT_MS || 12000),
+      }
+    );
+
+    const raw = String(
+      response?.data?.choices?.[0]?.message?.content || ""
+    )
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z_]/g, "");
+    const label = raw === "MEDICAL" || raw === "NON_MEDICAL" ? raw : "NON_MEDICAL";
+    return { success: true, label, reason: "ai_classified" };
+  } catch (error) {
+    console.error("Medical classifier AI fallback failed:", error.message);
+    return { success: false, label: "UNKNOWN", reason: "ai_request_failed" };
+  }
+};
+
+const extractTextForMedicalValidation = async ({
+  usingS3Storage,
+  s3Key,
+  s3Bucket,
+  localFilePath,
+  mimeType,
+}) => {
+  if (usingS3Storage && s3Key && s3Bucket) {
+    const extracted = await documentReader.extractTextFromS3(s3Key, s3Bucket);
+    if (!extracted?.success) {
+      return { success: false, text: "", reason: extracted?.error || "s3_extract_failed" };
+    }
+    return { success: true, text: extracted.text || "" };
+  }
+
+  if (!localFilePath || !fs.existsSync(localFilePath)) {
+    return { success: false, text: "", reason: "local_file_missing" };
+  }
+
+  try {
+    if (String(mimeType || "").toLowerCase() === "application/pdf") {
+      const extracted = await documentReader.extractFromPDF(localFilePath);
+      return { success: true, text: extracted?.text || "" };
+    }
+
+    const extracted = await documentReader.extractFromImage(localFilePath);
+    return { success: true, text: extracted?.text || "" };
+  } catch (error) {
+    return { success: false, text: "", reason: error.message || "local_extract_failed" };
+  }
+};
+
+const validateMedicalDocumentContent = async ({
+  usingS3Storage,
+  s3Key,
+  s3Bucket,
+  localFilePath,
+  mimeType,
+}) => {
+  const extracted = await extractTextForMedicalValidation({
+    usingS3Storage,
+    s3Key,
+    s3Bucket,
+    localFilePath,
+    mimeType,
+  });
+
+  const normalizedText = normalizeExtractedText(extracted?.text || "");
+  if (!extracted?.success || normalizedText.length < MIN_MEDICAL_TEXT_LENGTH) {
+    return {
+      allow: false,
+      reason: "insufficient_text",
+      message: `${DOCUMENT_REJECT_MESSAGE} Upload a clearer and complete medical document.`,
+      normalizedText,
+    };
+  }
+
+  const keywordDecision = evaluateMedicalKeywordConfidence(normalizedText);
+  if (keywordDecision.level === "strong") {
+    return {
+      allow: true,
+      reason: "keyword_strong_allow",
+      keywordDecision,
+    };
+  }
+
+  if (keywordDecision.level === "weak" || keywordDecision.level === "none") {
+    const aiDecision = await classifyMedicalTextWithAI(normalizedText);
+    if (aiDecision.success && aiDecision.label === "MEDICAL") {
+      return {
+        allow: true,
+        reason: "ai_medical_allow",
+        keywordDecision,
+        aiDecision,
+      };
+    }
+  }
+
+  return {
+    allow: false,
+    reason: "non_medical_reject",
+    message: DOCUMENT_REJECT_MESSAGE,
+    keywordDecision,
+  };
+};
 
 const getOptionalDocumentField = (doc, key) => doc?.get?.(key) ?? doc?.[key] ?? null;
 
@@ -386,6 +617,7 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
     const usingS3Storage = req.documentUploadStorage !== "local";
     const s3Key = req.file.key;
     const s3Bucket = req.file.bucket;
+    const localFilePath = usingS3Storage ? "" : String(req.file.path || "");
     const storedUrl =
       req.file.location ||
       (req.file.filename ? buildLocalUploadUrl(req, req.file.filename) : "");
@@ -462,16 +694,12 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
           size: req.file.size,
         });
       } catch (scanError) {
-        try {
-          await s3Client.send(
-            new DeleteObjectCommand({
-              Bucket: s3Bucket,
-              Key: s3Key,
-            })
-          );
-        } catch (cleanupError) {
-          console.error("Failed to cleanup untrusted upload:", cleanupError.message);
-        }
+        await cleanupRejectedUpload({
+          usingS3Storage,
+          s3Bucket,
+          s3Key,
+          localFilePath,
+        });
 
         return res.status(400).json({
           success: false,
@@ -481,6 +709,29 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
     }
 
     // ✅ Properly handle date conversion
+    const validationResult = await validateMedicalDocumentContent({
+      usingS3Storage,
+      s3Key,
+      s3Bucket,
+      localFilePath,
+      mimeType: req.file.mimetype,
+    });
+
+    if (!validationResult.allow) {
+      await cleanupRejectedUpload({
+        usingS3Storage,
+        s3Bucket,
+        s3Key,
+        localFilePath,
+      });
+
+      return res.status(400).json({
+        success: false,
+        code: "DOCUMENT_NOT_MEDICAL",
+        msg: validationResult.message || DOCUMENT_REJECT_MESSAGE,
+      });
+    }
+
     let uploadDate = new Date(); // Default to current time
     if (date && date.trim() !== '') {
       try {

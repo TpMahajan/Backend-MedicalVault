@@ -98,6 +98,7 @@ const UserSchema = new mongoose.Schema(
     // 🔹 System fields
     fcmToken: { type: String, default: null },
     isActive: { type: Boolean, default: true },
+    tokenVersion: { type: Number, default: 0, min: 0 },
     lastLogin: { type: Date, default: null },
     currentSessionId: { type: String, default: "", trim: true },
     currentDeviceId: { type: String, default: "", trim: true },

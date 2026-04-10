@@ -68,6 +68,9 @@ const persistRefreshToken = async (req, adminId, refreshToken, refreshMeta) => {
     tokenHash: hashToken(refreshToken),
     familyId: refreshMeta.familyId,
     jti: refreshMeta.jti,
+    tokenVersion: Number.isFinite(Number(refreshMeta?.tokenVersion))
+      ? Number(refreshMeta.tokenVersion)
+      : 0,
     expiresAt,
     createdByIp: req.ip || "",
     userAgent: req.headers["user-agent"] || "",
@@ -89,7 +92,7 @@ router.post("/login", authLimiter, async (req, res) => {
     }
 
     const admin = await AdminUser.findOne({ email: String(email).toLowerCase().trim() });
-    if (!admin || admin.isActive === false || admin.status === "BLOCKED") {
+    if (!admin) {
       await monitorFailedLogin({
         actorEmail: email,
         actorRole: "admin",
@@ -98,6 +101,14 @@ router.post("/login", authLimiter, async (req, res) => {
         source: "admin_login",
       });
       return res.status(401).json({ success: false, message: "Invalid credentials" });
+    }
+
+    if (admin.isActive === false || admin.status === "BLOCKED") {
+      return res.status(403).json({
+        success: false,
+        code: "USER_DISABLED",
+        message: "Your account has been deactivated by admin.",
+      });
     }
 
     const valid = await admin.comparePassword(password);
@@ -119,6 +130,9 @@ router.post("/login", authLimiter, async (req, res) => {
       principalId: admin._id.toString(),
       role: "admin",
       email: admin.email,
+      tokenVersion: Number.isFinite(Number(admin?.tokenVersion))
+        ? Number(admin.tokenVersion)
+        : 0,
     });
 
     await persistRefreshToken(req, admin._id, refreshToken, refreshMeta);
@@ -183,7 +197,25 @@ router.post("/refresh", async (req, res) => {
 
     const admin = await AdminUser.findById(stored.principalId);
     if (!admin || admin.isActive === false || admin.status === "BLOCKED") {
-      return res.status(403).json({ success: false, message: "Admin account inactive" });
+      return res.status(401).json({
+        success: false,
+        code: "USER_DISABLED",
+        message: "Your account has been deactivated by admin.",
+      });
+    }
+
+    const adminTokenVersion = Number.isFinite(Number(admin.tokenVersion))
+      ? Number(admin.tokenVersion)
+      : 0;
+    const incomingTokenVersion = Number.isFinite(Number(decoded.tokenVersion))
+      ? Number(decoded.tokenVersion)
+      : 0;
+    if (incomingTokenVersion !== adminTokenVersion) {
+      return res.status(401).json({
+        success: false,
+        code: "TOKEN_VERSION_MISMATCH",
+        message: "Your session is no longer valid. Please login again.",
+      });
     }
 
     const { accessToken, refreshToken, refreshMeta } = issueAuthTokenSet({
@@ -191,6 +223,7 @@ router.post("/refresh", async (req, res) => {
       role: "admin",
       email: admin.email,
       familyId: decoded.familyId,
+      tokenVersion: adminTokenVersion,
     });
 
     stored.revokedAt = new Date();

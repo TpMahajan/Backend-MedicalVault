@@ -1,8 +1,8 @@
 {
-    "latestVersion":  "1.0.15",
-    "minimumSupportedVersion":  "1.0.12",
+    "latestVersion":  "1.0.16",
+    "minimumSupportedVersion":  "1.0.14",
     "apkUrl":  "",
-    "releaseNotes":  "New Look and Feel \nNew theme colors added \nPerformance Improvements",
-    "sha256":  "cb7d5b356cde978551a9e60b6925da5a09f0aecd3162d7f28af49c7a77f812df",
+    "releaseNotes":  "Product page added \nNow user can view nearby ambulances , hospitals , etc \nPerformance Improvements",
+    "sha256":  "1884f7d5fb4b4d8e91dfc0b962ea2e8e8daff9b401f4e79241bc64d1bdd67e5b",
     "checksum":  "934d2b368cf9143704ce18b33c01593699fe920c246e2b00fede7b6ff0cef843"
 }

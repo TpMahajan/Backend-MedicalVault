@@ -60,6 +60,7 @@ const AdminUserSchema = new mongoose.Schema(
     password: { type: String, required: true, minlength: 6 },
     lastLogin: { type: Date, default: null },
     isActive: { type: Boolean, default: true },
+    tokenVersion: { type: Number, default: 0, min: 0 },
     role: {
       type: String,
       enum: ADMIN_ROLES,
