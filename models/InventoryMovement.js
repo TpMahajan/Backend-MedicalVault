@@ -5,7 +5,6 @@ const inventoryMovementSchema = new mongoose.Schema(
     productKey: {
       type: String,
       required: true,
-      enum: ["NFC_BAND", "MEDICAL_KIT"],
       index: true,
       trim: true,
     },
@@ -100,4 +99,3 @@ export const InventoryMovement = mongoose.model(
   "InventoryMovement",
   inventoryMovementSchema
 );
-

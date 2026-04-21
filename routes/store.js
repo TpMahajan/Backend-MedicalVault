@@ -3,9 +3,17 @@ import mongoose from "mongoose";
 
 import { auth, optionalAuth } from "../middleware/auth.js";
 import { BUCKET_NAME } from "../config/s3.js";
+import { InventoryProduct } from "../models/InventoryProduct.js";
 import { Product } from "../models/Product.js";
 import { StoreCart } from "../models/StoreCart.js";
 import { StoreOrder } from "../models/StoreOrder.js";
+import {
+  ensureInventoryForProduct,
+  ensureInventoryForProducts,
+  reserveInventoryForOrderItems,
+  restoreInventorySnapshots,
+  StoreInventoryError,
+} from "../services/storeInventoryBridge.js";
 import { generateSignedUrl } from "../utils/s3Utils.js";
 
 const router = express.Router();
@@ -19,6 +27,46 @@ const toNumber = (value, fallback = 0) => {
 };
 
 const asText = (value) => (value == null ? "" : String(value).trim());
+
+const resolveInventoryAvailable = (inventoryEntry, fallbackStock = 0) =>
+  (() => {
+    if (!inventoryEntry) return Math.max(0, toNumber(fallbackStock, 0));
+
+    const totalStock = Math.max(
+      0,
+      toNumber(
+        inventoryEntry?.totalStock,
+        toNumber(
+          inventoryEntry?.available ??
+            inventoryEntry?.availableStock ??
+            fallbackStock,
+          fallbackStock
+        )
+      )
+    );
+    const reservedStock = Math.max(
+      0,
+      toNumber(
+        inventoryEntry?.reservedStock ?? inventoryEntry?.reserved,
+        0
+      )
+    );
+
+    return Math.max(0, totalStock - Math.min(reservedStock, totalStock));
+  })();
+
+const resolveInventoryAvailability = (
+  productAvailability,
+  inventoryEntry,
+  fallbackStock = 0
+) => {
+  if (inventoryEntry) {
+    return resolveInventoryAvailable(inventoryEntry, fallbackStock) <= 0
+      ? "OUT_OF_STOCK"
+      : "IN_STOCK";
+  }
+  return asText(productAvailability || "IN_STOCK").toUpperCase();
+};
 
 const toAbsoluteUploadsUrl = (value) => {
   const raw = asText(value);
@@ -48,6 +96,38 @@ const parsePositiveInt = (value, fallback, { min = 1, max = 100 } = {}) => {
   return Math.min(Math.max(parsed, min), max);
 };
 
+const normalizePaymentMethod = (value) => {
+  const method = asText(value).toLowerCase();
+  if (["upi", "card", "cod", "netbanking", "wallet"].includes(method)) {
+    return method;
+  }
+  return "cod";
+};
+
+const STORE_GST_RATE = 0.18;
+const STORE_BASE_DELIVERY_FEE = 40;
+const STORE_FREE_DELIVERY_THRESHOLD = 599;
+
+const computeCheckoutTotals = (subtotalValue) => {
+  const subtotal = Math.max(0, toNumber(subtotalValue, 0));
+  const gst = Number((subtotal * STORE_GST_RATE).toFixed(2));
+  const deliveryCharges =
+    subtotal >= STORE_FREE_DELIVERY_THRESHOLD ? 0 : STORE_BASE_DELIVERY_FEE;
+  const total = Number((subtotal + gst + deliveryCharges).toFixed(2));
+  return {
+    subtotal: Number(subtotal.toFixed(2)),
+    gst,
+    deliveryCharges,
+    total,
+  };
+};
+
+const resolvePaymentStatus = (paymentMethod) => {
+  const normalized = normalizePaymentMethod(paymentMethod);
+  if (normalized === "cod") return "PENDING_PAYMENT";
+  return "PAID";
+};
+
 const resolveProductImage = async (product) => {
   const media = product?.media || {};
   const fromMedia =
@@ -73,10 +153,17 @@ const resolveProductImage = async (product) => {
   return /^https?:\/\//i.test(fromMedia) ? fromMedia : "";
 };
 
-const mapProductForClient = async (product) => {
+const mapProductForClient = async (product, inventoryEntry = null) => {
   const unitPrice = toNumber(product?.sellingPrice ?? product?.price, 0);
   const mrp = toNumber(product?.mrp, unitPrice);
   const rating = toNumber(product?.rating ?? product?.avgRating, 0);
+  const fallbackStock = Math.max(0, toNumber(product?.inventory?.stock, 0));
+  const availableStock = resolveInventoryAvailable(inventoryEntry, fallbackStock);
+  const availability = resolveInventoryAvailability(
+    product?.inventory?.availability,
+    inventoryEntry,
+    fallbackStock
+  );
 
   return {
     id: product?._id?.toString(),
@@ -89,10 +176,16 @@ const mapProductForClient = async (product) => {
     rating,
     mrp,
     sellingPrice: unitPrice,
+    stock: availableStock,
+    availableStock,
+    available_stock: availableStock,
+    availability,
+    status: availability,
+    status_code: availability,
     inventory: {
-      stock: Math.max(0, toNumber(product?.inventory?.stock, 0)),
-      availability: asText(product?.inventory?.availability || "IN_STOCK")
-        .toUpperCase(),
+      stock: availableStock,
+      available_stock: availableStock,
+      availability,
     },
     imageUrl: await resolveProductImage(product),
     updatedAt: product?.updatedAt,
@@ -108,10 +201,69 @@ const getPrincipalContext = (req) => {
   return { principalId, role };
 };
 
-const isOrderableProduct = (product) => {
+const normalizeGuestPrincipalId = (value) =>
+  asText(value)
+    .replace(/[^a-zA-Z0-9_-]/g, "")
+    .slice(0, 96);
+
+const resolveOrderPrincipal = (req) => {
+  const authenticated = getPrincipalContext(req);
+  if (authenticated) {
+    return {
+      ...authenticated,
+      isGuest: false,
+    };
+  }
+
+  const guestPrincipal = normalizeGuestPrincipalId(
+    req.body?.guestPrincipalId || req.query?.guestPrincipalId
+  );
+
+  if (!guestPrincipal) return null;
+
+  return {
+    principalId: `guest:${guestPrincipal}`,
+    role: "patient",
+    isGuest: true,
+  };
+};
+
+const normalizeGuestCheckoutItems = (items) => {
+  if (!Array.isArray(items)) return [];
+
+  const mergedQuantities = new Map();
+
+  for (const rawItem of items) {
+    const productId = asText(
+      rawItem?.productId || rawItem?.itemId || rawItem?.id
+    );
+    if (!mongoose.Types.ObjectId.isValid(productId)) continue;
+
+    const quantity = parsePositiveInt(rawItem?.quantity, 1, {
+      min: 1,
+      max: 20,
+    });
+    const current = mergedQuantities.get(productId) || 0;
+    mergedQuantities.set(productId, Math.min(20, current + quantity));
+  }
+
+  return Array.from(mergedQuantities.entries()).map(
+    ([productId, quantity]) => ({
+      productId,
+      quantity,
+    })
+  );
+};
+
+const isOrderableProduct = (product, inventoryEntry = null) => {
   if (!product || product.isActive === false) return false;
-  const availability = asText(product.inventory?.availability).toUpperCase();
-  const stock = toNumber(product.inventory?.stock, 0);
+  const fallbackStock = toNumber(product?.inventory?.stock, 0);
+  const availability = resolveInventoryAvailability(
+    product?.inventory?.availability,
+    inventoryEntry,
+    fallbackStock
+  );
+  const stock = resolveInventoryAvailable(inventoryEntry, fallbackStock);
   if (availability === "OUT_OF_STOCK") return false;
   if (stock <= 0 && availability !== "PREORDER") return false;
   return true;
@@ -208,6 +360,7 @@ const buildDeliveryPayload = (input = {}) => {
   const payload = {
     fullName: asText(input.fullName),
     phone: asText(input.phone),
+    alternatePhone: asText(input.alternatePhone),
     addressLine1: asText(input.addressLine1),
     addressLine2: asText(input.addressLine2),
     city: asText(input.city),
@@ -292,8 +445,23 @@ router.get("/products", optionalAuth, async (req, res) => {
       Product.countDocuments(query),
     ]);
 
+    await ensureInventoryForProducts(products);
+
+    const inventoryEntries = await InventoryProduct.find({
+      productId: {
+        $in: products.map((product) => product?._id?.toString()).filter(Boolean),
+      },
+    })
+      .select("productId totalStock reservedStock reserved available availableStock status")
+      .lean();
+    const inventoryByProductId = new Map(
+      inventoryEntries.map((entry) => [asText(entry?.productId), entry])
+    );
+
     const mappedProducts = await Promise.all(
-      products.map((product) => mapProductForClient(product))
+      products.map((product) =>
+        mapProductForClient(product, inventoryByProductId.get(asText(product?._id)))
+      )
     );
 
     return res.json({
@@ -380,7 +548,18 @@ router.post("/cart/items", auth, async (req, res) => {
       return res.status(404).json({ success: false, message: "Product not found" });
     }
 
-    if (!isOrderableProduct(product)) {
+    let inventoryEntry = await InventoryProduct.findOne({ productId })
+      .select("totalStock reservedStock reserved available availableStock status")
+      .lean();
+
+    if (!inventoryEntry) {
+      await ensureInventoryForProduct(product);
+      inventoryEntry = await InventoryProduct.findOne({ productId })
+        .select("totalStock reservedStock reserved available availableStock status")
+        .lean();
+    }
+
+    if (!isOrderableProduct(product, inventoryEntry)) {
       return res.status(400).json({
         success: false,
         message: "Product is currently unavailable",
@@ -510,15 +689,36 @@ router.delete("/cart/items/:itemId", auth, async (req, res) => {
   }
 });
 
-router.post("/orders", auth, async (req, res) => {
+router.post(["/orders", "/store/orders"], optionalAuth, async (req, res) => {
+  let reservedInventorySnapshots = [];
+
   try {
-    const principal = getPrincipalContext(req);
+    const principal = resolveOrderPrincipal(req);
     if (!principal) {
-      return res.status(401).json({ success: false, message: "Unauthorized" });
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized",
+      });
     }
 
-    const cart = await StoreCart.findOne(principal);
-    if (!cart || !Array.isArray(cart.items) || cart.items.length === 0) {
+    let cart = null;
+    let sourceItems = [];
+    const explicitCheckoutItems = normalizeGuestCheckoutItems(req.body?.items);
+    const hasExplicitCheckoutItems = explicitCheckoutItems.length > 0;
+
+    if (principal.isGuest) {
+      sourceItems = explicitCheckoutItems;
+    } else if (hasExplicitCheckoutItems) {
+      sourceItems = explicitCheckoutItems;
+    } else {
+      cart = await StoreCart.findOne({
+        principalId: principal.principalId,
+        role: principal.role,
+      });
+      sourceItems = Array.isArray(cart?.items) ? cart.items : [];
+    }
+
+    if (!Array.isArray(sourceItems) || sourceItems.length === 0) {
       return res.status(400).json({
         success: false,
         message: "Cart is empty",
@@ -533,7 +733,15 @@ router.post("/orders", auth, async (req, res) => {
       });
     }
 
-    const productIds = cart.items
+    const normalizedSourceItems = principal.isGuest || hasExplicitCheckoutItems
+      ? sourceItems
+      : sourceItems.map((item) => ({
+          productId: item?.productId?.toString?.() || asText(item?.productId),
+          quantity: Math.max(1, toNumber(item?.quantity, 1)),
+          snapshotName: asText(item?.priceSnapshot?.name),
+        }));
+
+    const productIds = normalizedSourceItems
       .map((item) => item?.productId)
       .filter((value) => mongoose.Types.ObjectId.isValid(value));
 
@@ -544,14 +752,26 @@ router.post("/orders", auth, async (req, res) => {
     const productsById = new Map(products.map((product) => [product._id.toString(), product]));
 
     const orderItems = [];
-    for (const item of cart.items) {
-      const productId = item?.productId?.toString?.() || "";
+    for (const item of normalizedSourceItems) {
+      const productId = asText(item?.productId);
       const product = productsById.get(productId);
+      let inventoryEntry = await InventoryProduct.findOne({ productId })
+        .select("totalStock reservedStock reserved available availableStock status")
+        .lean();
 
-      if (!product || !isOrderableProduct(product)) {
+      if (!inventoryEntry && product) {
+        await ensureInventoryForProduct(product);
+        inventoryEntry = await InventoryProduct.findOne({ productId })
+          .select("totalStock reservedStock reserved available availableStock status")
+          .lean();
+      }
+
+      if (!product || !isOrderableProduct(product, inventoryEntry)) {
         return res.status(400).json({
           success: false,
-          message: `Product unavailable for checkout: ${item?.priceSnapshot?.name || "Unknown product"}`,
+          message: `Product unavailable for checkout: ${
+            item?.snapshotName || asText(product?.name) || "Unknown product"
+          }`,
         });
       }
 
@@ -570,6 +790,8 @@ router.post("/orders", auth, async (req, res) => {
       });
     }
 
+    reservedInventorySnapshots = await reserveInventoryForOrderItems(orderItems);
+
     const itemCount = orderItems.reduce(
       (sum, item) => sum + Math.max(1, toNumber(item.quantity, 1)),
       0
@@ -580,21 +802,33 @@ router.post("/orders", auth, async (req, res) => {
         .toFixed(2)
     );
 
+    const normalizedPaymentMethod = normalizePaymentMethod(
+      req.body?.paymentMethod
+    );
+    const checkoutTotals = computeCheckoutTotals(subtotal);
+
     const order = await StoreOrder.create({
       principalId: principal.principalId,
       role: principal.role,
       items: orderItems,
       delivery,
+      paymentMethod: normalizedPaymentMethod,
+      paymentStatus: resolvePaymentStatus(normalizedPaymentMethod),
       totals: {
         itemCount,
-        subtotal,
+        subtotal: checkoutTotals.subtotal,
+        gst: checkoutTotals.gst,
+        deliveryCharges: checkoutTotals.deliveryCharges,
+        total: checkoutTotals.total,
       },
       status: "PLACED",
     });
 
-    cart.items = [];
-    recalculateCartTotals(cart);
-    await cart.save();
+    if (cart && !hasExplicitCheckoutItems) {
+      cart.items = [];
+      recalculateCartTotals(cart);
+      await cart.save();
+    }
 
     return res.status(201).json({
       success: true,
@@ -602,6 +836,21 @@ router.post("/orders", auth, async (req, res) => {
       order,
     });
   } catch (error) {
+    if (reservedInventorySnapshots.length > 0) {
+      try {
+        await restoreInventorySnapshots(reservedInventorySnapshots);
+      } catch (rollbackError) {
+        console.error("Store order inventory rollback failed:", rollbackError);
+      }
+    }
+
+    if (error instanceof StoreInventoryError || Number.isFinite(Number(error?.statusCode))) {
+      return res.status(Number(error?.statusCode) || 400).json({
+        success: false,
+        message: error.message || "Failed to place order",
+      });
+    }
+
     return res.status(500).json({
       success: false,
       message: "Failed to place order",
@@ -610,11 +859,20 @@ router.post("/orders", auth, async (req, res) => {
   }
 });
 
-router.get("/orders", auth, async (req, res) => {
+router.get(["/orders", "/store/orders"], optionalAuth, async (req, res) => {
   try {
-    const principal = getPrincipalContext(req);
+    const principal = resolveOrderPrincipal(req);
     if (!principal) {
-      return res.status(401).json({ success: false, message: "Unauthorized" });
+      return res.json({
+        success: true,
+        orders: [],
+        pagination: {
+          page: 1,
+          limit: 20,
+          total: 0,
+          totalPages: 1,
+        },
+      });
     }
 
     const page = parsePositiveInt(req.query.page, 1, { min: 1, max: 10000 });
@@ -641,7 +899,7 @@ router.get("/orders", auth, async (req, res) => {
         page,
         limit,
         total,
-        totalPages: Math.ceil(total / limit),
+        totalPages: Math.max(1, Math.ceil(total / limit)),
       },
     });
   } catch (error) {
@@ -653,9 +911,9 @@ router.get("/orders", auth, async (req, res) => {
   }
 });
 
-router.get("/orders/:id", auth, async (req, res) => {
+router.get(["/orders/:id", "/store/orders/:id"], optionalAuth, async (req, res) => {
   try {
-    const principal = getPrincipalContext(req);
+    const principal = resolveOrderPrincipal(req);
     if (!principal) {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }

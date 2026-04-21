@@ -2,6 +2,9 @@ import mongoose from "mongoose";
 import { InventoryMovement } from "../models/InventoryMovement.js";
 import { InventoryOrder } from "../models/InventoryOrder.js";
 import { InventoryProduct } from "../models/InventoryProduct.js";
+import { Product } from "../models/Product.js";
+import { listInventoryRowsWithProductDetails } from "./storeInventoryBridge.js";
+import { ensureInventoryForProduct } from "./storeInventoryBridge.js";
 
 export const INVENTORY_CATALOG = Object.freeze([
   {
@@ -52,6 +55,35 @@ const toNumber = (value, fallback = 0) => {
 const toInteger = (value, fallback = 0) =>
   Math.max(0, Math.floor(toNumber(value, fallback)));
 
+const resolveComputedAvailableStock = (product = {}) => {
+  const totalStock = Math.max(0, toInteger(product?.totalStock, 0));
+  const reservedStock = Math.min(
+    totalStock,
+    Math.max(0, toInteger(product?.reservedStock ?? product?.reserved, 0))
+  );
+  const availableStock = Math.max(0, totalStock - reservedStock);
+
+  return { totalStock, reservedStock, availableStock };
+};
+
+const logInventoryDebugState = (label, product = {}) => {
+  const { totalStock, reservedStock, availableStock } =
+    resolveComputedAvailableStock(product);
+  const productRef = String(
+    product?.productKey || product?.productId || product?._id || ""
+  );
+
+  console.info(
+    `[Inventory Debug] ${label} :: product=${productRef} total_stock=${totalStock} reserved_stock=${reservedStock} available_stock=${availableStock}`
+  );
+
+  if (totalStock > 0 && reservedStock === 0 && availableStock === 0) {
+    console.warn(
+      `[Inventory Debug] ${label} unexpected zero available stock for positive total stock (product=${productRef})`
+    );
+  }
+};
+
 const toDate = (value, fallback = new Date()) => {
   if (!value) return fallback;
   const parsed = value instanceof Date ? value : new Date(value);
@@ -91,6 +123,8 @@ const normalizeProductKeyValue = (value) => {
   const raw = String(value).trim();
   if (!raw) return null;
 
+  if (mongoose.Types.ObjectId.isValid(raw)) return raw;
+
   const upper = raw.toUpperCase();
   if (CATALOG_BY_KEY.has(upper)) return upper;
 
@@ -113,6 +147,10 @@ const normalizeProductKeyValue = (value) => {
     return "MEDICAL_KIT";
   }
 
+  if (/^[a-z0-9_-]{3,120}$/i.test(raw)) {
+    return raw;
+  }
+
   return null;
 };
 
@@ -121,35 +159,39 @@ const computeInventoryStatus = (availableStock) =>
 
 const computeRowStatus = (availableStock, reorderLevel) => {
   if (availableStock <= 0) return "Out";
-  if (availableStock <= reorderLevel) return "Low";
+  if (availableStock < reorderLevel) return "Low";
   return "In Stock";
 };
 
 const mapInventoryProduct = (product) => {
-  const totalStock = toInteger(product?.totalStock, 0);
-  const reservedStock = Math.min(totalStock, toInteger(product?.reservedStock, 0));
-  const availableStock = Math.max(
-    0,
-    product?.availableStock == null
-      ? totalStock - reservedStock
-      : toInteger(product?.availableStock, totalStock - reservedStock)
-  );
+  const { totalStock, reservedStock, availableStock } =
+    resolveComputedAvailableStock(product);
 
   return {
     _id: product?._id,
     productKey: product?.productKey,
     productId: product?._id,
+    product_id: product?.productId || "",
+    inventory_id: product?._id,
     externalProductId: product?.productId || "",
     productName: product?.productName || product?.name || product?.productKey,
     totalStock,
+    total_stock: totalStock,
     reservedStock,
+    reserved_stock: reservedStock,
     availableStock,
+    available_stock: availableStock,
     reorderLevel: toInteger(product?.reorderLevel, 0),
+    reorder_level: toInteger(product?.reorderLevel, 0),
     lastRestocked: product?.lastRestocked || product?.lastRestockedAt || null,
+    last_restocked: product?.lastRestocked || product?.lastRestockedAt || null,
     status: computeInventoryStatus(availableStock),
-    lowStock: availableStock <= toInteger(product?.reorderLevel, 0),
+    status_code: computeInventoryStatus(availableStock),
+    lowStock: availableStock < toInteger(product?.reorderLevel, 0),
+    low_stock: availableStock < toInteger(product?.reorderLevel, 0),
     sku: product?.sku || "",
     unitPrice: toNumber(product?.unitPrice, 0),
+    unit_price: toNumber(product?.unitPrice, 0),
   };
 };
 
@@ -158,19 +200,29 @@ const mapInventoryRow = (product) => {
   return {
     productKey: normalized.productKey,
     productId: normalized.productId,
+    product_id: normalized.externalProductId,
+    inventory_id: normalized.productId,
     externalProductId: normalized.externalProductId,
     product: normalized.productName,
     productName: normalized.productName,
     sku: normalized.sku,
     unitPrice: normalized.unitPrice,
+    unit_price: normalized.unitPrice,
     currentStock: normalized.totalStock,
     totalStock: normalized.totalStock,
+    total_stock: normalized.totalStock,
     reservedStock: normalized.reservedStock,
+    reserved_stock: normalized.reservedStock,
     availableStock: normalized.availableStock,
+    available_stock: normalized.availableStock,
     reorderLevel: normalized.reorderLevel,
+    reorder_level: normalized.reorderLevel,
     lastRestocked: normalized.lastRestocked,
+    last_restocked: normalized.lastRestocked,
     inventoryStatus: normalized.status,
+    status_code: normalized.status,
     lowStock: normalized.lowStock,
+    low_stock: normalized.lowStock,
     status: computeRowStatus(normalized.availableStock, normalized.reorderLevel),
   };
 };
@@ -494,27 +546,77 @@ const updateProductWithPipeline = async (
     runValidators: true,
   });
 
+const withDerivedInventoryState = (pipeline = []) => [
+  ...(Array.isArray(pipeline) ? pipeline : []),
+  {
+    $set: {
+      totalStock: { $max: [0, "$totalStock"] },
+    },
+  },
+  {
+    $set: {
+      reservedStock: {
+        $max: [0, { $min: ["$reservedStock", "$totalStock"] }],
+      },
+    },
+  },
+  {
+    $set: {
+      availableStock: { $max: [0, { $subtract: ["$totalStock", "$reservedStock"] }] },
+    },
+  },
+  {
+    $set: {
+      reserved: "$reservedStock",
+      available: "$availableStock",
+      status: {
+        $cond: [{ $gt: ["$availableStock", 0] }, "IN_STOCK", "OUT_OF_STOCK"],
+      },
+    },
+  },
+];
+
+const ensureInventoryLinkedToProduct = async (
+  normalizedProductKey,
+  { productModel = InventoryProduct } = {}
+) => {
+  if (productModel !== InventoryProduct) return;
+
+  const normalized = String(normalizedProductKey || "").trim();
+  if (!normalized) return;
+
+  const existing = await InventoryProduct.findOne({
+    $or: [{ productKey: normalized }, { productId: normalized }],
+  })
+    .select("_id")
+    .lean();
+  if (existing) return;
+
+  if (!mongoose.Types.ObjectId.isValid(normalized)) return;
+
+  const product = await Product.findById(normalized)
+    .select("name sku sellingPrice price inventory stock")
+    .lean();
+
+  if (!product) return;
+  await ensureInventoryForProduct(product);
+};
+
 const reserveInventoryForItem = async (item, deps = {}) => {
   const updated = await updateProductWithPipeline(
     {
       _id: item.productRef,
-      availableStock: { $gte: item.quantity },
+      $expr: {
+        $gte: [{ $subtract: ["$totalStock", "$reservedStock"] }, item.quantity],
+      },
     },
-    [
+    withDerivedInventoryState([
       {
         $set: {
           reservedStock: { $add: ["$reservedStock", item.quantity] },
-          availableStock: { $subtract: ["$availableStock", item.quantity] },
         },
       },
-      {
-        $set: {
-          status: {
-            $cond: [{ $gt: ["$availableStock", 0] }, "IN_STOCK", "OUT_OF_STOCK"],
-          },
-        },
-      },
-    ],
+    ]),
     deps
   );
 
@@ -534,21 +636,13 @@ const releaseReservedInventoryForItem = async (item, deps = {}) => {
       _id: item.productRef,
       reservedStock: { $gte: item.quantity },
     },
-    [
+    withDerivedInventoryState([
       {
         $set: {
           reservedStock: { $subtract: ["$reservedStock", item.quantity] },
-          availableStock: { $add: ["$availableStock", item.quantity] },
         },
       },
-      {
-        $set: {
-          status: {
-            $cond: [{ $gt: ["$availableStock", 0] }, "IN_STOCK", "OUT_OF_STOCK"],
-          },
-        },
-      },
-    ],
+    ]),
     deps
   );
 
@@ -569,22 +663,14 @@ const completeInventoryForItem = async (item, deps = {}) => {
       reservedStock: { $gte: item.quantity },
       totalStock: { $gte: item.quantity },
     },
-    [
+    withDerivedInventoryState([
       {
         $set: {
           reservedStock: { $subtract: ["$reservedStock", item.quantity] },
           totalStock: { $subtract: ["$totalStock", item.quantity] },
         },
       },
-      {
-        $set: {
-          availableStock: { $subtract: ["$totalStock", "$reservedStock"] },
-          status: {
-            $cond: [{ $gt: ["$availableStock", 0] }, "IN_STOCK", "OUT_OF_STOCK"],
-          },
-        },
-      },
-    ],
+    ]),
     deps
   );
 
@@ -603,22 +689,14 @@ const rollbackCompletedInventoryForItem = async (item, deps = {}) => {
     {
       _id: item.productRef,
     },
-    [
+    withDerivedInventoryState([
       {
         $set: {
           reservedStock: { $add: ["$reservedStock", item.quantity] },
           totalStock: { $add: ["$totalStock", item.quantity] },
         },
       },
-      {
-        $set: {
-          availableStock: { $subtract: ["$totalStock", "$reservedStock"] },
-          status: {
-            $cond: [{ $gt: ["$availableStock", 0] }, "IN_STOCK", "OUT_OF_STOCK"],
-          },
-        },
-      },
-    ],
+    ]),
     deps
   );
 
@@ -637,21 +715,13 @@ const restockCompletedInventoryForItem = async (item, deps = {}) => {
     {
       _id: item.productRef,
     },
-    [
+    withDerivedInventoryState([
       {
         $set: {
           totalStock: { $add: ["$totalStock", item.quantity] },
-          availableStock: { $add: ["$availableStock", item.quantity] },
         },
       },
-      {
-        $set: {
-          status: {
-            $cond: [{ $gt: ["$availableStock", 0] }, "IN_STOCK", "OUT_OF_STOCK"],
-          },
-        },
-      },
-    ],
+    ]),
     deps
   );
 
@@ -864,32 +934,27 @@ export const recordRestock = async (
   const happenedAt = new Date();
 
   await ensureInventoryProducts(productModel);
+  await ensureInventoryLinkedToProduct(normalizedProductKey, { productModel });
 
   const updatedProduct = await updateProductWithPipeline(
     { productKey: normalizedProductKey },
-    [
+    withDerivedInventoryState([
       {
         $set: {
           totalStock: { $add: ["$totalStock", qty] },
-          availableStock: { $add: ["$availableStock", qty] },
           lastRestocked: happenedAt,
           lastRestockedAt: happenedAt,
         },
       },
-      {
-        $set: {
-          status: {
-            $cond: [{ $gt: ["$availableStock", 0] }, "IN_STOCK", "OUT_OF_STOCK"],
-          },
-        },
-      },
-    ],
+    ]),
     { productModel }
   );
 
   if (!updatedProduct) {
     throw new InventoryError("Inventory product not found", 404);
   }
+
+  logInventoryDebugState("restock", updatedProduct);
 
   const movement = await createMovement(
     {
@@ -932,41 +997,28 @@ export const recordAdjustment = async (
   let pipeline;
 
   await ensureInventoryProducts(productModel);
+  await ensureInventoryLinkedToProduct(normalizedProductKey, { productModel });
 
   if (signedQuantity > 0) {
-    pipeline = [
+    pipeline = withDerivedInventoryState([
       {
         $set: {
           totalStock: { $add: ["$totalStock", quantityAbs] },
-          availableStock: { $add: ["$availableStock", quantityAbs] },
         },
       },
-      {
-        $set: {
-          status: {
-            $cond: [{ $gt: ["$availableStock", 0] }, "IN_STOCK", "OUT_OF_STOCK"],
-          },
-        },
-      },
-    ];
+    ]);
   } else {
-    filter.availableStock = { $gte: quantityAbs };
+    filter.$expr = {
+      $gte: [{ $subtract: ["$totalStock", "$reservedStock"] }, quantityAbs],
+    };
     filter.totalStock = { $gte: quantityAbs };
-    pipeline = [
+    pipeline = withDerivedInventoryState([
       {
         $set: {
           totalStock: { $subtract: ["$totalStock", quantityAbs] },
-          availableStock: { $subtract: ["$availableStock", quantityAbs] },
         },
       },
-      {
-        $set: {
-          status: {
-            $cond: [{ $gt: ["$availableStock", 0] }, "IN_STOCK", "OUT_OF_STOCK"],
-          },
-        },
-      },
-    ];
+    ]);
   }
 
   const updatedProduct = await updateProductWithPipeline(filter, pipeline, {
@@ -976,6 +1028,8 @@ export const recordAdjustment = async (
   if (!updatedProduct) {
     throw new InventoryError("Unable to adjust stock with the requested quantity", 409);
   }
+
+  logInventoryDebugState("adjustment", updatedProduct);
 
   const movement = await createMovement(
     {
@@ -1013,6 +1067,7 @@ export const updateProductReorderLevel = async (
   }
 
   await ensureInventoryProducts(productModel);
+  await ensureInventoryLinkedToProduct(normalizedProductKey, { productModel });
 
   const updated = await productModel.findOneAndUpdate(
     { productKey: normalizedProductKey },
@@ -1031,6 +1086,42 @@ export const getInventorySnapshot = async (
   { productKey } = {},
   { productModel = InventoryProduct } = {}
 ) => {
+  if (productModel === InventoryProduct) {
+    const rows = await getInventoryRows(
+      { productKey: productKey || "ALL" },
+      { productModel }
+    );
+
+    return {
+      products: rows.map((row) => ({
+        _id: row.inventory_id || row.productId || null,
+        productKey: row.productKey,
+        productId: row.inventory_id || row.productId || null,
+        product_id: row.product_id || row.externalProductId || "",
+        externalProductId: row.externalProductId || row.product_id || "",
+        productName: row.productName || row.product || "Product",
+        sku: row.sku || "",
+        unitPrice: toNumber(row.unitPrice, 0),
+        unit_price: toNumber(row.unitPrice, 0),
+        totalStock: toInteger(row.totalStock, 0),
+        total_stock: toInteger(row.totalStock, 0),
+        reservedStock: toInteger(row.reservedStock, 0),
+        reserved_stock: toInteger(row.reservedStock, 0),
+        availableStock: toInteger(row.availableStock, 0),
+        available_stock: toInteger(row.availableStock, 0),
+        status: row.statusCode || row.inventoryStatus || computeInventoryStatus(row.availableStock),
+        status_code:
+          row.statusCode || row.inventoryStatus || computeInventoryStatus(row.availableStock),
+        reorderLevel: toInteger(row.reorderLevel, 0),
+        reorder_level: toInteger(row.reorderLevel, 0),
+        lowStock: Boolean(row.lowStock),
+        low_stock: Boolean(row.lowStock),
+        lastRestocked: row.lastRestocked || null,
+        last_restocked: row.lastRestocked || null,
+      })),
+    };
+  }
+
   const products = await listSnapshotProducts({ productKey }, { productModel });
   return buildInventoryResponse(products);
 };
@@ -1416,11 +1507,17 @@ export const getInventoryRows = async (
     throw new InventoryError("Invalid product filter", 400);
   }
 
-  const products = await listSnapshotProducts(
-    { productKey: normalizedProduct },
-    { productModel }
-  );
-  return products.map(mapInventoryRow);
+  if (productModel !== InventoryProduct) {
+    const products = await listSnapshotProducts(
+      { productKey: normalizedProduct },
+      { productModel }
+    );
+    return products.map(mapInventoryRow);
+  }
+
+  return listInventoryRowsWithProductDetails({
+    productKey: normalizedProduct || "ALL",
+  });
 };
 
 const summarizePeriod = (movements, start, end) => {

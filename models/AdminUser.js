@@ -43,6 +43,9 @@ const normalizeRole = (value) => {
   return ADMIN_ROLES.includes(role) ? role : "PRODUCT_ADMIN";
 };
 
+const isBcryptHash = (value) =>
+  /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/.test(String(value || ""));
+
 const AdminUserSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true, maxlength: 50 },
@@ -127,6 +130,7 @@ AdminUserSchema.pre("save", function (next) {
 
 AdminUserSchema.pre("save", async function (next) {
   if (!this.isModified("password")) return next();
+  if (isBcryptHash(this.password)) return next();
   try {
     const salt = await bcrypt.genSalt(12);
     this.password = await bcrypt.hash(this.password, salt);
