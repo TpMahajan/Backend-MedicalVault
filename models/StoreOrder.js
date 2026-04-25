@@ -9,7 +9,7 @@ const orderItemSchema = new mongoose.Schema(
     },
     name: { type: String, required: true, trim: true, maxlength: 120 },
     category: { type: String, default: "", trim: true, maxlength: 80 },
-    imageUrl: { type: String, default: "", trim: true, maxlength: 1000 },
+    imageUrl: { type: String, default: "", trim: true, maxlength: 20000 },
     quantity: { type: Number, required: true, min: 1, max: 20 },
     unitPrice: { type: Number, required: true, min: 0 },
     lineTotal: { type: Number, required: true, min: 0 },
@@ -43,6 +43,7 @@ const storeOrderSchema = new mongoose.Schema(
     delivery: {
       fullName: { type: String, required: true, trim: true, maxlength: 120 },
       phone: { type: String, required: true, trim: true, maxlength: 30 },
+      alternatePhone: { type: String, default: "", trim: true, maxlength: 30 },
       addressLine1: { type: String, required: true, trim: true, maxlength: 180 },
       addressLine2: { type: String, default: "", trim: true, maxlength: 180 },
       city: { type: String, required: true, trim: true, maxlength: 80 },
@@ -50,9 +51,26 @@ const storeOrderSchema = new mongoose.Schema(
       pincode: { type: String, required: true, trim: true, maxlength: 20 },
       notes: { type: String, default: "", trim: true, maxlength: 600 },
     },
+    paymentMethod: {
+      type: String,
+      enum: ["upi", "card", "cod", "netbanking", "wallet"],
+      default: "cod",
+      lowercase: true,
+      trim: true,
+    },
+    paymentStatus: {
+      type: String,
+      enum: ["PAID", "PENDING_PAYMENT", "FAILED"],
+      default: "PENDING_PAYMENT",
+      uppercase: true,
+      trim: true,
+    },
     totals: {
       itemCount: { type: Number, min: 1, required: true },
       subtotal: { type: Number, min: 0, required: true },
+      gst: { type: Number, min: 0, default: 0 },
+      deliveryCharges: { type: Number, min: 0, default: 0 },
+      total: { type: Number, min: 0, default: 0 },
     },
     status: {
       type: String,

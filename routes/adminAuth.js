@@ -1,4 +1,5 @@
 import express from "express";
+import bcrypt from "bcryptjs";
 import { AdminUser } from "../models/AdminUser.js";
 import { MassIncident } from "../models/MassIncident.js";
 import { requireAdminAuth } from "../middleware/adminAuth.js";
@@ -19,6 +20,19 @@ import {
 } from "../services/securityMonitorService.js";
 
 const router = express.Router();
+
+const normalizeEmailInput = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+
+  // Handle accidental markdown/email-link inputs: [a@b.com](mailto:a@b.com)
+  const markdownMatch = raw.match(/\((?:mailto:)?([^)\s]+@[^)\s]+)\)/i);
+  if (markdownMatch?.[1]) {
+    return String(markdownMatch[1]).trim().toLowerCase();
+  }
+
+  return raw.replace(/^mailto:/i, "").trim().toLowerCase();
+};
 
 // POST /api/admin/signup
 // Disabled in production-grade mode: Admins can only be created by SuperAdmin APIs.
@@ -82,7 +96,10 @@ const persistRefreshToken = async (req, adminId, refreshToken, refreshMeta) => {
 // POST /api/admin/login
 router.post("/login", authLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const email = normalizeEmailInput(req.body?.email).toLowerCase();
+    const password = String(req.body?.password || "");
+    console.log("[admin-login] Email received:", email);
+
     const blockState = await isActorTemporarilyBlocked({ actorEmail: email, actorRole: "admin" });
     if (blockState.isBlocked) {
       return res.status(429).json({ success: false, message: "Account temporarily blocked due to suspicious activity" });
@@ -91,7 +108,9 @@ router.post("/login", authLimiter, async (req, res) => {
       return res.status(400).json({ success: false, message: "Email and password are required" });
     }
 
-    const admin = await AdminUser.findOne({ email: String(email).toLowerCase().trim() });
+    const admin = await AdminUser.findOne({ email: email.toLowerCase() });
+    console.log("[admin-login] User found:", Boolean(admin));
+
     if (!admin) {
       await monitorFailedLogin({
         actorEmail: email,
@@ -100,6 +119,7 @@ router.post("/login", authLimiter, async (req, res) => {
         userAgent: req.headers["user-agent"] || "",
         source: "admin_login",
       });
+      console.log("[admin-login] Password match:", false);
       return res.status(401).json({ success: false, message: "Invalid credentials" });
     }
 
@@ -111,8 +131,15 @@ router.post("/login", authLimiter, async (req, res) => {
       });
     }
 
-    const valid = await admin.comparePassword(password);
-    if (!valid) {
+    let isMatch = false;
+    try {
+      isMatch = await bcrypt.compare(password, String(admin.password || ""));
+    } catch {
+      isMatch = false;
+    }
+    console.log("[admin-login] Password match:", isMatch);
+
+    if (!isMatch) {
       await monitorFailedLogin({
         actorEmail: email,
         actorRole: "admin",
@@ -123,6 +150,9 @@ router.post("/login", authLimiter, async (req, res) => {
       return res.status(401).json({ success: false, message: "Invalid credentials" });
     }
 
+    if (String(admin.email || "") !== email) {
+      admin.email = email;
+    }
     admin.lastLogin = new Date();
     await admin.save();
 
@@ -150,6 +180,7 @@ router.post("/login", authLimiter, async (req, res) => {
         permissions: admin.permissions || [],
         isActive: admin.isActive !== false,
       },
+      role: admin.role,
       token: accessToken,
       refreshToken,
     });

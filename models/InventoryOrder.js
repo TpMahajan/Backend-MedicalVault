@@ -10,7 +10,8 @@ const inventoryOrderItemSchema = new mongoose.Schema(
     productKey: {
       type: String,
       required: true,
-      enum: ["NFC_BAND", "MEDICAL_KIT"],
+      trim: true,
+      index: true,
     },
     productId: {
       type: String,

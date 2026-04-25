@@ -45,6 +45,10 @@ import { RefreshToken } from "../models/RefreshToken.js";
 import { writeAuditLog } from "../middleware/auditLogger.js";
 import { emitSessionInvalidatedEvent } from "../services/authSessionRealtime.js";
 import {
+  ensureInventoryForProduct,
+  removeInventoryForProduct,
+} from "../services/storeInventoryBridge.js";
+import {
   PUBLIC_AD_SURFACES,
   PUBLIC_ALERT_PLATFORMS,
   broadcastPublicConfigEvent,
@@ -2223,10 +2227,11 @@ router.post("/users", requireSuperAdminAuth, async (req, res) => {
       ? requestedAdminRole
       : "PRODUCT_ADMIN";
     const adminPermissions = normalizePermissions(req.body.permissions);
+    const hashedPassword = await bcrypt.hash(password, 10);
     const admin = new AdminUser({
       name,
       email,
-      password,
+      password: hashedPassword,
       assignedBy: req.superAdmin.email,
       role: adminRole,
       permissions:
@@ -2477,6 +2482,7 @@ router.post("/admins", requireSuperAdminAuth, async (req, res) => {
       ? requestedAdminRole
       : "PRODUCT_ADMIN";
     const permissions = normalizePermissions(req.body.permissions);
+    const hashedPassword = await bcrypt.hash(password, 10);
 
     if (!name || !email || !password) {
       return res.status(400).json({
@@ -2488,7 +2494,7 @@ router.post("/admins", requireSuperAdminAuth, async (req, res) => {
     const admin = new AdminUser({
       name,
       email,
-      password,
+      password: hashedPassword,
       role: adminRole,
       status: "ACTIVE",
       assignedBy: req.superAdmin.email,
@@ -3129,6 +3135,7 @@ router.post("/products", requireSuperAdminAuth, async (req, res) => {
     };
 
     const product = await Product.create(payload);
+    await ensureInventoryForProduct(product);
     clearPublicConfigCache();
 
     await logActivity(req, {
@@ -3316,6 +3323,7 @@ router.delete("/products/:id", requireSuperAdminAuth, async (req, res) => {
     }
 
     await product.deleteOne();
+    await removeInventoryForProduct(req.params.id);
     clearPublicConfigCache();
 
     await logActivity(req, {

@@ -17,7 +17,7 @@ const cartItemSchema = new mongoose.Schema(
     priceSnapshot: {
       name: { type: String, default: "", trim: true, maxlength: 120 },
       category: { type: String, default: "", trim: true, maxlength: 80 },
-      imageUrl: { type: String, default: "", trim: true, maxlength: 1000 },
+      imageUrl: { type: String, default: "", trim: true, maxlength: 20000 },
       unitPrice: { type: Number, min: 0, default: 0 },
     },
   },

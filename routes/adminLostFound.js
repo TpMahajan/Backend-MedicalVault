@@ -2,6 +2,9 @@ import express from "express";
 import { requireAdminAuth, requireAdminPermissions } from "../middleware/adminAuth.js";
 import {
   getSummary,
+  listReports,
+  updateReportStatus,
+  sendReporterNotification,
   listMatches,
   confirmMatch,
   rejectMatch,
@@ -14,6 +17,24 @@ router.get(
   requireAdminAuth,
   requireAdminPermissions("VIEW_SOS"),
   getSummary
+);
+router.get(
+  "/reports",
+  requireAdminAuth,
+  requireAdminPermissions("VIEW_SOS"),
+  listReports
+);
+router.patch(
+  "/reports/:id/status",
+  requireAdminAuth,
+  requireAdminPermissions("HANDLE_SOS"),
+  updateReportStatus
+);
+router.post(
+  "/reports/:id/notify",
+  requireAdminAuth,
+  requireAdminPermissions("HANDLE_SOS"),
+  sendReporterNotification
 );
 router.get(
   "/matches",

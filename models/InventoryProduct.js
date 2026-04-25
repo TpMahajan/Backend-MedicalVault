@@ -4,9 +4,9 @@ const inventoryProductSchema = new mongoose.Schema(
   {
     productKey: {
       type: String,
-      required: true,
+      required: false,
       unique: true,
-      enum: ["NFC_BAND", "MEDICAL_KIT"],
+      sparse: true,
       index: true,
       trim: true,
     },
@@ -24,10 +24,11 @@ const inventoryProductSchema = new mongoose.Schema(
     },
     sku: {
       type: String,
-      required: true,
-      unique: true,
+      required: false,
+      default: "",
       trim: true,
       maxlength: 120,
+      index: true,
     },
     productId: {
       type: String,
@@ -43,6 +44,18 @@ const inventoryProductSchema = new mongoose.Schema(
       default: 0,
     },
     totalStock: {
+      type: Number,
+      required: true,
+      default: 0,
+      min: 0,
+    },
+    reserved: {
+      type: Number,
+      required: true,
+      default: 0,
+      min: 0,
+    },
+    available: {
       type: Number,
       required: true,
       default: 0,
@@ -94,6 +107,7 @@ const inventoryProductSchema = new mongoose.Schema(
 inventoryProductSchema.pre("validate", function syncInventoryFields(next) {
   if (!this.productName && this.name) this.productName = this.name;
   if (!this.name && this.productName) this.name = this.productName;
+  if (!this.productKey && this.productId) this.productKey = this.productId;
 
   if (!this.lastRestocked && this.lastRestockedAt) {
     this.lastRestocked = this.lastRestockedAt;
@@ -102,14 +116,30 @@ inventoryProductSchema.pre("validate", function syncInventoryFields(next) {
     this.lastRestockedAt = this.lastRestocked;
   }
 
-  const totalStock = Math.max(0, Math.floor(Number(this.totalStock || 0)));
+  const resolvedTotalSeed = Number(
+    this.totalStock ??
+      this.availableStock ??
+      this.available ??
+      0
+  );
+  const totalStock = Math.max(
+    0,
+    Math.floor(Number.isFinite(resolvedTotalSeed) ? resolvedTotalSeed : 0)
+  );
+  const resolvedReserved = Number(
+    this.reserved ??
+      this.reservedStock ??
+      0
+  );
   const reservedStock = Math.min(
     totalStock,
-    Math.max(0, Math.floor(Number(this.reservedStock || 0)))
+    Math.max(0, Math.floor(Number.isFinite(resolvedReserved) ? resolvedReserved : 0))
   );
   const availableStock = Math.max(0, totalStock - reservedStock);
 
   this.totalStock = totalStock;
+  this.reserved = reservedStock;
+  this.available = availableStock;
   this.reservedStock = reservedStock;
   this.availableStock = availableStock;
   this.status = availableStock > 0 ? "IN_STOCK" : "OUT_OF_STOCK";
