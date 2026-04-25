@@ -31,13 +31,21 @@ const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || "").trim();
 const DOCUMENT_CLASSIFIER_MODEL = String(
   process.env.DOCUMENT_CLASSIFIER_MODEL || "gpt-4o-mini"
 ).trim();
+const DOCUMENT_CATEGORY_CLASSIFIER_MODEL = String(
+  process.env.DOCUMENT_CATEGORY_CLASSIFIER_MODEL ||
+    DOCUMENT_CLASSIFIER_MODEL ||
+    "gpt-4o-mini"
+).trim();
 const DOCUMENT_REJECT_MESSAGE =
   "Only medical-related documents are allowed. Please upload valid reports, prescriptions, or health records.";
 const MIN_MEDICAL_TEXT_LENGTH = 40;
 const MAX_AI_CLASSIFIER_CHARS = 800;
+const MAX_AI_CATEGORY_CHARS = 350;
 const DEFAULT_CLASSIFIER_TIMEOUT_MS = 6000;
+const DEFAULT_CATEGORY_CLASSIFIER_TIMEOUT_MS = 3000;
 const ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS =
   String(process.env.ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS || "true").toLowerCase() !== "false";
+const validDocumentCategories = ["Report", "Prescription", "Bill", "Insurance"];
 const allowedMimeTypes = new Set([
   "application/pdf",
   "image/jpeg",
@@ -193,6 +201,184 @@ const evaluateMedicalKeywordConfidence = (normalizedText) => {
   };
 };
 
+const normalizeDocumentCategory = (category = "") => {
+  const normalized = String(category || "").toLowerCase().trim();
+  if (!normalized) return "";
+  if (normalized.includes("prescription") || normalized.includes("rx")) {
+    return "Prescription";
+  }
+  if (normalized.includes("insurance") || normalized.includes("claim")) {
+    return "Insurance";
+  }
+  if (
+    normalized.includes("bill") ||
+    normalized.includes("invoice") ||
+    normalized.includes("receipt")
+  ) {
+    return "Bill";
+  }
+  if (
+    normalized.includes("report") ||
+    normalized.includes("lab") ||
+    normalized.includes("test") ||
+    normalized.includes("scan")
+  ) {
+    return "Report";
+  }
+  return "";
+};
+
+const categoryKeywordGroups = {
+  Report: [
+    "report",
+    "lab",
+    "test",
+    "result",
+    "blood",
+    "cbc",
+    "hemoglobin",
+    "radiology",
+    "x-ray",
+    "xray",
+    "mri",
+    "ct scan",
+    "ultrasound",
+    "diagnosis",
+  ],
+  Prescription: [
+    "prescription",
+    "rx",
+    "tablet",
+    "capsule",
+    "syrup",
+    "dosage",
+    "dose",
+    "medicine",
+    "medication",
+    "take",
+    "daily",
+  ],
+  Bill: [
+    "bill",
+    "invoice",
+    "receipt",
+    "amount",
+    "total",
+    "paid",
+    "payment",
+    "charges",
+    "fee",
+    "tax",
+  ],
+  Insurance: [
+    "insurance",
+    "policy",
+    "claim",
+    "cashless",
+    "insurer",
+    "tpa",
+    "coverage",
+    "premium",
+    "mediclaim",
+  ],
+};
+
+const buildCategoryClassificationText = ({
+  title,
+  notes,
+  originalName,
+  normalizedText,
+}) =>
+  normalizeExtractedText(
+    [title, originalName, notes, normalizedText].filter(Boolean).join(" ")
+  );
+
+const inferDocumentCategoryByHeuristic = (classificationText) => {
+  const text = normalizeExtractedText(classificationText);
+  if (!text) return "Report";
+
+  const scores = Object.fromEntries(
+    validDocumentCategories.map((category) => [category, 0])
+  );
+
+  for (const [category, keywords] of Object.entries(categoryKeywordGroups)) {
+    for (const keyword of keywords) {
+      if (text.includes(keyword)) scores[category] += 1;
+    }
+  }
+
+  const ranked = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  if (ranked[0]?.[1] > 0 && ranked[0][1] > (ranked[1]?.[1] || 0)) {
+    return ranked[0][0];
+  }
+
+  return "Report";
+};
+
+const classifyDocumentCategoryWithAI = async ({
+  title,
+  notes,
+  originalName,
+  normalizedText,
+}) => {
+  const classificationText = buildCategoryClassificationText({
+    title,
+    notes,
+    originalName,
+    normalizedText,
+  });
+  const fallbackCategory = inferDocumentCategoryByHeuristic(classificationText);
+  const textSample = classificationText.slice(0, MAX_AI_CATEGORY_CHARS);
+
+  if (!OPENAI_API_KEY || textSample.length < 4) {
+    return { category: fallbackCategory, method: "heuristic" };
+  }
+
+  try {
+    const response = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: DOCUMENT_CATEGORY_CLASSIFIER_MODEL,
+        temperature: 0,
+        max_tokens: 3,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Return only one: Report, Prescription, Bill, Insurance.",
+          },
+          {
+            role: "user",
+            content: textSample,
+          },
+        ],
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        timeout: Number(
+          process.env.DOCUMENT_CATEGORY_CLASSIFIER_TIMEOUT_MS ||
+            DEFAULT_CATEGORY_CLASSIFIER_TIMEOUT_MS
+        ),
+      }
+    );
+
+    const raw = String(
+      response?.data?.choices?.[0]?.message?.content || ""
+    ).trim();
+    const aiCategory = normalizeDocumentCategory(raw);
+    return {
+      category: aiCategory || fallbackCategory,
+      method: aiCategory ? "ai" : "heuristic",
+    };
+  } catch (error) {
+    console.error("Document category AI fallback failed:", error.message);
+    return { category: fallbackCategory, method: "heuristic" };
+  }
+};
+
 const classifyMedicalTextWithAI = async (normalizedText) => {
   if (!OPENAI_API_KEY) {
     return { success: false, label: "UNKNOWN", reason: "missing_openai_key" };
@@ -298,6 +484,8 @@ const validateMedicalDocumentContent = async ({
     return {
       allow: true,
       reason: "metadata_strong_fast_accept",
+      normalizedText: "",
+      classificationText: metadataText,
       keywordDecision: metadataDecision,
       verification: buildVerificationPayload({
         status: "accepted",
@@ -329,6 +517,8 @@ const validateMedicalDocumentContent = async ({
       return {
         allow: true,
         reason: "metadata_medical_accept",
+        normalizedText,
+        classificationText: aiSample || metadataText,
         keywordDecision: metadataDecision,
         verification: buildVerificationPayload({
           status: "accepted",
@@ -347,6 +537,7 @@ const validateMedicalDocumentContent = async ({
       reason: "insufficient_text",
       message: `${DOCUMENT_REJECT_MESSAGE} Upload a clearer and complete medical document.`,
       normalizedText,
+      classificationText: aiSample || metadataText,
       verification: buildVerificationPayload({
         status: "rejected",
         label: "UNKNOWN",
@@ -362,6 +553,8 @@ const validateMedicalDocumentContent = async ({
     return {
       allow: true,
       reason: "keyword_strong_allow",
+      normalizedText,
+      classificationText: aiSample || normalizedText || metadataText,
       keywordDecision,
       verification: buildVerificationPayload({
         status: "verified",
@@ -380,6 +573,8 @@ const validateMedicalDocumentContent = async ({
       return {
         allow: true,
         reason: "ai_medical_allow",
+        normalizedText,
+        classificationText: aiSample || normalizedText || metadataText,
         keywordDecision,
         aiDecision,
         verification: buildVerificationPayload({
@@ -398,6 +593,8 @@ const validateMedicalDocumentContent = async ({
     allow: false,
     reason: "non_medical_reject",
     message: DOCUMENT_REJECT_MESSAGE,
+    normalizedText,
+    classificationText: aiSample || normalizedText || metadataText,
     keywordDecision,
     verification: buildVerificationPayload({
       status: "rejected",
@@ -709,20 +906,10 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
 
     const { title, category, date, notes, userId } = req.body;
 
-    const validCategories = ["Report", "Prescription", "Bill", "Insurance"];
-    let chosenCategory = "Report"; // Default
-
-    // Normalize the category to match valid categories
-    const normalizedCategory = String(category || "").toLowerCase().trim();
-    if (normalizedCategory.includes("report")) {
-      chosenCategory = "Report";
-    } else if (normalizedCategory.includes("prescription")) {
-      chosenCategory = "Prescription";
-    } else if (normalizedCategory.includes("bill")) {
-      chosenCategory = "Bill";
-    } else if (normalizedCategory.includes("insurance")) {
-      chosenCategory = "Insurance";
-    }
+    const requestedCategory = normalizeDocumentCategory(category);
+    const categoryWasProvided = Boolean(requestedCategory);
+    let chosenCategory = requestedCategory;
+    let categoryDetectionMethod = categoryWasProvided ? "manual" : "ai";
 
     // ✅ Store S3 information
     const usingS3Storage = req.documentUploadStorage !== "local";
@@ -827,7 +1014,7 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
       localFilePath,
       mimeType: req.file.mimetype,
       title,
-      category: chosenCategory,
+      category: categoryWasProvided ? chosenCategory : "",
       originalName: req.file.originalname,
     });
 
@@ -856,6 +1043,20 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
         reason: "The file passed upload validation.",
         confidence: "unknown",
       });
+
+    if (!categoryWasProvided) {
+      const categoryDecision = await classifyDocumentCategoryWithAI({
+        title,
+        notes,
+        originalName: req.file.originalname,
+        normalizedText:
+          validationResult.classificationText ||
+          validationResult.normalizedText ||
+          "",
+      });
+      chosenCategory = categoryDecision.category || "Report";
+      categoryDetectionMethod = categoryDecision.method || "heuristic";
+    }
 
     let uploadDate = new Date(); // Default to current time
     if (date && date.trim() !== '') {
@@ -958,6 +1159,8 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
       statusCode: 200,
       metadata: {
         category: chosenCategory,
+        categoryAutoDetected: !categoryWasProvided,
+        categoryDetectionMethod,
         mimeType: req.file.mimetype,
         medicalVerificationStatus: medicalVerification.status,
         medicalVerificationMethod: medicalVerification.method,
@@ -971,6 +1174,8 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
           ? "Medical document verified and uploaded"
           : "Document uploaded and accepted for your medical vault",
       medicalVerification,
+      categoryAutoDetected: !categoryWasProvided,
+      categoryDetectionMethod,
       document: doc,
     });
   } catch (err) {
