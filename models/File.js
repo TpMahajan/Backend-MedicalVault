@@ -44,6 +44,35 @@ const fileSchema = new mongoose.Schema(
     // ✅ Add url field for frontend compatibility (will be signed URL)
     url: { type: String }, // This will be set to signed URL in responses
 
+    // Medical document verification
+    medicalVerified: { type: Boolean, default: false },
+    medicalVerification: {
+      status: {
+        type: String,
+        enum: ["verified", "accepted", "pending", "rejected"],
+        default: "pending",
+      },
+      label: {
+        type: String,
+        enum: ["MEDICAL", "NON_MEDICAL", "UNKNOWN"],
+        default: "UNKNOWN",
+      },
+      method: {
+        type: String,
+        enum: ["keyword", "ai", "metadata", "inconclusive", "security"],
+        default: "inconclusive",
+      },
+      reason: { type: String, default: "" },
+      confidence: {
+        type: String,
+        enum: ["high", "medium", "low", "unknown"],
+        default: "unknown",
+      },
+      checkedAt: { type: Date },
+      keywordHits: { type: Number, default: 0 },
+      matchedKeywords: [{ type: String }],
+    },
+
     // Dates
     date: { type: String },
     uploadedAt: { type: Date, default: Date.now },

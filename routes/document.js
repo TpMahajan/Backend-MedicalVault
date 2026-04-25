@@ -35,6 +35,8 @@ const DOCUMENT_REJECT_MESSAGE =
   "Only medical-related documents are allowed. Please upload valid reports, prescriptions, or health records.";
 const MIN_MEDICAL_TEXT_LENGTH = 40;
 const MAX_AI_CLASSIFIER_CHARS = 800;
+const ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS =
+  String(process.env.ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS || "true").toLowerCase() !== "false";
 const allowedMimeTypes = new Set([
   "application/pdf",
   "image/jpeg",
@@ -70,6 +72,10 @@ const medicalKeywords = [
   "medicine",
   "lab",
   "clinic",
+  "insurance",
+  "bill",
+  "invoice",
+  "claim",
 ];
 
 const highSignalMedicalPhrases = [
@@ -82,6 +88,10 @@ const highSignalMedicalPhrases = [
   "ct scan",
   "prescription",
   "patient name",
+  "hospital bill",
+  "medical bill",
+  "health insurance",
+  "insurance claim",
 ];
 
 const isRole = (req, role) => String(req.auth?.role || "").toLowerCase() === role;
@@ -141,6 +151,24 @@ const normalizeExtractedText = (value) =>
     .replace(/[^\x20-\x7E]+/g, " ")
     .trim()
     .toLowerCase();
+
+const buildVerificationPayload = ({
+  status = "pending",
+  label = "UNKNOWN",
+  method = "inconclusive",
+  reason = "",
+  confidence = "unknown",
+  keywordDecision = null,
+} = {}) => ({
+  status,
+  label,
+  method,
+  reason,
+  confidence,
+  checkedAt: new Date(),
+  keywordHits: keywordDecision?.keywordHits || 0,
+  matchedKeywords: keywordDecision?.matched || [],
+});
 
 const evaluateMedicalKeywordConfidence = (normalizedText) => {
   if (!normalizedText) {
@@ -254,6 +282,9 @@ const validateMedicalDocumentContent = async ({
   s3Bucket,
   localFilePath,
   mimeType,
+  title,
+  category,
+  originalName,
 }) => {
   const extracted = await extractTextForMedicalValidation({
     usingS3Storage,
@@ -264,12 +295,63 @@ const validateMedicalDocumentContent = async ({
   });
 
   const normalizedText = normalizeExtractedText(extracted?.text || "");
+  const metadataText = normalizeExtractedText(
+    [title, category, originalName].filter(Boolean).join(" ")
+  );
+  const aiSample = normalizeExtractedText([normalizedText, metadataText].join(" "));
   if (!extracted?.success || normalizedText.length < MIN_MEDICAL_TEXT_LENGTH) {
+    const metadataDecision = evaluateMedicalKeywordConfidence(metadataText);
+    if (metadataText) {
+      const aiDecision = await classifyMedicalTextWithAI(aiSample || metadataText);
+      if (aiDecision.success && aiDecision.label === "MEDICAL") {
+        return {
+          allow: true,
+          reason: "ai_metadata_medical_allow",
+          aiDecision,
+          verification: buildVerificationPayload({
+            status: "verified",
+            label: "MEDICAL",
+            method: "ai",
+            reason: "AI classified the document metadata as medical.",
+            confidence: "medium",
+            keywordDecision: metadataDecision,
+          }),
+        };
+      }
+    }
+
+    if (
+      ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS &&
+      (metadataDecision.level === "strong" || metadataDecision.level === "weak")
+    ) {
+      return {
+        allow: true,
+        reason: "metadata_medical_accept",
+        keywordDecision: metadataDecision,
+        verification: buildVerificationPayload({
+          status: "accepted",
+          label: "MEDICAL",
+          method: "metadata",
+          reason:
+            "The file passed security checks and matches medical document metadata, but readable text was limited.",
+          confidence: metadataDecision.level === "strong" ? "medium" : "low",
+          keywordDecision: metadataDecision,
+        }),
+      };
+    }
+
     return {
       allow: false,
       reason: "insufficient_text",
       message: `${DOCUMENT_REJECT_MESSAGE} Upload a clearer and complete medical document.`,
       normalizedText,
+      verification: buildVerificationPayload({
+        status: "rejected",
+        label: "UNKNOWN",
+        method: "inconclusive",
+        reason: "Could not extract enough readable text to verify the document.",
+        confidence: "low",
+      }),
     };
   }
 
@@ -279,17 +361,33 @@ const validateMedicalDocumentContent = async ({
       allow: true,
       reason: "keyword_strong_allow",
       keywordDecision,
+      verification: buildVerificationPayload({
+        status: "verified",
+        label: "MEDICAL",
+        method: "keyword",
+        reason: "Medical terms were found in the document text.",
+        confidence: "high",
+        keywordDecision,
+      }),
     };
   }
 
   if (keywordDecision.level === "weak" || keywordDecision.level === "none") {
-    const aiDecision = await classifyMedicalTextWithAI(normalizedText);
+    const aiDecision = await classifyMedicalTextWithAI(aiSample || normalizedText);
     if (aiDecision.success && aiDecision.label === "MEDICAL") {
       return {
         allow: true,
         reason: "ai_medical_allow",
         keywordDecision,
         aiDecision,
+        verification: buildVerificationPayload({
+          status: "verified",
+          label: "MEDICAL",
+          method: "ai",
+          reason: "AI classified the document as medical.",
+          confidence: "medium",
+          keywordDecision,
+        }),
       };
     }
   }
@@ -299,6 +397,14 @@ const validateMedicalDocumentContent = async ({
     reason: "non_medical_reject",
     message: DOCUMENT_REJECT_MESSAGE,
     keywordDecision,
+    verification: buildVerificationPayload({
+      status: "rejected",
+      label: "NON_MEDICAL",
+      method: "ai",
+      reason: "The document did not look like a medical record.",
+      confidence: "medium",
+      keywordDecision,
+    }),
   };
 };
 
@@ -570,8 +676,11 @@ const singleDocumentUpload = (req, res, next) => {
           return next();
         }
 
-        const statusCode = err?.code === "LIMIT_FILE_SIZE" ? 400 : 500;
         const message = err?.message || "Upload failed";
+        const statusCode =
+          err?.code === "LIMIT_FILE_SIZE" || /unsupported file/i.test(message)
+            ? 400
+            : 500;
         console.error("Document upload middleware error:", err);
         return res.status(statusCode).json({
           success: false,
@@ -715,6 +824,9 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
       s3Bucket,
       localFilePath,
       mimeType: req.file.mimetype,
+      title,
+      category: chosenCategory,
+      originalName: req.file.originalname,
     });
 
     if (!validationResult.allow) {
@@ -729,8 +841,19 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
         success: false,
         code: "DOCUMENT_NOT_MEDICAL",
         msg: validationResult.message || DOCUMENT_REJECT_MESSAGE,
+        medicalVerification: validationResult.verification,
       });
     }
+
+    const medicalVerification =
+      validationResult.verification ||
+      buildVerificationPayload({
+        status: "accepted",
+        label: "MEDICAL",
+        method: "inconclusive",
+        reason: "The file passed upload validation.",
+        confidence: "unknown",
+      });
 
     let uploadDate = new Date(); // Default to current time
     if (date && date.trim() !== '') {
@@ -761,6 +884,10 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
       s3Region: REGION,
       url: storedUrl,
       uploadedAt: uploadDate,
+      medicalVerified:
+        medicalVerification.status === "verified" &&
+        medicalVerification.label === "MEDICAL",
+      medicalVerification,
     });
 
     // ✅ Link the document to the target user's medicalRecords array
@@ -827,10 +954,23 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
       resourceId: doc._id?.toString(),
       patientId: targetUserId,
       statusCode: 200,
-      metadata: { category: chosenCategory, mimeType: req.file.mimetype },
+      metadata: {
+        category: chosenCategory,
+        mimeType: req.file.mimetype,
+        medicalVerificationStatus: medicalVerification.status,
+        medicalVerificationMethod: medicalVerification.method,
+      },
     });
 
-    res.json({ success: true, document: doc });
+    res.json({
+      success: true,
+      msg:
+        medicalVerification.status === "verified"
+          ? "Medical document verified and uploaded"
+          : "Document uploaded and accepted for your medical vault",
+      medicalVerification,
+      document: doc,
+    });
   } catch (err) {
     res.status(500).json({ msg: "Upload failed", error: err.message });
   }
@@ -1126,7 +1266,9 @@ router.get("/:id/preview", auth, checkSession, async (req, res) => {
     const localFilePath = resolveLocalDocumentPath(doc);
     let previewUrl;
     if (localFilePath) {
-      previewUrl = buildProxyUrl(req, doc._id.toString(), "inline");
+      previewUrl =
+        resolveStoredDocumentUrl(req, doc) ||
+        buildProxyUrl(req, doc._id.toString(), "inline");
     } else {
       try {
         previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket, doc.mimeType);
