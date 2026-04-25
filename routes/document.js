@@ -35,6 +35,7 @@ const DOCUMENT_REJECT_MESSAGE =
   "Only medical-related documents are allowed. Please upload valid reports, prescriptions, or health records.";
 const MIN_MEDICAL_TEXT_LENGTH = 40;
 const MAX_AI_CLASSIFIER_CHARS = 800;
+const DEFAULT_CLASSIFIER_TIMEOUT_MS = 6000;
 const ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS =
   String(process.env.ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS || "true").toLowerCase() !== "false";
 const allowedMimeTypes = new Set([
@@ -226,7 +227,10 @@ const classifyMedicalTextWithAI = async (normalizedText) => {
           Authorization: `Bearer ${OPENAI_API_KEY}`,
           "Content-Type": "application/json",
         },
-        timeout: Number(process.env.DOCUMENT_CLASSIFIER_TIMEOUT_MS || 12000),
+        timeout: Number(
+          process.env.DOCUMENT_CLASSIFIER_TIMEOUT_MS ||
+            DEFAULT_CLASSIFIER_TIMEOUT_MS
+        ),
       }
     );
 
@@ -286,6 +290,27 @@ const validateMedicalDocumentContent = async ({
   category,
   originalName,
 }) => {
+  const metadataText = normalizeExtractedText(
+    [title, category, originalName].filter(Boolean).join(" ")
+  );
+  const metadataDecision = evaluateMedicalKeywordConfidence(metadataText);
+  if (ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS && metadataDecision.level === "strong") {
+    return {
+      allow: true,
+      reason: "metadata_strong_fast_accept",
+      keywordDecision: metadataDecision,
+      verification: buildVerificationPayload({
+        status: "accepted",
+        label: "MEDICAL",
+        method: "metadata",
+        reason:
+          "The file passed security checks and has strong medical document metadata.",
+        confidence: "medium",
+        keywordDecision: metadataDecision,
+      }),
+    };
+  }
+
   const extracted = await extractTextForMedicalValidation({
     usingS3Storage,
     s3Key,
@@ -295,34 +320,11 @@ const validateMedicalDocumentContent = async ({
   });
 
   const normalizedText = normalizeExtractedText(extracted?.text || "");
-  const metadataText = normalizeExtractedText(
-    [title, category, originalName].filter(Boolean).join(" ")
-  );
   const aiSample = normalizeExtractedText([normalizedText, metadataText].join(" "));
   if (!extracted?.success || normalizedText.length < MIN_MEDICAL_TEXT_LENGTH) {
-    const metadataDecision = evaluateMedicalKeywordConfidence(metadataText);
-    if (metadataText) {
-      const aiDecision = await classifyMedicalTextWithAI(aiSample || metadataText);
-      if (aiDecision.success && aiDecision.label === "MEDICAL") {
-        return {
-          allow: true,
-          reason: "ai_metadata_medical_allow",
-          aiDecision,
-          verification: buildVerificationPayload({
-            status: "verified",
-            label: "MEDICAL",
-            method: "ai",
-            reason: "AI classified the document metadata as medical.",
-            confidence: "medium",
-            keywordDecision: metadataDecision,
-          }),
-        };
-      }
-    }
-
     if (
       ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS &&
-      (metadataDecision.level === "strong" || metadataDecision.level === "weak")
+      metadataDecision.level === "weak"
     ) {
       return {
         allow: true,
