@@ -1,8 +1,8 @@
 {
-    "latestVersion":  "1.0.17",
-    "minimumSupportedVersion":  "1.0.14",
+    "latestVersion":  "1.0.18",
+    "minimumSupportedVersion":  "1.0.17",
     "apkUrl":  "",
     "releaseNotes":  "Product page added \nNow user can view nearby ambulances , hospitals , etc \nPerformance Improvements",
-    "sha256":  "c47fc81f4ce3b46de728ce40c5a7e72f5448d7cd7c1239c67d5bba4607a559a2",
+    "sha256":  "7dd8c6260c02cdf115f23f6f2c633272b9809c158eb076110d44995268e1d040",
     "checksum":  "934d2b368cf9143704ce18b33c01593699fe920c246e2b00fede7b6ff0cef843"
 }
