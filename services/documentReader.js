@@ -18,6 +18,8 @@ class DocumentReader {
       text: ['txt', 'md'],
       docx: ['docx', 'doc']
     };
+    this.ocrWorkerPromises = new Map();
+    this.ocrQueues = new Map();
   }
 
   /**
@@ -26,7 +28,7 @@ class DocumentReader {
    * @param {string} bucketName - The S3 bucket name
    * @returns {Promise<Object>} - Extracted text and metadata
    */
-  async extractTextFromS3(s3Key, bucketName) {
+  async extractTextFromS3(s3Key, bucketName, options = {}) {
     let tempFilePath = null;
     
     try {
@@ -52,7 +54,9 @@ class DocumentReader {
       if (this.supportedTypes.pdf.includes(fileExtension)) {
         console.log(`📖 Extracting text from PDF...`);
         try {
-          const result = await this.extractFromPDF(tempFilePath);
+          const result = await this.extractFromPDF(tempFilePath, {
+            parseParams: options.pdfParseParams,
+          });
           extractedText = result.text;
           metadata = { ...metadata, ...result.metadata };
           console.log(`✅ PDF extraction completed. Text length: ${extractedText.length}`);
@@ -69,7 +73,10 @@ class DocumentReader {
         }
       } else if (this.supportedTypes.image.includes(fileExtension)) {
         console.log(`🖼️ Extracting text from image using OCR...`);
-        const result = await this.extractFromImage(tempFilePath);
+        const result = await this.extractFromImage(
+          tempFilePath,
+          options.imageOcrOptions
+        );
         extractedText = result.text;
         metadata = { ...metadata, ...result.metadata };
         console.log(`✅ Image OCR completed. Text length: ${extractedText.length}`);
@@ -181,7 +188,7 @@ class DocumentReader {
   /**
    * Extract text from PDF file
    */
-  async extractFromPDF(filePath) {
+  async extractFromPDF(filePath, options = {}) {
     try {
       console.log(`📖 Starting PDF extraction for: ${filePath}`);
       
@@ -222,7 +229,11 @@ class DocumentReader {
       const pdfParser = new PDFParse({ data: dataBuffer });
       
       // Extract text from the document
-      const result = await pdfParser.getText();
+      const parseParams =
+        options.parseParams && typeof options.parseParams === 'object'
+          ? options.parseParams
+          : {};
+      const result = await pdfParser.getText(parseParams);
       
       // Clean up the parser
       await pdfParser.destroy();
@@ -244,7 +255,8 @@ class DocumentReader {
           pages: result.pages?.length || 0,
           info: result.info,
           version: result.version,
-          originalText: result.text || ''
+          originalText: result.text || '',
+          parseParams
         }
       };
     } catch (error) {
@@ -261,20 +273,60 @@ class DocumentReader {
   /**
    * Extract text from image file using OCR
    */
-  async extractFromImage(filePath) {
+  async _getOcrWorker(languages) {
+    const normalizedLanguages = String(languages || 'eng+hin').trim() || 'eng+hin';
+    if (!this.ocrWorkerPromises.has(normalizedLanguages)) {
+      this.ocrWorkerPromises.set(
+        normalizedLanguages,
+        createWorker(normalizedLanguages)
+      );
+    }
+    return this.ocrWorkerPromises.get(normalizedLanguages);
+  }
+
+  async _resetOcrWorker(languages) {
+    const normalizedLanguages = String(languages || 'eng+hin').trim() || 'eng+hin';
+    const workerPromise = this.ocrWorkerPromises.get(normalizedLanguages);
+    this.ocrWorkerPromises.delete(normalizedLanguages);
+    if (!workerPromise) return;
+
     try {
-      const worker = await createWorker('eng+hin'); // English and Hindi support
-      const { data: { text } } = await worker.recognize(filePath);
+      const worker = await workerPromise;
       await worker.terminate();
+    } catch (error) {
+      console.warn('Failed to reset OCR worker:', error.message);
+    }
+  }
+
+  async _withOcrWorker(languages, task) {
+    const normalizedLanguages = String(languages || 'eng+hin').trim() || 'eng+hin';
+    const previous = this.ocrQueues.get(normalizedLanguages) || Promise.resolve();
+    const run = previous
+      .catch(() => {})
+      .then(async () => task(await this._getOcrWorker(normalizedLanguages)));
+
+    this.ocrQueues.set(normalizedLanguages, run.catch(() => {}));
+    return run;
+  }
+
+  async extractFromImage(filePath, options = {}) {
+    const languages = String(options?.languages || 'eng+hin').trim() || 'eng+hin';
+    try {
+      const { data: { text } } = await this._withOcrWorker(
+        languages,
+        (worker) => worker.recognize(filePath, options?.recognizeOptions || {})
+      );
 
       return {
         text: text.trim(),
         metadata: {
           ocrEngine: 'Tesseract.js',
-          languages: ['eng', 'hin']
+          languages: languages.split('+').map((language) => language.trim()),
+          reusedWorker: true
         }
       };
     } catch (error) {
+      await this._resetOcrWorker(languages);
       throw new Error(`Image OCR failed: ${error.message}`);
     }
   }

@@ -38,11 +38,23 @@ const DOCUMENT_CATEGORY_CLASSIFIER_MODEL = String(
 ).trim();
 const DOCUMENT_REJECT_MESSAGE =
   "Only medical-related documents are allowed. Please upload valid reports, prescriptions, or health records.";
+const parsePositiveInteger = (value, fallback) => {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
 const MIN_MEDICAL_TEXT_LENGTH = 40;
 const MAX_AI_CLASSIFIER_CHARS = 800;
 const MAX_AI_CATEGORY_CHARS = 350;
-const DEFAULT_CLASSIFIER_TIMEOUT_MS = 6000;
+const DEFAULT_CLASSIFIER_TIMEOUT_MS = 2500;
 const DEFAULT_CATEGORY_CLASSIFIER_TIMEOUT_MS = 3000;
+const DEFAULT_VALIDATION_PDF_PAGES = 2;
+const VALIDATION_PDF_PAGES = parsePositiveInteger(
+  process.env.DOCUMENT_VALIDATION_PDF_PAGES,
+  DEFAULT_VALIDATION_PDF_PAGES
+);
+const VALIDATION_OCR_LANGUAGES = String(
+  process.env.DOCUMENT_VALIDATION_OCR_LANGUAGES || "eng+hin"
+).trim();
 const ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS =
   String(process.env.ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS || "false").toLowerCase() === "true";
 const validDocumentCategories = ["Report", "Prescription", "Bill", "Insurance"];
@@ -139,7 +151,6 @@ const highSignalMedicalPhrases = [
   "ultrasound",
   "prescription",
   "prescribed by",
-  "patient name",
   "hospital bill",
   "medical bill",
   "doctor bill",
@@ -527,7 +538,10 @@ const extractTextForMedicalValidation = async ({
   mimeType,
 }) => {
   if (usingS3Storage && s3Key && s3Bucket) {
-    const extracted = await documentReader.extractTextFromS3(s3Key, s3Bucket);
+    const extracted = await documentReader.extractTextFromS3(s3Key, s3Bucket, {
+      pdfParseParams: { first: VALIDATION_PDF_PAGES },
+      imageOcrOptions: { languages: VALIDATION_OCR_LANGUAGES },
+    });
     if (!extracted?.success) {
       return { success: false, text: "", reason: extracted?.error || "s3_extract_failed" };
     }
@@ -540,11 +554,15 @@ const extractTextForMedicalValidation = async ({
 
   try {
     if (String(mimeType || "").toLowerCase() === "application/pdf") {
-      const extracted = await documentReader.extractFromPDF(localFilePath);
+      const extracted = await documentReader.extractFromPDF(localFilePath, {
+        parseParams: { first: VALIDATION_PDF_PAGES },
+      });
       return { success: true, text: extracted?.text || "" };
     }
 
-    const extracted = await documentReader.extractFromImage(localFilePath);
+    const extracted = await documentReader.extractFromImage(localFilePath, {
+      languages: VALIDATION_OCR_LANGUAGES,
+    });
     return { success: true, text: extracted?.text || "" };
   } catch (error) {
     return { success: false, text: "", reason: error.message || "local_extract_failed" };
@@ -638,7 +656,9 @@ const validateMedicalDocumentContent = async ({
   }
 
   let aiDecision = null;
-  if (keywordDecision.level === "weak" || keywordDecision.level === "none") {
+  const shouldUseAiClassifier =
+    keywordDecision.level === "weak" && (keywordDecision.clinicalHits || 0) > 0;
+  if (shouldUseAiClassifier) {
     aiDecision = await classifyMedicalTextWithAI(normalizedText);
     if (aiDecision.success && aiDecision.label === "MEDICAL") {
       return {
