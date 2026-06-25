@@ -44,7 +44,7 @@ const MAX_AI_CATEGORY_CHARS = 350;
 const DEFAULT_CLASSIFIER_TIMEOUT_MS = 6000;
 const DEFAULT_CATEGORY_CLASSIFIER_TIMEOUT_MS = 3000;
 const ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS =
-  String(process.env.ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS || "true").toLowerCase() !== "false";
+  String(process.env.ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS || "false").toLowerCase() === "true";
 const validDocumentCategories = ["Report", "Prescription", "Bill", "Insurance"];
 const allowedMimeTypes = new Set([
   "application/pdf",
@@ -64,43 +64,91 @@ const validateUploadFilename = (name = "") => {
 const isValidObjectId = (value) => /^[a-fA-F0-9]{24}$/.test(String(value || ""));
 const documentReader = new DocumentReader();
 
-const medicalKeywords = [
+const clinicalMedicalKeywords = [
   "prescription",
   "diagnosis",
   "doctor",
   "hospital",
   "blood test",
-  "report",
   "x-ray",
   "xray",
   "mri",
   "ct scan",
-  "patient name",
-  "patient",
   "medication",
   "medicine",
   "lab",
+  "laboratory",
   "clinic",
+  "dosage",
+  "dose",
+  "tablet",
+  "capsule",
+  "syrup",
+  "injection",
+  "radiology",
+  "pathology",
+  "hemoglobin",
+  "wbc",
+  "rbc",
+  "platelet",
+  "glucose",
+  "creatinine",
+  "cholesterol",
+  "blood pressure",
+  "bp",
+  "ecg",
+  "ekg",
+  "rx",
+  "discharge",
+  "admission",
+  "opd",
+  "ipd",
+  "symptoms",
+  "treatment",
+];
+
+const supportingMedicalDocumentKeywords = [
+  "patient name",
+  "patient",
+  "report",
+  "test",
+  "result",
   "insurance",
   "bill",
   "invoice",
   "claim",
+  "receipt",
+  "policy",
+  "charges",
+  "paid",
 ];
 
 const highSignalMedicalPhrases = [
   "medical report",
+  "lab report",
+  "laboratory report",
+  "pathology report",
   "radiology report",
+  "diagnostic report",
   "discharge summary",
   "blood test",
+  "blood report",
   "x-ray",
   "mri",
   "ct scan",
+  "ultrasound",
   "prescription",
+  "prescribed by",
   "patient name",
   "hospital bill",
   "medical bill",
+  "doctor bill",
+  "clinic bill",
   "health insurance",
-  "insurance claim",
+  "medical insurance",
+  "mediclaim",
+  "medical claim",
+  "hospital claim",
 ];
 
 const isRole = (req, role) => String(req.auth?.role || "").toLowerCase() === role;
@@ -161,6 +209,22 @@ const normalizeExtractedText = (value) =>
     .trim()
     .toLowerCase();
 
+const escapeRegex = (value) =>
+  String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const hasMedicalTerm = (normalizedText, term) => {
+  const normalizedTerm = normalizeExtractedText(term);
+  if (!normalizedText || !normalizedTerm) return false;
+  if (normalizedTerm.includes(" ")) {
+    return normalizedText.includes(normalizedTerm);
+  }
+
+  const termPattern = new RegExp(
+    `(^|[^a-z0-9])${escapeRegex(normalizedTerm)}([^a-z0-9]|$)`
+  );
+  return termPattern.test(normalizedText);
+};
+
 const buildVerificationPayload = ({
   status = "pending",
   label = "UNKNOWN",
@@ -184,19 +248,40 @@ const evaluateMedicalKeywordConfidence = (normalizedText) => {
     return { level: "none", keywordHits: 0, highSignal: false, matched: [] };
   }
 
-  const matchedKeywords = medicalKeywords.filter((keyword) =>
-    normalizedText.includes(keyword)
+  const matchedHighSignal = highSignalMedicalPhrases.filter((phrase) =>
+    hasMedicalTerm(normalizedText, phrase)
   );
-  const highSignal = highSignalMedicalPhrases.some((phrase) =>
-    normalizedText.includes(phrase)
+  const matchedClinical = clinicalMedicalKeywords.filter((keyword) =>
+    hasMedicalTerm(normalizedText, keyword)
   );
+  const matchedSupporting = supportingMedicalDocumentKeywords.filter((keyword) =>
+    hasMedicalTerm(normalizedText, keyword)
+  );
+  const matchedKeywords = [
+    ...new Set([
+      ...matchedHighSignal,
+      ...matchedClinical,
+      ...matchedSupporting,
+    ]),
+  ];
+  const highSignal = matchedHighSignal.length > 0;
+  const clinicalHits = matchedClinical.length;
+  const supportingHits = matchedSupporting.length;
   const keywordHits = matchedKeywords.length;
-  const level = highSignal || keywordHits >= 2 ? "strong" : keywordHits === 1 ? "weak" : "none";
+
+  const level =
+    highSignal || clinicalHits >= 2 || (clinicalHits >= 1 && supportingHits >= 1)
+      ? "strong"
+      : clinicalHits === 1 || supportingHits >= 2
+        ? "weak"
+        : "none";
 
   return {
     level,
     keywordHits,
     highSignal,
+    clinicalHits,
+    supportingHits,
     matched: matchedKeywords.slice(0, 12),
   };
 };
@@ -473,31 +558,13 @@ const validateMedicalDocumentContent = async ({
   localFilePath,
   mimeType,
   title,
-  category,
   originalName,
 }) => {
+  // User-entered labels can help later categorization, but they cannot prove
+  // the uploaded file itself is medical.
   const metadataText = normalizeExtractedText(
-    [title, category, originalName].filter(Boolean).join(" ")
+    [title, originalName].filter(Boolean).join(" ")
   );
-  const metadataDecision = evaluateMedicalKeywordConfidence(metadataText);
-  if (ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS && metadataDecision.level === "strong") {
-    return {
-      allow: true,
-      reason: "metadata_strong_fast_accept",
-      normalizedText: "",
-      classificationText: metadataText,
-      keywordDecision: metadataDecision,
-      verification: buildVerificationPayload({
-        status: "accepted",
-        label: "MEDICAL",
-        method: "metadata",
-        reason:
-          "The file passed security checks and has strong medical document metadata.",
-        confidence: "medium",
-        keywordDecision: metadataDecision,
-      }),
-    };
-  }
 
   const extracted = await extractTextForMedicalValidation({
     usingS3Storage,
@@ -508,26 +575,29 @@ const validateMedicalDocumentContent = async ({
   });
 
   const normalizedText = normalizeExtractedText(extracted?.text || "");
-  const aiSample = normalizeExtractedText([normalizedText, metadataText].join(" "));
+  const classificationText = normalizeExtractedText(
+    [normalizedText, metadataText].filter(Boolean).join(" ")
+  );
   if (!extracted?.success || normalizedText.length < MIN_MEDICAL_TEXT_LENGTH) {
+    const partialKeywordDecision = evaluateMedicalKeywordConfidence(normalizedText);
     if (
       ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS &&
-      metadataDecision.level === "weak"
+      partialKeywordDecision.level === "strong"
     ) {
       return {
         allow: true,
-        reason: "metadata_medical_accept",
+        reason: "partial_keyword_medical_accept",
         normalizedText,
-        classificationText: aiSample || metadataText,
-        keywordDecision: metadataDecision,
+        classificationText: classificationText || normalizedText,
+        keywordDecision: partialKeywordDecision,
         verification: buildVerificationPayload({
           status: "accepted",
           label: "MEDICAL",
-          method: "metadata",
+          method: "keyword",
           reason:
-            "The file passed security checks and matches medical document metadata, but readable text was limited.",
-          confidence: metadataDecision.level === "strong" ? "medium" : "low",
-          keywordDecision: metadataDecision,
+            "Readable text was limited, but the extracted content contained strong medical terms.",
+          confidence: "low",
+          keywordDecision: partialKeywordDecision,
         }),
       };
     }
@@ -537,7 +607,7 @@ const validateMedicalDocumentContent = async ({
       reason: "insufficient_text",
       message: `${DOCUMENT_REJECT_MESSAGE} Upload a clearer and complete medical document.`,
       normalizedText,
-      classificationText: aiSample || metadataText,
+      classificationText: classificationText || metadataText,
       verification: buildVerificationPayload({
         status: "rejected",
         label: "UNKNOWN",
@@ -554,7 +624,7 @@ const validateMedicalDocumentContent = async ({
       allow: true,
       reason: "keyword_strong_allow",
       normalizedText,
-      classificationText: aiSample || normalizedText || metadataText,
+      classificationText: classificationText || normalizedText || metadataText,
       keywordDecision,
       verification: buildVerificationPayload({
         status: "verified",
@@ -567,14 +637,15 @@ const validateMedicalDocumentContent = async ({
     };
   }
 
+  let aiDecision = null;
   if (keywordDecision.level === "weak" || keywordDecision.level === "none") {
-    const aiDecision = await classifyMedicalTextWithAI(aiSample || normalizedText);
+    aiDecision = await classifyMedicalTextWithAI(normalizedText);
     if (aiDecision.success && aiDecision.label === "MEDICAL") {
       return {
         allow: true,
         reason: "ai_medical_allow",
         normalizedText,
-        classificationText: aiSample || normalizedText || metadataText,
+        classificationText: classificationText || normalizedText || metadataText,
         keywordDecision,
         aiDecision,
         verification: buildVerificationPayload({
@@ -594,14 +665,17 @@ const validateMedicalDocumentContent = async ({
     reason: "non_medical_reject",
     message: DOCUMENT_REJECT_MESSAGE,
     normalizedText,
-    classificationText: aiSample || normalizedText || metadataText,
+    classificationText: classificationText || normalizedText || metadataText,
     keywordDecision,
+    aiDecision,
     verification: buildVerificationPayload({
       status: "rejected",
       label: "NON_MEDICAL",
-      method: "ai",
-      reason: "The document did not look like a medical record.",
-      confidence: "medium",
+      method: aiDecision?.success ? "ai" : "keyword",
+      reason: aiDecision?.success
+        ? "AI classified the document as non-medical."
+        : "The document text did not contain reliable medical evidence.",
+      confidence: aiDecision?.success ? "medium" : "low",
       keywordDecision,
     }),
   };
@@ -1014,7 +1088,6 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
       localFilePath,
       mimeType: req.file.mimetype,
       title,
-      category: categoryWasProvided ? chosenCategory : "",
       originalName: req.file.originalname,
     });
 
