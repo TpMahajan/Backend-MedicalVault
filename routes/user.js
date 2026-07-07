@@ -2,6 +2,7 @@
 import {
   updateProfile,
   updateFCMToken,
+  updateUserLocation,
   getUserProfile,
   deleteAccount,
   getMedicalCard,
@@ -28,6 +29,9 @@ router.get('/all-patients', auth, checkRole('doctor', 'admin', 'superadmin'), ge
 
 // @route   PUT /api/users/fcm-token
 router.put('/fcm-token', auth, fcmLimiter, fcmTokenValidation, updateFCMToken);
+
+// @route   PUT /api/users/location  (opt-in last known location for nearby alerts)
+router.put('/location', auth, updateUserLocation);
 
 // @route   GET /api/users/:id/medical-card
 router.get(

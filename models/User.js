@@ -2,6 +2,15 @@ import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
 import { decryptField, encryptField } from "../utils/fieldEncryption.js";
 
+// GeoJSON Point sub-schema (avoids the "type" keyword collision when nested).
+const GeoPointSchema = new mongoose.Schema(
+  {
+    type: { type: String, enum: ["Point"], default: "Point" },
+    coordinates: { type: [Number], required: true }, // [lng, lat]
+  },
+  { _id: false },
+);
+
 const UserSchema = new mongoose.Schema(
   {
     // 🔹 Signup/Login fields
@@ -95,6 +104,16 @@ const UserSchema = new mongoose.Schema(
 
     medicalRecords: [{ type: mongoose.Schema.Types.ObjectId, ref: "Document" }],
 
+    // 🔹 Location (opt-in, for nearby lost-person alerts). GeoJSON Point [lng, lat].
+    // Absent unless the user explicitly shares location; 2dsphere v2 skips absent field.
+    lastKnownLocation: { type: GeoPointSchema, default: undefined },
+    lastKnownLocationAddress: { type: String, default: null },
+    lastKnownLocationUpdatedAt: { type: Date, default: null },
+    // User must explicitly opt in before location is used for nearby alerts.
+    locationSharingEnabled: { type: Boolean, default: false },
+    // Soft opt-out from lost-person alerts even if location sharing is on.
+    lostPersonAlertsOptOut: { type: Boolean, default: false },
+
     // 🔹 System fields
     fcmToken: { type: String, default: null },
     isActive: { type: Boolean, default: true },
@@ -150,6 +169,10 @@ UserSchema.pre("save", async function (next) {
     next(error);
   }
 });
+
+// 🌍 Geospatial index for nearby lost-person alerts (sparse: skips users
+// who have not shared a location).
+UserSchema.index({ lastKnownLocation: "2dsphere" });
 
 // 🔐 Compare password
 UserSchema.methods.comparePassword = async function (candidatePassword) {

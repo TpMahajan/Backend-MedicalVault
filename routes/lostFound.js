@@ -9,7 +9,12 @@ import {
   createLostReport,
   createFoundReport,
   getMyLostReports,
+  searchLostReports,
+  searchLostReportsByPhoto,
+  getLostReportDetail,
+  getLostReportNameSuggestions,
 } from "../controllers/lostFoundController.js";
+import { lostReportLimiter } from "../middleware/rateLimit.js";
 import s3Client, { BUCKET_NAME } from "../config/s3.js";
 import { generateSignedUrl } from "../utils/s3Utils.js";
 import { resolveUploadStorage } from "../services/uploadStoragePolicy.js";
@@ -94,6 +99,12 @@ const localPhotoUpload = multer({
   fileFilter,
 });
 
+const photoSearchUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter,
+});
+
 const singlePhotoUpload = (req, res, next) => {
   resolveUploadStorage("lost-found-upload")
     .then((storageMode) => {
@@ -122,9 +133,19 @@ const singlePhotoUpload = (req, res, next) => {
     });
 };
 
-router.post("/lost", auth, createLostReport);
-router.post("/found", auth, createFoundReport);
+router.post("/lost", auth, lostReportLimiter, createLostReport);
+router.post("/found", auth, lostReportLimiter, createFoundReport);
 router.get("/my-lost-reports", auth, getMyLostReports);
+// Search + detail (privacy-safe, open reports). Must precede any ":id" params.
+router.get("/name-suggestions", auth, getLostReportNameSuggestions);
+router.get("/search", auth, searchLostReports);
+router.post(
+  "/search-photo",
+  auth,
+  photoSearchUpload.single("photo"),
+  searchLostReportsByPhoto,
+);
+router.get("/lost/:id", auth, getLostReportDetail);
 
 router.post("/upload-photo", auth, singlePhotoUpload, async (req, res) => {
   try {

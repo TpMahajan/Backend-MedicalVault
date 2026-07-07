@@ -1109,6 +1109,81 @@ router.post("/logout", auth, async (req, res) => {
 });
 
 // ---------------- Auth Session Control ----------------
+// GET /api/auth/session/policy
+router.get("/session/policy", auth, async (req, res) => {
+  try {
+    const principalId = asText(req.auth?.id);
+    const role = lower(req.auth?.role);
+
+    if (!principalId || !["patient", "doctor", "admin", "superadmin"].includes(role)) {
+      return res.status(403).json({ success: false, message: "Access denied" });
+    }
+
+    if (role !== patientRole) {
+      return res.json({
+        success: true,
+        allowMultipleSessions: false,
+        readOnly: true,
+      });
+    }
+
+    const user = await User.findById(principalId)
+      .select("allowMultipleSessions")
+      .lean();
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.json({
+      success: true,
+      allowMultipleSessions: user.allowMultipleSessions === true,
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch session policy" });
+  }
+});
+
+// PUT/PATCH /api/auth/session/policy
+const updateSessionPolicyHandler = async (req, res) => {
+  try {
+    const principalId = asText(req.auth?.id);
+    const role = lower(req.auth?.role);
+    const allowMultipleSessions = req.body?.allowMultipleSessions === true;
+
+    if (role !== patientRole || !principalId) {
+      return res.status(403).json({
+        success: false,
+        message: "Patient access required",
+      });
+    }
+
+    const result = await User.findByIdAndUpdate(
+      principalId,
+      { $set: { allowMultipleSessions } },
+      { new: true, projection: "allowMultipleSessions" },
+    ).lean();
+
+    if (!result) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.json({
+      success: true,
+      allowMultipleSessions: result.allowMultipleSessions === true,
+      message: "Session policy updated",
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to update session policy" });
+  }
+};
+
+router.put("/session/policy", auth, updateSessionPolicyHandler);
+router.patch("/session/policy", auth, updateSessionPolicyHandler);
+
 // POST /api/auth/session/heartbeat
 router.post("/session/heartbeat", auth, async (req, res) => {
   try {

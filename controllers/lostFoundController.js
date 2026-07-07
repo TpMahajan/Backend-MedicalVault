@@ -5,6 +5,7 @@ import {
   matchFoundToLost,
   matchLostToFound,
 } from "../services/lostFoundMatcher.js";
+import { broadcastLostPersonAlert } from "../services/lostFoundBroadcast.js";
 import { generateSignedUrl } from "../utils/s3Utils.js";
 import { BUCKET_NAME } from "../config/s3.js";
 
@@ -91,7 +92,16 @@ export const createLostReport = async (req, res) => {
       pincode,
       landmark,
       lastSeenLocationText,
+      allowReporterContact,
+      publicContactName,
+      publicContactPhone,
     } = req.body;
+
+    const parseBoolean = (value) => {
+      if (typeof value === "boolean") return value;
+      const text = asText(value).toLowerCase();
+      return ["true", "1", "yes", "on"].includes(text);
+    };
 
     let resolvedPhotoUrl = photoUrl;
     let resolvedName = personName;
@@ -178,11 +188,22 @@ export const createLostReport = async (req, res) => {
       pincode: nonEmptyOrUndefined(pincode),
       landmark: nonEmptyOrUndefined(landmark),
       lastSeenLocationText: nonEmptyOrUndefined(lastSeenLocationText),
+      allowReporterContact: parseBoolean(allowReporterContact),
+      publicContactName: nonEmptyOrUndefined(publicContactName),
+      publicContactPhone: nonEmptyOrUndefined(publicContactPhone),
+      // Notification-safe image (already a signed/public URL when present).
+      notificationImageUrl: /^https?:\/\//i.test(asText(resolvedPhotoUrl))
+        ? asText(resolvedPhotoUrl)
+        : undefined,
     };
 
     const lostReport = await LostPersonReport.create(payload);
 
     runMatcherSoon("matchLostToFound", () => matchLostToFound(lostReport));
+    // Nearby 100km alert broadcast (async, non-blocking, idempotent).
+    runMatcherSoon("broadcastLostPersonAlert", () =>
+      broadcastLostPersonAlert(lostReport),
+    );
 
     res.status(201).json({
       success: true,
@@ -201,6 +222,7 @@ export const createLostReport = async (req, res) => {
 export const createFoundReport = async (req, res) => {
   try {
     const {
+      personName,
       approxAge,
       gender,
       description,
@@ -234,6 +256,7 @@ export const createFoundReport = async (req, res) => {
       currentLocation: location,
       foundTime: parsedFoundTime,
       currentHospitalId: currentHospitalId || null,
+      personName: nonEmptyOrUndefined(personName),
       approxAge: parseOptionalNumber(approxAge),
       gender: normalizeGender(gender),
       description: nonEmptyOrUndefined(description),
@@ -341,6 +364,316 @@ export const getMyLostReports = async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to fetch lost person reports",
+    });
+  }
+};
+
+const escapeRegex = (value) =>
+  String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Mask all but the last 3 digits: 98765 43210 -> ******3210 (kept short).
+const maskPhone = (value) => {
+  const digits = asText(value).replace(/\D/g, "");
+  if (!digits) return "";
+  if (digits.length <= 3) return "*".repeat(digits.length);
+  return `${"*".repeat(Math.max(2, digits.length - 3))}${digits.slice(-3)}`;
+};
+
+// Build a privacy-safe public view of a lost report. Never exposes reporter
+// phone/email, medical notes, identification details, or linked user ids.
+const toPublicLostReport = async (reportObj, { includeContact = false } = {}) => {
+  const allowContact = Boolean(reportObj.allowReporterContact);
+  const photoUrl = reportObj.photoUrl
+    ? await resolvePhotoUrl(reportObj.photoUrl)
+    : null;
+
+  const view = {
+    id: String(reportObj._id),
+    personName: reportObj.personName || null,
+    approxAge: reportObj.approxAge ?? null,
+    gender: reportObj.gender || "Unknown",
+    description: reportObj.description || null,
+    clothingDescription: reportObj.clothingDescription || null,
+    photoUrl,
+    lastSeenLocationText:
+      reportObj.lastSeenLocationText ||
+      [reportObj.area, reportObj.city, reportObj.state]
+        .filter(Boolean)
+        .join(", ") ||
+      null,
+    area: reportObj.area || null,
+    city: reportObj.city || null,
+    state: reportObj.state || null,
+    lastSeenLocation: reportObj.lastSeenLocation || null,
+    lastSeenTime: reportObj.lastSeenTime || null,
+    status: reportObj.status || "open",
+    createdAt: reportObj.createdAt || null,
+    allowReporterContact: allowContact,
+    contact: null,
+  };
+
+  if (allowContact) {
+    view.contact = {
+      name: reportObj.publicContactName || reportObj.reporterName || null,
+      // Masked by default; full number only on explicit detail request.
+      maskedPhone: maskPhone(reportObj.publicContactPhone),
+      phone:
+        includeContact && reportObj.publicContactPhone
+          ? reportObj.publicContactPhone
+          : null,
+    };
+  }
+
+  return view;
+};
+
+// @desc   Search open lost-person reports (privacy-safe)
+// @route  GET /api/lost-found/search
+// @access Private
+export const searchLostReports = async (req, res) => {
+  try {
+    const { q, age, gender, location, lat, lng, radiusKm, dateFrom, dateTo } =
+      req.query;
+
+    const query = { status: "open" };
+
+    const name = asText(q);
+    if (name) {
+      query.personName = { $regex: escapeRegex(name), $options: "i" };
+    }
+
+    const normalizedGender = normalizeGender(gender);
+    if (asText(gender) && normalizedGender !== "Unknown") {
+      query.gender = normalizedGender;
+    }
+
+    const approxAge = parseOptionalNumber(age);
+    if (approxAge !== undefined) {
+      query.approxAge = { $gte: approxAge - 5, $lte: approxAge + 5 };
+    }
+
+    const loc = asText(location);
+    if (loc) {
+      const locRegex = { $regex: escapeRegex(loc), $options: "i" };
+      query.$or = [
+        { lastSeenLocationText: locRegex },
+        { area: locRegex },
+        { city: locRegex },
+        { state: locRegex },
+      ];
+    }
+
+    const from = parseDateOrNull(dateFrom);
+    const to = parseDateOrNull(dateTo);
+    if (from || to) {
+      query.lastSeenTime = {};
+      if (from) query.lastSeenTime.$gte = from;
+      if (to) query.lastSeenTime.$lte = to;
+    }
+
+    const centerLng = parseCoordinate(lng);
+    const centerLat = parseCoordinate(lat);
+    const radius = parseOptionalNumber(radiusKm);
+    if (centerLng !== null && centerLat !== null) {
+      query.lastSeenLocation = {
+        $near: {
+          $geometry: { type: "Point", coordinates: [centerLng, centerLat] },
+          $maxDistance: Math.round((radius || 100) * 1000),
+        },
+      };
+    }
+
+    const reports = await LostPersonReport.find(query)
+      .sort(query.lastSeenLocation ? {} : { createdAt: -1 })
+      .limit(50)
+      .lean();
+
+    const results = await Promise.all(
+      reports.map((report) => toPublicLostReport(report)),
+    );
+
+    res.json({ success: true, data: { results, count: results.length } });
+  } catch (error) {
+    console.error("searchLostReports error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to search lost person reports",
+    });
+  }
+};
+
+// @desc   Lightweight name typeahead for open lost-person reports.
+// @route  GET /api/lost-found/name-suggestions?q=...
+// @access Private
+// Optimised: prefix (anchored) regex, name-only projection, deduped, capped.
+export const getLostReportNameSuggestions = async (req, res) => {
+  try {
+    const q = asText(req.query.q);
+    // Only search once there is something meaningful to match on.
+    if (q.length < 2) {
+      return res.json({ success: true, data: { suggestions: [] } });
+    }
+
+    const reports = await LostPersonReport.find({
+      status: "open",
+      personName: { $regex: "^" + escapeRegex(q), $options: "i" },
+    })
+      .select("personName")
+      .sort({ personName: 1 })
+      .limit(20)
+      .lean();
+
+    const seen = new Set();
+    const suggestions = [];
+    for (const report of reports) {
+      const name = asText(report.personName);
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      suggestions.push(name);
+      if (suggestions.length >= 8) break;
+    }
+
+    res.json({ success: true, data: { suggestions } });
+  } catch (error) {
+    console.error("getLostReportNameSuggestions error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load name suggestions",
+    });
+  }
+};
+
+// @desc   Photo-assisted lost-person search without fake face recognition
+// @route  POST /api/lost-found/search-photo
+// @access Private
+export const searchLostReportsByPhoto = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: "A JPG or PNG photo is required for photo-assisted search.",
+      });
+    }
+
+    const { q, age, gender, location, lat, lng, radiusKm, dateFrom, dateTo } =
+      req.body || {};
+    const query = {
+      status: "open",
+      photoUrl: { $exists: true, $ne: "" },
+    };
+
+    const name = asText(q);
+    if (name) {
+      query.personName = { $regex: escapeRegex(name), $options: "i" };
+    }
+
+    const normalizedGender = normalizeGender(gender);
+    if (asText(gender) && normalizedGender !== "Unknown") {
+      query.gender = normalizedGender;
+    }
+
+    const approxAge = parseOptionalNumber(age);
+    if (approxAge !== undefined) {
+      query.approxAge = { $gte: approxAge - 5, $lte: approxAge + 5 };
+    }
+
+    const loc = asText(location);
+    if (loc) {
+      const locRegex = { $regex: escapeRegex(loc), $options: "i" };
+      query.$or = [
+        { lastSeenLocationText: locRegex },
+        { area: locRegex },
+        { city: locRegex },
+        { state: locRegex },
+      ];
+    }
+
+    const from = parseDateOrNull(dateFrom);
+    const to = parseDateOrNull(dateTo);
+    if (from || to) {
+      query.lastSeenTime = {};
+      if (from) query.lastSeenTime.$gte = from;
+      if (to) query.lastSeenTime.$lte = to;
+    }
+
+    const centerLng = parseCoordinate(lng);
+    const centerLat = parseCoordinate(lat);
+    const radius = parseOptionalNumber(radiusKm);
+    if (centerLng !== null && centerLat !== null) {
+      query.lastSeenLocation = {
+        $near: {
+          $geometry: { type: "Point", coordinates: [centerLng, centerLat] },
+          $maxDistance: Math.round((radius || 100) * 1000),
+        },
+      };
+    }
+
+    const reports = await LostPersonReport.find(query)
+      .sort(query.lastSeenLocation ? {} : { createdAt: -1 })
+      .limit(25)
+      .lean();
+
+    const results = await Promise.all(
+      reports.map(async (report) => ({
+        ...(await toPublicLostReport(report)),
+        matchScore: 0,
+        photoMatchAvailable: false,
+      })),
+    );
+
+    res.json({
+      success: true,
+      data: {
+        results,
+        count: results.length,
+        photoSearch: {
+          enabled: false,
+          message:
+            "Photo-based face/person matching is not AI-enabled yet. Results are filtered to active lost reports with photos and any text filters you provided.",
+        },
+      },
+    });
+  } catch (error) {
+    console.error("searchLostReportsByPhoto error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to search lost person reports by photo",
+    });
+  }
+};
+
+// @desc   Get a single lost-person report (privacy-safe detail)
+// @route  GET /api/lost-found/lost/:id
+// @access Private
+export const getLostReportDetail = async (req, res) => {
+  try {
+    const id = asText(req.params.id);
+    if (!/^[a-fA-F0-9]{24}$/.test(id)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid report id" });
+    }
+
+    const report = await LostPersonReport.findById(id).lean();
+    if (!report) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Lost person report not found" });
+    }
+
+    // Full contact (unmasked) only when the reporter allowed contact sharing.
+    const detail = await toPublicLostReport(report, {
+      includeContact: Boolean(report.allowReporterContact),
+    });
+
+    res.json({ success: true, data: { report: detail } });
+  } catch (error) {
+    console.error("getLostReportDetail error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch lost person report",
     });
   }
 };

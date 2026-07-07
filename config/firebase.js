@@ -70,11 +70,18 @@ const sendPushNotification = async (token, notification, data = {}) => {
       }
     }
 
+    // Optional image (big-picture on Android, attachment on iOS). Safe to omit.
+    const imageUrl =
+      typeof notification.image === 'string' && /^https?:\/\//i.test(notification.image)
+        ? notification.image
+        : undefined;
+
     const message = {
       token,
       notification: {
         title: notification.title,
         body: notification.body,
+        ...(imageUrl ? { imageUrl } : {}),
       },
       data: stringData,
       android: {
@@ -82,6 +89,7 @@ const sendPushNotification = async (token, notification, data = {}) => {
         notification: {
           sound: 'default',
           priority: 'high',
+          ...(imageUrl ? { imageUrl } : {}),
         },
       },
       apns: {
@@ -89,8 +97,10 @@ const sendPushNotification = async (token, notification, data = {}) => {
           aps: {
             sound: 'default',
             badge: 1,
+            ...(imageUrl ? { 'mutable-content': 1 } : {}),
           },
         },
+        ...(imageUrl ? { fcmOptions: { imageUrl } } : {}),
       },
     };
 

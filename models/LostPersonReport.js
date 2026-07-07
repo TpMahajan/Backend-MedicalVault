@@ -125,6 +125,24 @@ const LostPersonReportSchema = new mongoose.Schema(
       ref: "FoundPersonReport",
       default: null,
     },
+
+    // 🔔 Nearby-alert broadcast tracking (see services/lostFoundBroadcast.js)
+    broadcastStatus: {
+      type: String,
+      enum: ["pending", "processing", "sent", "failed", "skipped"],
+      default: "pending",
+    },
+    broadcastSentAt: { type: Date, default: null },
+    broadcastRadiusKm: { type: Number, default: null },
+    broadcastRecipientCount: { type: Number, default: 0 },
+    broadcastError: { type: String, trim: true, default: "" },
+    // Longer-lived, notification-safe image URL (falls back to photoUrl).
+    notificationImageUrl: { type: String, trim: true },
+
+    // 🔒 Public contact controls (what a searcher/nearby user may see).
+    allowReporterContact: { type: Boolean, default: false },
+    publicContactName: { type: String, trim: true },
+    publicContactPhone: { type: String, trim: true },
   },
   { timestamps: true }
 );

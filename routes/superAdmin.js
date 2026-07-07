@@ -21,6 +21,8 @@ import { SuperAdminCredential } from "../models/SuperAdminCredential.js";
 import { Advertisement } from "../models/Advertisement.js";
 import { Product } from "../models/Product.js";
 import { UIConfig } from "../models/UIConfig.js";
+import { AISettings } from "../models/AISettings.js";
+import { AIUsage } from "../models/AIUsage.js";
 import { Notification } from "../models/Notification.js";
 import { Appointment } from "../models/Appointment.js";
 import { Session } from "../models/Session.js";
@@ -53,6 +55,7 @@ import {
   PUBLIC_ALERT_PLATFORMS,
   broadcastPublicConfigEvent,
 } from "../services/publicConfigRealtime.js";
+import { getAISettings, getDateKey, summarizeAIUsage } from "../services/aiGovernance.js";
 
 const router = express.Router();
 initializeFirebase();
@@ -182,6 +185,93 @@ function toBoolean(value, fallback = false) {
     if (value.toLowerCase() === "false") return false;
   }
   return fallback;
+}
+
+function toNonNegativeNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function normalizeAllowedModels(value) {
+  const models = toArray(value)
+    .flatMap((entry) => String(entry || "").split(","))
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return models.length ? [...new Set(models)] : ["gpt-4o-mini"];
+}
+
+function normalizeAISettingsPayload(body = {}, existing = {}) {
+  const allowedModels = normalizeAllowedModels(
+    body.allowedModels ?? existing.allowedModels,
+  );
+  const defaultModelRaw = String(
+    body.defaultModel || existing.defaultModel || allowedModels[0],
+  ).trim();
+  const defaultModel = allowedModels.includes(defaultModelRaw)
+    ? defaultModelRaw
+    : allowedModels[0];
+
+  return {
+    patientDailyMessageLimit: toNonNegativeNumber(
+      body.patientDailyMessageLimit,
+      existing.patientDailyMessageLimit ?? 10,
+    ),
+    doctorDailyMessageLimit: toNonNegativeNumber(
+      body.doctorDailyMessageLimit,
+      existing.doctorDailyMessageLimit ?? 25,
+    ),
+    adminDailyMessageLimit: toNonNegativeNumber(
+      body.adminDailyMessageLimit,
+      existing.adminDailyMessageLimit ?? 50,
+    ),
+    maxInputTokensPerRequest: Math.max(
+      100,
+      toNonNegativeNumber(
+        body.maxInputTokensPerRequest,
+        existing.maxInputTokensPerRequest ?? 1500,
+      ),
+    ),
+    maxOutputTokensPerRequest: Math.max(
+      50,
+      toNonNegativeNumber(
+        body.maxOutputTokensPerRequest,
+        existing.maxOutputTokensPerRequest ?? 700,
+      ),
+    ),
+    maxInputChars: Math.max(
+      500,
+      toNonNegativeNumber(body.maxInputChars, existing.maxInputChars ?? 6000),
+    ),
+    maxChatHistoryMessages: toNonNegativeNumber(
+      body.maxChatHistoryMessages,
+      existing.maxChatHistoryMessages ?? 6,
+    ),
+    maxDocumentsPerRequest: Math.max(
+      1,
+      toNonNegativeNumber(
+        body.maxDocumentsPerRequest,
+        existing.maxDocumentsPerRequest ?? 3,
+      ),
+    ),
+    allowedModels,
+    defaultModel,
+    documentVerificationAiEnabled: toBoolean(
+      body.documentVerificationAiEnabled,
+      existing.documentVerificationAiEnabled ?? true,
+    ),
+    aiAssistantEnabled: toBoolean(
+      body.aiAssistantEnabled,
+      existing.aiAssistantEnabled ?? true,
+    ),
+    hardDailyTokenBudget: toNonNegativeNumber(
+      body.hardDailyTokenBudget,
+      existing.hardDailyTokenBudget ?? 100000,
+    ),
+    hardDailyCostBudget: toNonNegativeNumber(
+      body.hardDailyCostBudget,
+      existing.hardDailyCostBudget ?? 10,
+    ),
+  };
 }
 
 function sanitizeRichText(value) {
@@ -1713,6 +1803,114 @@ router.get("/activities", requireSuperAdminAuth, async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to fetch activities",
+      error: error.message,
+    });
+  }
+});
+
+// ---------------- AI GOVERNANCE ----------------
+router.get("/ai-settings", requireSuperAdminAuth, async (req, res) => {
+  try {
+    const settings = await getAISettings();
+    return res.json({ success: true, settings });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch AI settings",
+      error: error.message,
+    });
+  }
+});
+
+router.put("/ai-settings", requireSuperAdminAuth, async (req, res) => {
+  try {
+    const existing = await getAISettings();
+    const payload = normalizeAISettingsPayload(req.body || {}, existing);
+    const settings = await AISettings.findOneAndUpdate(
+      { key: "GLOBAL" },
+      {
+        $set: {
+          ...payload,
+          updatedBy: req.superAdmin?.email || req.auth?.email || "superadmin",
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).lean();
+
+    await writeAuditLog({
+      req,
+      action: "UPDATE_AI_SETTINGS",
+      resourceType: "AI_SETTINGS",
+      statusCode: 200,
+      metadata: {
+        patientDailyMessageLimit: settings.patientDailyMessageLimit,
+        aiAssistantEnabled: settings.aiAssistantEnabled,
+        documentVerificationAiEnabled: settings.documentVerificationAiEnabled,
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: "AI settings updated",
+      settings,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update AI settings",
+      error: error.message,
+    });
+  }
+});
+
+router.get("/ai-usage-summary", requireSuperAdminAuth, async (req, res) => {
+  try {
+    const dateKey = String(req.query.dateKey || getDateKey()).slice(0, 10);
+    const summary = await summarizeAIUsage({ dateKey });
+    return res.json({ success: true, ...summary });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch AI usage summary",
+      error: error.message,
+    });
+  }
+});
+
+router.get("/ai-usage-users", requireSuperAdminAuth, async (req, res) => {
+  try {
+    const dateKey = String(req.query.dateKey || getDateKey()).slice(0, 10);
+    const rows = await AIUsage.aggregate([
+      { $match: { dateKey } },
+      {
+        $group: {
+          _id: { userId: "$userId", role: "$role" },
+          messages: { $sum: "$messageCount" },
+          inputTokens: { $sum: "$tokenInputCount" },
+          outputTokens: { $sum: "$tokenOutputCount" },
+          estimatedCost: { $sum: "$estimatedCost" },
+        },
+      },
+      { $sort: { messages: -1 } },
+      { $limit: 50 },
+    ]);
+
+    return res.json({
+      success: true,
+      dateKey,
+      users: rows.map((row) => ({
+        userId: row._id?.userId || "",
+        role: row._id?.role || "",
+        messages: row.messages || 0,
+        inputTokens: row.inputTokens || 0,
+        outputTokens: row.outputTokens || 0,
+        estimatedCost: Number((row.estimatedCost || 0).toFixed(6)),
+      })),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch AI usage users",
       error: error.message,
     });
   }

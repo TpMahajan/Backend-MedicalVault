@@ -21,6 +21,9 @@ const FoundPersonReportSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    // Optional name of the found person (finder may know it or match it from
+    // an existing missing report).
+    personName: { type: String, trim: true },
     approxAge: { type: Number },
     gender: {
       type: String,

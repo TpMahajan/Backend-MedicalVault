@@ -11,6 +11,13 @@ import { fileURLToPath } from "url";
 // Load env (.env first, then legacy db.env fallback)
 dotenv.config();
 dotenv.config({ path: "./db.env" });
+
+// Startup-safe config signal — never prints the actual key.
+console.log(
+  "[nearby] Google Maps key configured:",
+  Boolean(process.env.GOOGLE_MAPS_API_KEY),
+);
+
 validateStartupConfig();
 
 // Config imports
@@ -163,7 +170,22 @@ app.use(compression({
     return compression.filter(req, res);
   }
 }));
-app.use(morgan("dev"));
+const verboseHttpLogs =
+  String(process.env.HTTP_LOG_VERBOSE || "false").toLowerCase() === "true";
+const quietSuccessLogPatterns = [
+  /^\/api\/auth\/session\/heartbeat(?:\?|$)/,
+  /^\/api\/public\/ui-config(?:\?|$)/,
+  /^\/api\/public\/ads(?:\?|$)/,
+  /^\/api\/files\/user\/[^/]+\/grouped(?:\?|$)/,
+];
+app.use(
+  morgan("dev", {
+    skip: (req, res) =>
+      !verboseHttpLogs &&
+      res.statusCode < 400 &&
+      quietSuccessLogPatterns.some((pattern) => pattern.test(req.originalUrl)),
+  }),
+);
 
 // -------------------- Static File Serving --------------------
 const __filename = fileURLToPath(import.meta.url);
@@ -306,7 +328,6 @@ const startServer = async () => {
       console.log(`🚀 Server running on http://localhost:${PORT}`);
       console.log(`📚 Health check: http://localhost:${PORT}/health`);
       console.log(`📂 Serving uploads at: http://localhost:${PORT}/uploads`);
-      console.log(`⏰ Cron jobs initialized for reminders`);
     });
 
     initPublicConfigRealtime(server);

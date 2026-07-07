@@ -13,7 +13,7 @@ const notificationSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['general', 'appointment', 'session', 'document', 'qr_scan', 'system', 'reminder'],
+    enum: ['general', 'appointment', 'session', 'document', 'qr_scan', 'system', 'reminder', 'lost_person_alert'],
     default: 'general'
   },
   data: {

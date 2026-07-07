@@ -71,6 +71,21 @@ export const aiLimiter = rateLimit({
   ...sharedOptions,
 });
 
+// Lost-person report creation (triggers nearby broadcast; guard against abuse/spam)
+export const lostReportLimiter =
+  !isProduction && disableApiLimiterInDev
+    ? noopLimiter
+    : rateLimit({
+        windowMs: parseEnvInt(process.env.LOST_REPORT_RATE_LIMIT_WINDOW_MS, 60 * 60 * 1000), // 1 hour
+        max: parseEnvInt(process.env.LOST_REPORT_RATE_LIMIT_MAX, 10),
+        message: {
+          success: false,
+          message: "Too many lost/found reports created. Please try again later.",
+        },
+        skip: (req) => req.method === "OPTIONS",
+        ...sharedOptions,
+      });
+
 // File uploads
 export const uploadLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,

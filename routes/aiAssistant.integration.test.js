@@ -4,6 +4,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, jest } from "@je
 
 const mockState = {
   openAiReply: "Mocked AI response.",
+  aiLimitError: null,
+  lostFoundContext: { intent: false, matches: [] },
   doctorAccessDefault: true,
   doctorAccessByPair: new Map(),
   usersById: new Map(),
@@ -59,6 +61,34 @@ const canDoctorAccessPatientMock = jest.fn(async (doctorId, patientId) => {
 });
 
 const extractTextFromS3Mock = jest.fn(async () => mockState.extractionResult);
+
+const aiSettingsMock = {
+  aiAssistantEnabled: true,
+  documentVerificationAiEnabled: true,
+  patientDailyMessageLimit: 10,
+  doctorDailyMessageLimit: 25,
+  adminDailyMessageLimit: 50,
+  maxInputChars: 6000,
+  maxOutputTokens: 700,
+  maxChatHistoryMessages: 6,
+  maxDocumentsPerRequest: 3,
+  allowedModels: ["gpt-4o-mini"],
+  defaultModel: "gpt-4o-mini",
+  hardDailyTokenBudget: 100000,
+  hardDailyCostBudget: 10,
+};
+
+const assertAIUsageAllowedMock = jest.fn(async () => {
+  if (mockState.aiLimitError) {
+    throw mockState.aiLimitError;
+  }
+  return { settings: aiSettingsMock };
+});
+const recordAIUsageMock = jest.fn(async () => ({}));
+const estimateTokensFromTextMock = jest.fn((text = "") =>
+  Math.max(1, Math.ceil(String(text).length / 4))
+);
+const buildLostFoundAiContextMock = jest.fn(async () => mockState.lostFoundContext);
 
 const userFindByIdMock = jest.fn((id) =>
   makeSelectChain(mockState.usersById.get(String(id)) || null)
@@ -161,6 +191,16 @@ await jest.unstable_mockModule("../services/documentReader.js", () => ({
   },
 }));
 
+await jest.unstable_mockModule("../services/aiGovernance.js", () => ({
+  assertAIUsageAllowed: assertAIUsageAllowedMock,
+  estimateTokensFromText: estimateTokensFromTextMock,
+  recordAIUsage: recordAIUsageMock,
+}));
+
+await jest.unstable_mockModule("../services/lostFoundAiContextService.js", () => ({
+  buildLostFoundAiContext: buildLostFoundAiContextMock,
+}));
+
 await jest.unstable_mockModule("../models/User.js", () => ({
   User: {
     findById: userFindByIdMock,
@@ -204,6 +244,8 @@ app.use("/api/ai", aiAssistantRouter);
 
 const resetState = () => {
   mockState.openAiReply = "Mocked AI response.";
+  mockState.aiLimitError = null;
+  mockState.lostFoundContext = { intent: false, matches: [] };
   mockState.doctorAccessDefault = true;
   mockState.doctorAccessByPair = new Map();
   mockState.usersById = new Map([
@@ -264,6 +306,10 @@ describe("AI assistant /api/ai integration", () => {
     axiosPostMock.mockClear();
     canDoctorAccessPatientMock.mockClear();
     extractTextFromS3Mock.mockClear();
+    assertAIUsageAllowedMock.mockClear();
+    recordAIUsageMock.mockClear();
+    estimateTokensFromTextMock.mockClear();
+    buildLostFoundAiContextMock.mockClear();
     userFindByIdMock.mockClear();
     doctorFindByIdMock.mockClear();
     adminFindByIdMock.mockClear();
@@ -301,6 +347,72 @@ describe("AI assistant /api/ai integration", () => {
     expect(response.body.context?.userRole).toBe("patient");
     expect(response.body.context?.resolvedLanguage).toBe("english");
     expect(doctorFindByIdMock).not.toHaveBeenCalled();
+  });
+
+  it("blocks patient AI ask when the daily message limit is reached", async () => {
+    const limitError = new Error(
+      "You have used your 10 AI messages for today. Please try again tomorrow."
+    );
+    limitError.code = "AI_DAILY_LIMIT_REACHED";
+    limitError.limit = 10;
+    limitError.used = 10;
+    limitError.resetAt = "2026-07-08T00:00:00.000Z";
+    mockState.aiLimitError = limitError;
+
+    const response = await request(app)
+      .post("/api/ai/ask")
+      .set("x-test-role", "patient")
+      .set("x-test-id", "patient-1")
+      .send({ prompt: "Explain my latest summary" });
+
+    expect(response.status).toBe(429);
+    expect(response.body.error).toBe("AI_DAILY_LIMIT_REACHED");
+    expect(response.body.limit).toBe(10);
+    expect(response.body.used).toBe(10);
+    expect(axiosPostMock).not.toHaveBeenCalled();
+  });
+
+  it("returns safe lost-person cards without calling OpenAI for lost-person intent", async () => {
+    mockState.lostFoundContext = {
+      intent: true,
+      reply: "I found 1 open lost-person report that may match Rahul.",
+      matches: [
+        {
+          id: "lost-rahul-1",
+          personName: "Rahul Sharma",
+          approxAge: 29,
+          gender: "Male",
+          lastSeenLocation: "Nashik Road",
+          lastSeenTime: "2026-07-05T08:00:00.000Z",
+          status: "open",
+          photoUrl: "https://cdn.example/rahul.jpg",
+        },
+      ],
+      structuredData: {
+        type: "lost_person_results",
+        items: [
+          {
+            id: "lost-rahul-1",
+            personName: "Rahul Sharma",
+            status: "open",
+          },
+        ],
+      },
+    };
+
+    const response = await request(app)
+      .post("/api/ai/ask")
+      .set("x-test-role", "patient")
+      .set("x-test-id", "patient-1")
+      .send({ prompt: "Search for missing Rahul" });
+
+    expect(response.status).toBe(200);
+    expect(response.body.responseType).toBe("lost_person_results");
+    expect(response.body.items).toHaveLength(1);
+    expect(response.body.items[0].personName).toBe("Rahul Sharma");
+    expect(response.body.context.action).toBe("open_lost_person_detail");
+    expect(axiosPostMock).not.toHaveBeenCalled();
+    expect(recordAIUsageMock).toHaveBeenCalled();
   });
 
   it("returns 403 when doctor requests an unauthorized patient scope", async () => {

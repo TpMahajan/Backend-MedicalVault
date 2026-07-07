@@ -21,6 +21,12 @@ import {
   resolveLanguage,
   resolvePersona,
 } from "../services/aiAssistantPolicy.js";
+import {
+  assertAIUsageAllowed,
+  estimateTokensFromText,
+  recordAIUsage,
+} from "../services/aiGovernance.js";
+import { buildLostFoundAiContext } from "../services/lostFoundAiContextService.js";
 
 const router = express.Router();
 router.use(aiLimiter);
@@ -1153,6 +1159,14 @@ router.post("/ask", auth, async (req, res) => {
       return res.status(403).json({ success: false, message: "Unsupported role" });
     }
 
+    const usageGate = await assertAIUsageAllowed({
+      userId: requesterId,
+      role,
+      endpoint: "ai.ask",
+      inputText: prompt,
+    });
+    const aiSettings = usageGate.settings;
+
     // Resolve language with preference-first behavior + per-message override.
     const languageResolution = resolveLanguage({
       prompt,
@@ -1173,6 +1187,39 @@ router.post("/ask", auth, async (req, res) => {
     const isScheduleRequest = isScheduleQuery(prompt);
     const isUrgent = isUrgentQuery(prompt);
     const isPatientsList = isPatientsQuery(prompt);
+
+    const lostFoundContext = await buildLostFoundAiContext(prompt);
+    if (lostFoundContext.intent) {
+      await recordAIUsage({
+        userId: requesterId,
+        role,
+        endpoint: "ai.ask",
+        inputTokens: estimateTokensFromText(prompt),
+        outputTokens: estimateTokensFromText(lostFoundContext.reply),
+        estimatedCost: 0,
+      });
+
+      return res.json({
+        success: true,
+        user: currentUser.name || "User",
+        assistant: "AI Ally Assistant",
+        reply: lostFoundContext.reply,
+        language,
+        responseType: "lost_person_results",
+        structuredData: lostFoundContext.structuredData,
+        data: lostFoundContext.matches,
+        type: "lost_person_results",
+        title: "Lost-person matches",
+        items: lostFoundContext.matches,
+        context: {
+          userRole: persona,
+          resolvedPersona: persona,
+          resolvedLanguage: language,
+          timestamp: new Date().toISOString(),
+          action: "open_lost_person_detail",
+        },
+      });
+    }
 
     const selectedPatientProfile = String(
       requestContext.selectedPatientProfile || patientId || ""
@@ -1526,12 +1573,20 @@ router.post("/ask", auth, async (req, res) => {
       ? `\n\nActive Patients (last 30 days):\n` + patientsData.map((p, i) => `${i + 1}. ${p.name} - Last appointment: ${new Date(p.lastAppointmentDate).toLocaleDateString()}`).join('\n')
       : '';
 
+    let limitedDocumentContent = documentContent;
+    if (limitedDocumentContent) {
+      limitedDocumentContent = String(limitedDocumentContent).slice(
+        0,
+        Number(aiSettings.maxInputChars || 6000),
+      );
+    }
+
     const systemPrompt = generateSystemPrompt(
       currentUser,
       documents,
       isDocumentRequest,
       language,
-      documentContent,
+      limitedDocumentContent,
       wantsStructured,
       persona,
       targetPatientId,
@@ -1565,12 +1620,26 @@ router.post("/ask", auth, async (req, res) => {
     console.log(`🤖 Calling OpenAI API...`);
     let openaiResponse;
     try {
+      if (!process.env.OPENAI_API_KEY) {
+        return res.status(503).json({
+          success: false,
+          code: "AI_NOT_CONFIGURED",
+          message: "AI assistant is not configured right now.",
+        });
+      }
+
+      const allowedModels = Array.isArray(aiSettings.allowedModels)
+        ? aiSettings.allowedModels
+        : ["gpt-4o-mini"];
+      const model = allowedModels.includes(aiSettings.defaultModel)
+        ? aiSettings.defaultModel
+        : allowedModels[0] || "gpt-4o-mini";
       openaiResponse = await axios.post(
         "https://api.openai.com/v1/chat/completions",
         {
-          model: "gpt-4o-mini",
+          model,
           messages: messages,
-          max_tokens: documentContent ? 800 : (isDocumentRequest ? 300 : 500),
+          max_tokens: Number(aiSettings.maxOutputTokensPerRequest || 700),
           temperature: 0.3,
           top_p: 0.8,
           stream: false
@@ -1602,6 +1671,19 @@ router.post("/ask", auth, async (req, res) => {
       .replace(/[ \t]+\n/g, "\n")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
+
+    const usage = openaiResponse?.data?.usage || {};
+    await recordAIUsage({
+      userId: requesterId,
+      role,
+      endpoint: "ai.ask",
+      inputTokens:
+        Number(usage.prompt_tokens || 0) ||
+        estimateTokensFromText(`${effectiveSystemPrompt}\n${prompt}`),
+      outputTokens:
+        Number(usage.completion_tokens || 0) ||
+        estimateTokensFromText(aiReply),
+    });
 
     const parsedSections = parseSectionsFromReply(aiReply, persona);
 
@@ -1804,6 +1886,32 @@ router.post("/ask", auth, async (req, res) => {
 
   } catch (error) {
     console.error("AI Assistant error:", error);
+
+    if (error.code === "AI_DAILY_LIMIT_REACHED") {
+      return res.status(429).json({
+        success: false,
+        error: "AI_DAILY_LIMIT_REACHED",
+        code: "AI_DAILY_LIMIT_REACHED",
+        message: error.message,
+        limit: error.limit,
+        used: error.used,
+        resetAt: error.resetAt,
+      });
+    }
+
+    if (
+      error.code === "AI_ASSISTANT_DISABLED" ||
+      error.code === "AI_INPUT_TOO_LARGE" ||
+      error.code === "AI_GLOBAL_TOKEN_BUDGET_REACHED" ||
+      error.code === "AI_GLOBAL_COST_BUDGET_REACHED"
+    ) {
+      return res.status(error.statusCode || 429).json({
+        success: false,
+        error: error.code,
+        code: error.code,
+        message: error.message,
+      });
+    }
     
     if (error.response?.status === 401) {
       return res.status(500).json({
@@ -2097,13 +2205,24 @@ Format your response as JSON:
       });
     }
 
+    const summaryRole = isDoctor ? "doctor" : "patient";
+    const summaryUserId = isDoctor ? doctorId : patientId;
+    const summaryGate = await assertAIUsageAllowed({
+      userId: summaryUserId,
+      role: summaryRole,
+      endpoint: "ai.appointment-summary",
+      inputText: prompt,
+    });
+    const summarySettings = summaryGate.settings;
+
     const axios = (await import("axios")).default;
     const completion = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       {
-        model: "gpt-4o-mini",
+        model: summarySettings.defaultModel || "gpt-4o-mini",
         messages: [{ role: "user", content: prompt }],
         temperature: 0.3,
+        max_tokens: Number(summarySettings.maxOutputTokensPerRequest || 700),
       },
       { headers: { Authorization: `Bearer ${openaiKey}` } }
     );
@@ -2123,6 +2242,17 @@ Format your response as JSON:
       summary = content.slice(0, 500);
     }
 
+    const usage = completion?.data?.usage || {};
+    await recordAIUsage({
+      userId: summaryUserId,
+      role: summaryRole,
+      endpoint: "ai.appointment-summary",
+      inputTokens:
+        Number(usage.prompt_tokens || 0) || estimateTokensFromText(prompt),
+      outputTokens:
+        Number(usage.completion_tokens || 0) || estimateTokensFromText(content),
+    });
+
     const { AppointmentAIInsight } = await import(
       "../models/AppointmentAIInsight.js"
     );
@@ -2140,6 +2270,18 @@ Format your response as JSON:
     });
   } catch (error) {
     console.error("Appointment summary error:", error);
+    if (error.code === "AI_DAILY_LIMIT_REACHED") {
+      return fail(res, {
+        status: 429,
+        message: error.message,
+        legacy: {
+          error: "AI_DAILY_LIMIT_REACHED",
+          limit: error.limit,
+          used: error.used,
+          resetAt: error.resetAt,
+        },
+      });
+    }
     return fail(res, {
       status: 500,
       message: error.message || "Failed to generate summary",
@@ -2207,5 +2349,3 @@ router.get('/patient/:patientId/analyze', auth, async (req, res) => {
 });
 
 export default router;
-
-

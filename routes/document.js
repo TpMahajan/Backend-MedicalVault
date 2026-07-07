@@ -28,6 +28,12 @@ import { writeAuditLog } from "../middleware/auditLogger.js";
 import { uploadLimiter } from "../middleware/rateLimit.js";
 import DocumentReader from "../services/documentReader.js";
 import { resolveUploadStorage } from "../services/uploadStoragePolicy.js";
+import {
+  assertAIUsageAllowed,
+  estimateTokensFromText,
+  getAISettings,
+  recordAIUsage,
+} from "../services/aiGovernance.js";
 
 const router = express.Router();
 
@@ -471,7 +477,12 @@ const classifyDocumentCategoryWithAI = async ({
   const fallbackCategory = inferDocumentCategoryByHeuristic(classificationText);
   const textSample = classificationText.slice(0, MAX_AI_CATEGORY_CHARS);
 
-  if (!OPENAI_API_KEY || textSample.length < 4) {
+  const aiSettings = await getAISettings();
+  if (
+    !OPENAI_API_KEY ||
+    !aiSettings.documentVerificationAiEnabled ||
+    textSample.length < 4
+  ) {
     return { category: fallbackCategory, method: "heuristic" };
   }
 
@@ -519,7 +530,18 @@ const classifyDocumentCategoryWithAI = async ({
   }
 };
 
-const classifyMedicalTextWithAI = async (normalizedText) => {
+const classifyMedicalTextWithAI = async (
+  normalizedText,
+  { userId = "unknown", role = "patient" } = {},
+) => {
+  const aiSettings = await getAISettings();
+  if (!aiSettings.documentVerificationAiEnabled) {
+    return {
+      success: false,
+      label: "UNKNOWN",
+      reason: "document_ai_disabled",
+    };
+  }
   if (!OPENAI_API_KEY) {
     return { success: false, label: "UNKNOWN", reason: "missing_openai_key" };
   }
@@ -533,12 +555,22 @@ const classifyMedicalTextWithAI = async (normalizedText) => {
   }
 
   try {
+    await assertAIUsageAllowed({
+      userId,
+      role,
+      endpoint: "ai.document-verification",
+      inputText: textSample,
+    });
+
     const response = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       {
-        model: DOCUMENT_CLASSIFIER_MODEL,
+        model: aiSettings.defaultModel || DOCUMENT_CLASSIFIER_MODEL,
         temperature: 0,
-        max_tokens: 5,
+        max_tokens: Math.min(
+          10,
+          Number(aiSettings.maxOutputTokensPerRequest || 700),
+        ),
         messages: [
           {
             role: "system",
@@ -569,6 +601,16 @@ const classifyMedicalTextWithAI = async (normalizedText) => {
       .replace(/[^A-Z_]/g, "");
     const label =
       raw === "MEDICAL" || raw === "NON_MEDICAL" ? raw : "NON_MEDICAL";
+    const usage = response?.data?.usage || {};
+    await recordAIUsage({
+      userId,
+      role,
+      endpoint: "ai.document-verification",
+      inputTokens:
+        Number(usage.prompt_tokens || 0) || estimateTokensFromText(textSample),
+      outputTokens:
+        Number(usage.completion_tokens || 0) || estimateTokensFromText(raw),
+    });
     return { success: true, label, reason: "ai_classified" };
   } catch (error) {
     console.error("Medical classifier AI fallback failed:", error.message);
@@ -663,6 +705,8 @@ const validateMedicalDocumentContent = async ({
   title,
   originalName,
   category,
+  userId,
+  role,
 }) => {
   const metadataText = normalizeExtractedText(
     [category, title, originalName].filter(Boolean).join(" "),
@@ -817,7 +861,10 @@ const validateMedicalDocumentContent = async ({
   const shouldUseAiClassifier =
     keywordDecision.level === "weak" && (keywordDecision.clinicalHits || 0) > 0;
   if (shouldUseAiClassifier) {
-    aiDecision = await classifyMedicalTextWithAI(normalizedText);
+    aiDecision = await classifyMedicalTextWithAI(normalizedText, {
+      userId,
+      role,
+    });
     if (aiDecision.success && aiDecision.label === "MEDICAL") {
       return {
         allow: true,
@@ -1220,7 +1267,14 @@ router.post(
   async (req, res) => {
     const uploadStartedAt = Date.now();
     try {
-      if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          error: "NO_FILE_UPLOADED",
+          message: "No file uploaded",
+          msg: "No file uploaded",
+        });
+      }
 
       const { title, category, date, notes, userId } = req.body;
 
@@ -1353,6 +1407,8 @@ router.post(
 
         return res.status(400).json({
           success: false,
+          error: "FILE_SECURITY_CHECK_FAILED",
+          message: "Uploaded file failed security checks",
           msg: "Uploaded file failed security checks",
         });
       }
@@ -1367,6 +1423,8 @@ router.post(
         title,
         originalName: req.file.originalname,
         category: requestedCategory || category,
+        userId: requesterId,
+        role: requesterRole,
       });
 
       if (!validationResult.allow) {
@@ -1553,8 +1611,9 @@ router.post(
     } catch (err) {
       res.status(500).json({
         success: false,
-        msg: "Upload failed",
-        error: err.message,
+        error: "UPLOAD_FAILED",
+        message: err.message || "Upload failed",
+        msg: err.message || "Upload failed",
         processingTimeMs: Date.now() - uploadStartedAt,
       });
     }

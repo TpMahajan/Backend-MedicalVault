@@ -113,6 +113,7 @@ const lostFoundMatchMock = {
 
 const matchLostToFoundMock = jest.fn(async () => []);
 const matchFoundToLostMock = jest.fn(async () => []);
+const broadcastLostPersonAlertMock = jest.fn(async () => ({ status: "sent" }));
 
 await jest.unstable_mockModule("../middleware/auth.js", () => ({
   auth: authMock,
@@ -154,6 +155,12 @@ await jest.unstable_mockModule("../services/lostFoundMatcher.js", () => ({
   matchLostToFound: matchLostToFoundMock,
   matchFoundToLost: matchFoundToLostMock,
 }));
+await jest.unstable_mockModule("../services/lostFoundBroadcast.js", () => ({
+  broadcastLostPersonAlert: broadcastLostPersonAlertMock,
+}));
+await jest.unstable_mockModule("../middleware/rateLimit.js", () => ({
+  lostReportLimiter: (req, res, next) => next(),
+}));
 
 const { default: lostFoundRouter } = await import("./lostFound.js");
 const { default: adminLostFoundRouter } = await import("./adminLostFound.js");
@@ -189,6 +196,7 @@ describe("lost & found API integration", () => {
     mockState.matches.clear();
     matchLostToFoundMock.mockClear();
     matchFoundToLostMock.mockClear();
+    broadcastLostPersonAlertMock.mockClear();
     lostFoundMatchMock.updateMany.mockClear();
     process.env.NODE_ENV = "development";
     delete process.env.ALLOW_LOCAL_UPLOAD_FALLBACK;
@@ -309,6 +317,8 @@ describe("lost & found API integration", () => {
 
       await flushMatcherQueue();
       expect(matchLostToFoundMock).toHaveBeenCalledTimes(1);
+      // Creating a lost report triggers the nearby-alert broadcast.
+      expect(broadcastLostPersonAlertMock).toHaveBeenCalledTimes(1);
     });
 
     it("rejects an uploaded-photo lost report without photoUrl", async () => {

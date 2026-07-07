@@ -328,6 +328,14 @@ const toAdminReportPayload = (report, matchStats = {}) => {
       count: Number(suggested.count || 0),
       maxScore: Number(suggested.maxScore || 0),
     },
+    // Nearby-alert broadcast visibility for admin moderation (WS9).
+    broadcast: {
+      status: report?.broadcastStatus || "pending",
+      radiusKm: report?.broadcastRadiusKm ?? null,
+      recipientCount: Number(report?.broadcastRecipientCount || 0),
+      sentAt: report?.broadcastSentAt || null,
+      error: report?.broadcastError || "",
+    },
   };
 };
 

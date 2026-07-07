@@ -81,6 +81,83 @@ export const updateProfile = async (req, res) => {
   }
 };
 
+// @desc    Update the authenticated user's last known location (opt-in)
+// @route   PUT /api/users/location
+// @access  Private
+export const updateUserLocation = async (req, res) => {
+  try {
+    const { lat, lng, address, locationSharingEnabled, lostPersonAlertsOptOut } =
+      req.body;
+
+    const update = {};
+
+    // Only write coordinates when both are valid numbers in range.
+    const latNum = Number(lat);
+    const lngNum = Number(lng);
+    const hasCoords =
+      Number.isFinite(latNum) &&
+      Number.isFinite(lngNum) &&
+      latNum >= -90 &&
+      latNum <= 90 &&
+      lngNum >= -180 &&
+      lngNum <= 180;
+
+    if (hasCoords) {
+      update.lastKnownLocation = {
+        type: "Point",
+        coordinates: [lngNum, latNum], // GeoJSON order: [lng, lat]
+      };
+      update.lastKnownLocationUpdatedAt = new Date();
+      if (typeof address === "string") {
+        update.lastKnownLocationAddress = address.trim() || null;
+      }
+    } else if (lat !== undefined || lng !== undefined) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid coordinates. Provide numeric lat/lng in range.",
+      });
+    }
+
+    if (locationSharingEnabled !== undefined) {
+      update.locationSharingEnabled = Boolean(locationSharingEnabled);
+    }
+    if (lostPersonAlertsOptOut !== undefined) {
+      update.lostPersonAlertsOptOut = Boolean(lostPersonAlertsOptOut);
+    }
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No location fields provided.",
+      });
+    }
+
+    const user = await User.findByIdAndUpdate(req.user._id, update, {
+      new: true,
+      runValidators: true,
+    }).select(
+      "lastKnownLocation lastKnownLocationAddress lastKnownLocationUpdatedAt locationSharingEnabled lostPersonAlertsOptOut",
+    );
+
+    res.json({
+      success: true,
+      message: "Location updated",
+      data: {
+        locationSharingEnabled: user?.locationSharingEnabled ?? false,
+        lostPersonAlertsOptOut: user?.lostPersonAlertsOptOut ?? false,
+        lastKnownLocationUpdatedAt: user?.lastKnownLocationUpdatedAt ?? null,
+        address: user?.lastKnownLocationAddress ?? null,
+      },
+    });
+  } catch (error) {
+    console.error("Update user location error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+};
+
 // @desc    Update FCM token
 // @route   PUT /api/user/fcm-token
 // @access  Private
