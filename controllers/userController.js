@@ -8,24 +8,69 @@ import { buildUserResponse } from "../utils/userResponse.js";
 // @access  Private
 export const updateProfile = async (req, res) => {
   try {
-    const { name, profilePicture, allergies } = req.body;
+    const {
+      name,
+      profilePicture,
+      allergies,
+      mobile,
+      dateOfBirth,
+      age,
+      gender,
+      bloodType,
+      height,
+      weight,
+      lastVisit,
+      nextAppointment,
+      emergencyContact,
+      medicalHistory,
+      medications,
+      aadhaar,
+    } = req.body;
     const updateData = {};
 
     if (name !== undefined) updateData.name = name;
-    if (profilePicture !== undefined) updateData.profilePicture = profilePicture;
+    if (profilePicture !== undefined)
+      updateData.profilePicture = profilePicture;
+    if (mobile !== undefined) updateData.mobile = mobile;
+    if (dateOfBirth !== undefined) updateData.dateOfBirth = dateOfBirth;
+    if (age !== undefined) updateData.age = age;
+    if (gender !== undefined) updateData.gender = gender;
+    if (bloodType !== undefined) updateData.bloodType = bloodType;
+    if (height !== undefined) updateData.height = height;
+    if (weight !== undefined) updateData.weight = weight;
+    if (lastVisit !== undefined) updateData.lastVisit = lastVisit;
+    if (nextAppointment !== undefined)
+      updateData.nextAppointment = nextAppointment;
+    if (aadhaar !== undefined) updateData.aadhaar = aadhaar;
     if (allergies !== undefined) {
       updateData.allergies = typeof allergies === "string" ? allergies : "";
     }
+    if (emergencyContact && typeof emergencyContact === "object") {
+      updateData.emergencyContact = {
+        name: emergencyContact.name ?? null,
+        relationship: emergencyContact.relationship ?? null,
+        phone:
+          emergencyContact.phone ??
+          emergencyContact.mobile ??
+          emergencyContact.number ??
+          null,
+      };
+    }
+    if (Array.isArray(medicalHistory))
+      updateData.medicalHistory = medicalHistory;
+    if (Array.isArray(medications)) updateData.medications = medications;
 
     const user = await User.findByIdAndUpdate(req.user._id, updateData, {
       new: true,
       runValidators: true,
     }).select("-password");
 
+    const processedUser = await buildUserResponse(user);
+
     res.json({
       success: true,
       message: "Profile updated successfully",
-      data: { user },
+      data: { user: processedUser },
     });
   } catch (error) {
     console.error("Update profile error:", error);
@@ -189,36 +234,39 @@ export const getAllPatients = async (req, res) => {
     if (req.auth && req.auth.role === "doctor") {
       const doctorId = req.auth.id;
 
-      const [sessionPatientIds, appointmentPatientIds, activeSessions] = await Promise.all([
-        Session.distinct("patientId", { doctorId }),
-        Appointment.distinct("patientId", { doctorId }),
-        Session.find({
-          doctorId,
-          status: "accepted",
-          expiresAt: { $gt: new Date() },
-        }).select("patientId"),
-      ]);
+      const [sessionPatientIds, appointmentPatientIds, activeSessions] =
+        await Promise.all([
+          Session.distinct("patientId", { doctorId }),
+          Appointment.distinct("patientId", { doctorId }),
+          Session.find({
+            doctorId,
+            status: "accepted",
+            expiresAt: { $gt: new Date() },
+          }).select("patientId"),
+        ]);
 
       const allDoctorPatientIds = [
         ...new Set(
           [
             ...sessionPatientIds.map((id) => id.toString()),
             ...appointmentPatientIds.map((id) => id?.toString()),
-          ].filter(Boolean)
+          ].filter(Boolean),
         ),
       ];
 
-      activePatientIds = new Set(activeSessions.map((s) => s.patientId.toString()));
+      activePatientIds = new Set(
+        activeSessions.map((s) => s.patientId.toString()),
+      );
 
       if (status && status !== "All") {
         if (status === "Active") {
           const filteredIds = Array.from(activePatientIds).filter((id) =>
-            allDoctorPatientIds.includes(id)
+            allDoctorPatientIds.includes(id),
           );
           query._id = { $in: filteredIds };
         } else {
           const filteredIds = allDoctorPatientIds.filter(
-            (id) => !activePatientIds.has(id)
+            (id) => !activePatientIds.has(id),
           );
           query._id = { $in: filteredIds };
         }
@@ -261,7 +309,9 @@ export const getAllPatients = async (req, res) => {
     const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
 
     const patients = await User.find(query)
-      .select("name email mobile age gender dateOfBirth bloodType lastVisit isActive medicalRecords")
+      .select(
+        "name email mobile age gender dateOfBirth bloodType lastVisit isActive medicalRecords",
+      )
       .populate("medicalRecords", "_id")
       .sort(sort)
       .skip(skip)
@@ -280,7 +330,9 @@ export const getAllPatients = async (req, res) => {
       email: patient.email,
       lastVisit: patient.lastVisit || "N/A",
       documents: patient.medicalRecords ? patient.medicalRecords.length : 0,
-      status: activePatientIds.has(patient._id.toString()) ? "Active" : "Inactive",
+      status: activePatientIds.has(patient._id.toString())
+        ? "Active"
+        : "Inactive",
       bloodType: patient.bloodType || "N/A",
     }));
 

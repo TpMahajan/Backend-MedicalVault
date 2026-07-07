@@ -112,7 +112,7 @@ const formatDocumentsForAI = (documents, category) => {
 const generatePreviewUrls = (documents) => {
   return documents.map(doc => ({
     ...doc,
-    previewUrl: `${process.env.BASE_URL || 'http://localhost:5000'}/api/files/${doc.id}/preview`
+    previewUrl: `${process.env.BASE_URL || 'http://localhost:5001'}/api/files/${doc.id}/preview`
   }));
 };
 

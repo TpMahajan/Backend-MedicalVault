@@ -1,9 +1,14 @@
 import { LostPersonReport } from "../models/LostPersonReport.js";
 import { FoundPersonReport } from "../models/FoundPersonReport.js";
 import { User } from "../models/User.js";
-import { matchFoundToLost } from "../services/lostFoundMatcher.js";
+import {
+  matchFoundToLost,
+  matchLostToFound,
+} from "../services/lostFoundMatcher.js";
 import { generateSignedUrl } from "../utils/s3Utils.js";
 import { BUCKET_NAME } from "../config/s3.js";
+
+const asText = (value) => (value == null ? "" : String(value).trim());
 
 const parseCoordinate = (value) => {
   if (value === undefined || value === null || value === "") return null;
@@ -27,6 +32,35 @@ const parseDateOrNull = (value) => {
   return Number.isNaN(date.getTime()) ? null : date;
 };
 
+const parseOptionalNumber = (value) => {
+  if (value === undefined || value === null || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+};
+
+const normalizeGender = (value) => {
+  const raw = asText(value).toLowerCase();
+  if (raw === "male") return "Male";
+  if (raw === "female") return "Female";
+  if (raw === "other") return "Other";
+  return "Unknown";
+};
+
+const runMatcherSoon = (label, matcher) => {
+  setImmediate(async () => {
+    try {
+      await matcher();
+    } catch (error) {
+      console.error(`${label} error:`, error);
+    }
+  });
+};
+
+const nonEmptyOrUndefined = (value) => {
+  const text = asText(value);
+  return text ? text : undefined;
+};
+
 export const createLostReport = async (req, res) => {
   try {
     const {
@@ -41,6 +75,22 @@ export const createLostReport = async (req, res) => {
       lastSeenLng,
       lastSeenTime,
       medicalNotes,
+      reportForType,
+      selectedProfileName,
+      clothingDescription,
+      identificationDetails,
+      reporterName,
+      reporterPhone,
+      alternateContact,
+      reporterEmail,
+      relationshipToPerson,
+      address,
+      area,
+      city,
+      state,
+      pincode,
+      landmark,
+      lastSeenLocationText,
     } = req.body;
 
     let resolvedPhotoUrl = photoUrl;
@@ -56,7 +106,7 @@ export const createLostReport = async (req, res) => {
       }
 
       const linkedUser = await User.findById(lostPersonUserId).select(
-        "profilePicture name"
+        "profilePicture name",
       );
       if (!linkedUser) {
         return res.status(404).json({
@@ -96,27 +146,48 @@ export const createLostReport = async (req, res) => {
 
     const payload = {
       reportedByUserId: req.user?._id || req.auth?.id,
-      lostPersonUserId: lostPersonUserId || null,
-      personName: resolvedName,
-      approxAge:
-        approxAge !== undefined && approxAge !== null
-          ? Number(approxAge)
-          : undefined,
-      gender: gender || "Unknown",
-      description,
+      lostPersonUserId: nonEmptyOrUndefined(lostPersonUserId) || null,
+      personName: nonEmptyOrUndefined(resolvedName),
+      approxAge: parseOptionalNumber(approxAge),
+      gender: normalizeGender(gender),
+      description: nonEmptyOrUndefined(description),
       lastSeenLocation: location,
       lastSeenTime: seenTime || undefined,
-      photoUrl: resolvedPhotoUrl,
+      photoUrl: nonEmptyOrUndefined(resolvedPhotoUrl),
       photoSource,
-      medicalNotes,
+      reportForType:
+        reportForType === "medicalvault_profile" ||
+        reportForType === "family_friend"
+          ? reportForType
+          : lostPersonUserId
+            ? "medicalvault_profile"
+            : "family_friend",
+      selectedProfileName: nonEmptyOrUndefined(selectedProfileName),
+      clothingDescription: nonEmptyOrUndefined(clothingDescription),
+      identificationDetails: nonEmptyOrUndefined(identificationDetails),
+      medicalNotes: nonEmptyOrUndefined(medicalNotes),
+      reporterName: nonEmptyOrUndefined(reporterName),
+      reporterPhone: nonEmptyOrUndefined(reporterPhone),
+      alternateContact: nonEmptyOrUndefined(alternateContact),
+      reporterEmail: nonEmptyOrUndefined(reporterEmail),
+      relationshipToPerson: nonEmptyOrUndefined(relationshipToPerson),
+      address: nonEmptyOrUndefined(address),
+      area: nonEmptyOrUndefined(area),
+      city: nonEmptyOrUndefined(city),
+      state: nonEmptyOrUndefined(state),
+      pincode: nonEmptyOrUndefined(pincode),
+      landmark: nonEmptyOrUndefined(landmark),
+      lastSeenLocationText: nonEmptyOrUndefined(lastSeenLocationText),
     };
 
     const lostReport = await LostPersonReport.create(payload);
 
+    runMatcherSoon("matchLostToFound", () => matchLostToFound(lostReport));
+
     res.status(201).json({
       success: true,
       message: "Lost person report created",
-      data: { lostReport },
+      data: { lostReport, matchingQueued: true },
     });
   } catch (error) {
     console.error("createLostReport error:", error);
@@ -163,34 +234,22 @@ export const createFoundReport = async (req, res) => {
       currentLocation: location,
       foundTime: parsedFoundTime,
       currentHospitalId: currentHospitalId || null,
-      approxAge:
-        approxAge !== undefined && approxAge !== null
-          ? Number(approxAge)
-          : undefined,
-      gender: gender || "Unknown",
-      description,
-      condition,
-      photoUrl,
+      approxAge: parseOptionalNumber(approxAge),
+      gender: normalizeGender(gender),
+      description: nonEmptyOrUndefined(description),
+      condition: nonEmptyOrUndefined(condition),
+      photoUrl: nonEmptyOrUndefined(photoUrl),
     });
 
-    // Run simple matching to suggest possible links
-    let matches = [];
-    try {
-      matches = await matchFoundToLost(foundReport);
-    } catch (matchErr) {
-      console.error("matchFoundToLost error:", matchErr);
-    }
+    runMatcherSoon("matchFoundToLost", () => matchFoundToLost(foundReport));
 
     res.status(201).json({
       success: true,
       message: "Found person report created",
       data: {
         foundReport,
-        suggestedMatches: matches.map((m) => ({
-          id: m._id,
-          lostReportId: m.lostReportId,
-          score: m.score,
-        })),
+        suggestedMatches: [],
+        matchingQueued: true,
       },
     });
   } catch (error) {
@@ -205,33 +264,36 @@ export const createFoundReport = async (req, res) => {
 // Helper to generate signed URL if photoUrl is an S3 key
 const resolvePhotoUrl = async (photoUrl) => {
   if (!photoUrl) return null;
-  
+  const text = String(photoUrl).trim();
+  if (text.startsWith("/uploads/")) return text;
+  if (text.startsWith("uploads/")) return `/${text}`;
+
   // If it's already a full URL (starts with http/https), return as is
-  if (photoUrl.startsWith('http://') || photoUrl.startsWith('https://')) {
+  if (text.startsWith("http://") || text.startsWith("https://")) {
     // Check if it's a direct S3 URL that needs signing
-    if (photoUrl.includes('.s3.') && photoUrl.includes(BUCKET_NAME)) {
+    if (text.includes(".s3.") && text.includes(BUCKET_NAME)) {
       // Extract S3 key from URL
-      const urlParts = photoUrl.split('/');
-      const keyIndex = urlParts.findIndex(part => part.includes('.s3.'));
+      const urlParts = text.split("/");
+      const keyIndex = urlParts.findIndex((part) => part.includes(".s3."));
       if (keyIndex !== -1 && keyIndex < urlParts.length - 1) {
-        const s3Key = urlParts.slice(keyIndex + 1).join('/');
+        const s3Key = urlParts.slice(keyIndex + 1).join("/");
         try {
           return await generateSignedUrl(s3Key, BUCKET_NAME, 3600 * 24 * 7); // 7 days
         } catch (err) {
           console.error("Error generating signed URL:", err);
-          return photoUrl; // Fallback to original
+          return text; // Fallback to original
         }
       }
     }
-    return photoUrl;
+    return text;
   }
-  
+
   // If it looks like an S3 key (no http), generate signed URL
   try {
-    return await generateSignedUrl(photoUrl, BUCKET_NAME, 3600 * 24 * 7); // 7 days
+    return await generateSignedUrl(text, BUCKET_NAME, 3600 * 24 * 7); // 7 days
   } catch (err) {
     console.error("Error generating signed URL for key:", err);
-    return photoUrl; // Fallback to original
+    return text; // Fallback to original
   }
 };
 
@@ -244,28 +306,28 @@ export const getMyLostReports = async (req, res) => {
       .sort({ createdAt: -1 })
       .populate(
         "matchedFoundReportId",
-        "approxAge gender description currentLocation foundTime photoUrl condition status"
+        "approxAge gender description currentLocation foundTime photoUrl condition status",
       );
 
     // Generate signed URLs for all photo URLs
     const reportsWithSignedUrls = await Promise.all(
       reports.map(async (report) => {
         const reportObj = report.toObject();
-        
+
         // Resolve main photo URL
         if (reportObj.photoUrl) {
           reportObj.photoUrl = await resolvePhotoUrl(reportObj.photoUrl);
         }
-        
+
         // Resolve matched report photo URL if exists
         if (reportObj.matchedFoundReportId?.photoUrl) {
           reportObj.matchedFoundReportId.photoUrl = await resolvePhotoUrl(
-            reportObj.matchedFoundReportId.photoUrl
+            reportObj.matchedFoundReportId.photoUrl,
           );
         }
-        
+
         return reportObj;
-      })
+      }),
     );
 
     res.json({
@@ -282,4 +344,3 @@ export const getMyLostReports = async (req, res) => {
     });
   }
 };
-

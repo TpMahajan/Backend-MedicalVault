@@ -1,10 +1,14 @@
 import express from "express";
-import { requireAdminAuth, requireAdminPermissions } from "../middleware/adminAuth.js";
+import {
+  requireAdminAuth,
+  requireAdminPermissions,
+} from "../middleware/adminAuth.js";
 import {
   getSummary,
   listReports,
   updateReportStatus,
   sendReporterNotification,
+  listFoundReports,
   listMatches,
   confirmMatch,
   rejectMatch,
@@ -16,44 +20,49 @@ router.get(
   "/summary",
   requireAdminAuth,
   requireAdminPermissions("VIEW_SOS"),
-  getSummary
+  getSummary,
 );
 router.get(
   "/reports",
   requireAdminAuth,
   requireAdminPermissions("VIEW_SOS"),
-  listReports
+  listReports,
+);
+router.get(
+  "/found-reports",
+  requireAdminAuth,
+  requireAdminPermissions("VIEW_SOS"),
+  listFoundReports,
 );
 router.patch(
   "/reports/:id/status",
   requireAdminAuth,
   requireAdminPermissions("HANDLE_SOS"),
-  updateReportStatus
+  updateReportStatus,
 );
 router.post(
   "/reports/:id/notify",
   requireAdminAuth,
   requireAdminPermissions("HANDLE_SOS"),
-  sendReporterNotification
+  sendReporterNotification,
 );
 router.get(
   "/matches",
   requireAdminAuth,
   requireAdminPermissions("VIEW_SOS"),
-  listMatches
+  listMatches,
 );
 router.post(
   "/matches/:id/confirm",
   requireAdminAuth,
   requireAdminPermissions("HANDLE_SOS"),
-  confirmMatch
+  confirmMatch,
 );
 router.post(
   "/matches/:id/reject",
   requireAdminAuth,
   requireAdminPermissions("HANDLE_SOS"),
-  rejectMatch
+  rejectMatch,
 );
 
 export default router;
-

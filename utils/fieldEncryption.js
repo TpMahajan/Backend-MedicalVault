@@ -35,7 +35,9 @@ export const decryptField = (value) => {
   const key = keyBuffer();
   if (!key) return encoded;
   try {
-    const [, ivB64, tagB64, dataB64] = encoded.split(":");
+    // Format: "enc:v1:<iv>:<tag>:<data>" — the prefix itself contains a
+    // colon, so take the last three segments (base64 never contains ":").
+    const [ivB64, tagB64, dataB64] = encoded.split(":").slice(-3);
     const decipher = crypto.createDecipheriv(
       "aes-256-gcm",
       key,

@@ -103,7 +103,9 @@ const normalizeReportType = (value) => {
   const raw = asText(value).toLowerCase().replace(/\s+/g, "_");
   if (!raw || raw === "all") return "";
 
-  if (["medicalvault_profile", "medical_vault_profile", "profile"].includes(raw)) {
+  if (
+    ["medicalvault_profile", "medical_vault_profile", "profile"].includes(raw)
+  ) {
     return "medicalvault_profile";
   }
   if (["family_friend", "family", "friend"].includes(raw)) {
@@ -191,14 +193,18 @@ const enrichLostReportMedia = async (report) => {
   if (output.lostPersonUserId?.profilePicture) {
     output.lostPersonUserId = {
       ...output.lostPersonUserId,
-      profilePicture: await resolvePhotoUrl(output.lostPersonUserId.profilePicture),
+      profilePicture: await resolvePhotoUrl(
+        output.lostPersonUserId.profilePicture,
+      ),
     };
   }
 
   if (output.reportedByUserId?.profilePicture) {
     output.reportedByUserId = {
       ...output.reportedByUserId,
-      profilePicture: await resolvePhotoUrl(output.reportedByUserId.profilePicture),
+      profilePicture: await resolvePhotoUrl(
+        output.reportedByUserId.profilePicture,
+      ),
     };
   }
 
@@ -230,6 +236,15 @@ const enrichMatchMedia = async (match) => {
     };
   }
 
+  return output;
+};
+
+const enrichFoundReportMedia = async (report) => {
+  if (!report) return null;
+  const output = { ...report };
+  if (output.photoUrl) {
+    output.photoUrl = await resolvePhotoUrl(output.photoUrl);
+  }
   return output;
 };
 
@@ -284,7 +299,9 @@ const toAdminReportPayload = (report, matchStats = {}) => {
   const address = extractAddress(report);
   const actionHistory = Array.isArray(report?.actionHistory)
     ? [...report.actionHistory].sort(
-        (a, b) => new Date(b?.changedAt || 0).getTime() - new Date(a?.changedAt || 0).getTime()
+        (a, b) =>
+          new Date(b?.changedAt || 0).getTime() -
+          new Date(a?.changedAt || 0).getTime(),
       )
     : [];
 
@@ -452,11 +469,14 @@ const appendReportAction = ({
 
 const hydrateReportById = async (reportId) => {
   const report = await LostPersonReport.findById(reportId)
-    .populate("reportedByUserId", "name email mobile emergencyContact profilePicture")
+    .populate(
+      "reportedByUserId",
+      "name email mobile emergencyContact profilePicture",
+    )
     .populate("lostPersonUserId", "name email mobile gender age profilePicture")
     .populate(
       "matchedFoundReportId",
-      "_id approxAge gender description currentLocation foundTime photoUrl condition status createdAt updatedAt"
+      "_id approxAge gender description currentLocation foundTime photoUrl condition status createdAt updatedAt",
     )
     .populate("assignedAdminId", "name email role")
     .lean();
@@ -479,7 +499,9 @@ export const getSummary = async (req, res) => {
       LostPersonReport.countDocuments({
         status: { $in: ["open", "under_review", "matched"] },
       }),
-      LostPersonReport.countDocuments({ status: { $in: ["found", "resolved"] } }),
+      LostPersonReport.countDocuments({
+        status: { $in: ["found", "resolved"] },
+      }),
       FoundPersonReport.countDocuments({ status: "unmatched" }),
       LostFoundMatch.countDocuments({ status: "suggested" }),
       Notification.countDocuments({ "data.module": "lost_found" }),
@@ -513,7 +535,7 @@ export const listReports = async (req, res) => {
     const page = parsePositiveInt(req.query.page, 1);
     const limit = Math.min(
       parsePositiveInt(req.query.limit, DEFAULT_PAGE_SIZE),
-      MAX_PAGE_SIZE
+      MAX_PAGE_SIZE,
     );
     const sort = asText(req.query.sort).toLowerCase() === "oldest" ? 1 : -1;
 
@@ -525,11 +547,17 @@ export const listReports = async (req, res) => {
         .sort({ createdAt: sort, _id: sort })
         .skip((page - 1) * limit)
         .limit(limit)
-        .populate("reportedByUserId", "name email mobile emergencyContact profilePicture")
-        .populate("lostPersonUserId", "name email mobile gender age profilePicture")
+        .populate(
+          "reportedByUserId",
+          "name email mobile emergencyContact profilePicture",
+        )
+        .populate(
+          "lostPersonUserId",
+          "name email mobile gender age profilePicture",
+        )
         .populate(
           "matchedFoundReportId",
-          "_id approxAge gender description currentLocation foundTime photoUrl condition status createdAt updatedAt"
+          "_id approxAge gender description currentLocation foundTime photoUrl condition status createdAt updatedAt",
         )
         .populate("assignedAdminId", "name email role")
         .lean(),
@@ -565,11 +593,11 @@ export const listReports = async (req, res) => {
     }
 
     const reportsWithMedia = await Promise.all(
-      reports.map((report) => enrichLostReportMedia(report))
+      reports.map((report) => enrichLostReportMedia(report)),
     );
 
     const items = reportsWithMedia.map((report) =>
-      toAdminReportPayload(report, matchStatsByReportId)
+      toAdminReportPayload(report, matchStatsByReportId),
     );
 
     res.json({
@@ -694,7 +722,9 @@ export const sendReporterNotification = async (req, res) => {
   try {
     const reportId = asText(req.params.id);
     if (!isObjectId(reportId)) {
-      return res.status(400).json({ success: false, message: "Invalid report ID" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid report ID" });
     }
 
     const report = await LostPersonReport.findById(reportId);
@@ -712,7 +742,8 @@ export const sendReporterNotification = async (req, res) => {
       });
     }
 
-    const foundLocation = asText(req.body?.foundLocation) || asText(report.foundLocation);
+    const foundLocation =
+      asText(req.body?.foundLocation) || asText(report.foundLocation);
     const customMessage = asText(req.body?.message);
     const statusLabel = normalizeLostStatus(report.status) || "open";
 
@@ -746,13 +777,19 @@ export const sendReporterNotification = async (req, res) => {
     });
 
     let push = { success: false, error: "No FCM token" };
-    const reporter = await User.findById(recipientUserId).select("fcmToken").lean();
+    const reporter = await User.findById(recipientUserId)
+      .select("fcmToken")
+      .lean();
     if (reporter?.fcmToken) {
-      push = await sendPushNotification(reporter.fcmToken, { title, body }, {
-        module: "lost_found",
-        reportId,
-        status: statusLabel,
-      });
+      push = await sendPushNotification(
+        reporter.fcmToken,
+        { title, body },
+        {
+          module: "lost_found",
+          reportId,
+          status: statusLabel,
+        },
+      );
     }
 
     if (push.success) {
@@ -786,7 +823,10 @@ export const sendReporterNotification = async (req, res) => {
         await notificationModule.broadcastNotification(notification);
       }
     } catch (broadcastError) {
-      console.error("sendReporterNotification broadcast error:", broadcastError);
+      console.error(
+        "sendReporterNotification broadcast error:",
+        broadcastError,
+      );
     }
 
     res.json({
@@ -817,16 +857,18 @@ export const listMatches = async (req, res) => {
       .limit(limit)
       .populate(
         "lostReportId",
-        "_id personName approxAge gender description clothingDescription identificationDetails medicalNotes lastSeenLocation lastSeenLocationText lastSeenTime photoUrl status city state pincode createdAt updatedAt"
+        "_id personName approxAge gender description clothingDescription identificationDetails medicalNotes lastSeenLocation lastSeenLocationText lastSeenTime photoUrl status city state pincode createdAt updatedAt",
       )
       .populate(
         "foundReportId",
-        "_id approxAge gender description currentLocation foundTime photoUrl condition status currentHospitalId createdAt updatedAt"
+        "_id approxAge gender description currentLocation foundTime photoUrl condition status currentHospitalId createdAt updatedAt",
       )
       .populate("reviewedByAdminId", "name email")
       .lean();
 
-    const items = await Promise.all(matches.map((entry) => enrichMatchMedia(entry)));
+    const items = await Promise.all(
+      matches.map((entry) => enrichMatchMedia(entry)),
+    );
 
     res.json({
       success: true,
@@ -837,6 +879,42 @@ export const listMatches = async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to fetch lost & found matches",
+    });
+  }
+};
+
+export const listFoundReports = async (req, res) => {
+  try {
+    const limit = Math.min(parsePositiveInt(req.query.limit, 50), 200);
+    const status = asText(req.query.status).toLowerCase();
+    const query = {};
+    if (["unmatched", "under_evaluation", "matched"].includes(status)) {
+      query.status = status;
+    }
+
+    const reports = await FoundPersonReport.find(query)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .populate(
+        "reportedByUserId",
+        "name email mobile emergencyContact profilePicture",
+      )
+      .populate("matchedLostReportId", "_id personName status photoUrl")
+      .lean();
+
+    const items = await Promise.all(
+      reports.map((entry) => enrichFoundReportMedia(entry)),
+    );
+
+    res.json({
+      success: true,
+      data: { reports: items },
+    });
+  } catch (error) {
+    console.error("listFoundReports error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch found person reports",
     });
   }
 };
@@ -871,7 +949,7 @@ export const confirmMatch = async (req, res) => {
               status: "match_confirmed",
               note: "Suggested match accepted",
               message: `Match confirmed with confidence ${Math.round(
-                Number(match.score || 0)
+                Number(match.score || 0),
               )}%`,
               changedByAdminId: req.admin?._id || null,
               changedByName: getAdminName(req),
@@ -879,7 +957,7 @@ export const confirmMatch = async (req, res) => {
             },
           },
         },
-        { new: true }
+        { new: true },
       ),
       FoundPersonReport.findByIdAndUpdate(match.foundReportId, {
         status: "matched",
@@ -900,7 +978,7 @@ export const confirmMatch = async (req, res) => {
             reviewedByAdminId: req.admin?._id || null,
             reviewedAt: actionTime,
           },
-        }
+        },
       ),
     ]);
 

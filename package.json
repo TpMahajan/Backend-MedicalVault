@@ -12,12 +12,13 @@
     "security:audit": "npm audit --omit=dev",
     "security:check": "node --check index.js && npm run security:audit",
     "backup:create": "node ./scripts/backup-db.js",
-    "backup:restore": "node ./scripts/restore-db.js"
+    "backup:restore": "node ./scripts/restore-db.js",
+    "migrate:dedupe-lost-found-matches": "node ./scripts/dedupe-lost-found-matches.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.540.0",
     "@aws-sdk/s3-request-presigner": "^3.540.0",
-    "axios": "^1.12.2",
+    "axios": "^1.18.1",
     "bcryptjs": "^2.4.3",
     "compression": "^1.7.4",
     "cors": "^2.8.5",
@@ -25,28 +26,33 @@
     "express": "^4.19.2",
     "express-rate-limit": "^7.1.5",
     "express-validator": "^7.0.1",
-    "firebase-admin": "^13.7.0",
+    "firebase-admin": "^14.1.0",
     "google-auth-library": "^9.14.2",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
-    "mongoose": "^8.4.1",
+    "mongoose": "^8.24.1",
     "morgan": "^1.10.0",
-    "multer": "^1.4.5-lts.1",
+    "multer": "^2.2.0",
     "multer-s3": "^3.0.1",
     "node-cron": "^4.2.1",
-    "nodemailer": "^7.0.6",
+    "nodemailer": "^9.0.1",
     "pdf-parse": "^2.3.12",
     "resend": "^6.2.2",
     "tesseract.js": "^6.0.1",
     "ws": "^8.18.3"
   },
   "devDependencies": {
-    "jest": "^29.7.0",
+    "jest": "^30.4.2",
     "nodemon": "^3.1.0",
-    "supertest": "^6.3.3"
+    "supertest": "^7.2.2"
   },
   "overrides": {
-    "fast-xml-parser": "5.5.8",
+    "@google-cloud/storage": "7.21.0",
+    "fast-xml-parser": "5.9.3",
+    "gaxios": "7.1.5",
+    "js-yaml": "5.1.0",
+    "teeny-request": "10.1.3",
+    "uuid": "14.0.1",
     "@tootallnate/once": "3.0.1"
   },
   "keywords": [

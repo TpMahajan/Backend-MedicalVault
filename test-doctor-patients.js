@@ -3,7 +3,7 @@
 
 import fetch from 'node-fetch';
 
-const API_BASE = 'http://localhost:5000';
+const API_BASE = 'http://localhost:5001';
 
 async function testDoctorPatientsEndpoint() {
     console.log('🧪 Testing /api/doctors/patients endpoint\n');
@@ -73,7 +73,7 @@ async function testDoctorPatientsEndpoint() {
     } catch (error) {
         console.error('❌ Test failed with error:', error.message);
         console.error('\nPossible issues:');
-        console.error('  - Backend server is not running (check http://localhost:5000)');
+        console.error('  - Backend server is not running (check http://localhost:5001)');
         console.error('  - Invalid JWT token');
         console.error('  - MongoDB connection issue');
         console.error('  - Network error\n');

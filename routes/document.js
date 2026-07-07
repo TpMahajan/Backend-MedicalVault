@@ -12,29 +12,40 @@ import { Document } from "../models/File.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { Session } from "../models/Session.js";
-import { checkSession, checkSessionByEmail } from "../middleware/checkSession.js";
+import {
+  checkSession,
+  checkSessionByEmail,
+} from "../middleware/checkSession.js";
 import s3Client, { BUCKET_NAME, REGION } from "../config/s3.js";
-import { generateSignedUrl, generatePreviewUrl, generateDownloadUrl } from "../utils/s3Utils.js";
+import {
+  generateSignedUrl,
+  generatePreviewUrl,
+  generateDownloadUrl,
+} from "../utils/s3Utils.js";
 import { sendNotification } from "../utils/notifications.js";
 import { canDoctorAccessPatient } from "../services/accessControl.js";
 import { writeAuditLog } from "../middleware/auditLogger.js";
 import { uploadLimiter } from "../middleware/rateLimit.js";
 import DocumentReader from "../services/documentReader.js";
+import { resolveUploadStorage } from "../services/uploadStoragePolicy.js";
 
 const router = express.Router();
 
 const privilegedRoles = new Set(["admin", "superadmin"]);
-const MALWARE_SCAN_API_URL = String(process.env.MALWARE_SCAN_API_URL || "").trim();
+const MALWARE_SCAN_API_URL = String(
+  process.env.MALWARE_SCAN_API_URL || "",
+).trim();
 const MALWARE_SCAN_FAIL_CLOSED =
-  String(process.env.MALWARE_SCAN_FAIL_CLOSED || "false").toLowerCase() === "true";
+  String(process.env.MALWARE_SCAN_FAIL_CLOSED || "false").toLowerCase() ===
+  "true";
 const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || "").trim();
 const DOCUMENT_CLASSIFIER_MODEL = String(
-  process.env.DOCUMENT_CLASSIFIER_MODEL || "gpt-4o-mini"
+  process.env.DOCUMENT_CLASSIFIER_MODEL || "gpt-4o-mini",
 ).trim();
 const DOCUMENT_CATEGORY_CLASSIFIER_MODEL = String(
   process.env.DOCUMENT_CATEGORY_CLASSIFIER_MODEL ||
     DOCUMENT_CLASSIFIER_MODEL ||
-    "gpt-4o-mini"
+    "gpt-4o-mini",
 ).trim();
 const DOCUMENT_REJECT_MESSAGE =
   "Only medical-related documents are allowed. Please upload valid reports, prescriptions, or health records.";
@@ -48,15 +59,27 @@ const MAX_AI_CATEGORY_CHARS = 350;
 const DEFAULT_CLASSIFIER_TIMEOUT_MS = 2500;
 const DEFAULT_CATEGORY_CLASSIFIER_TIMEOUT_MS = 3000;
 const DEFAULT_VALIDATION_PDF_PAGES = 2;
+const DEFAULT_VALIDATION_TEXT_TIMEOUT_MS = 6000;
+const DEFAULT_VALIDATION_OCR_TIMEOUT_MS = 5000;
 const VALIDATION_PDF_PAGES = parsePositiveInteger(
   process.env.DOCUMENT_VALIDATION_PDF_PAGES,
-  DEFAULT_VALIDATION_PDF_PAGES
+  DEFAULT_VALIDATION_PDF_PAGES,
+);
+const VALIDATION_TEXT_TIMEOUT_MS = parsePositiveInteger(
+  process.env.DOCUMENT_VALIDATION_TEXT_TIMEOUT_MS,
+  DEFAULT_VALIDATION_TEXT_TIMEOUT_MS,
+);
+const VALIDATION_OCR_TIMEOUT_MS = parsePositiveInteger(
+  process.env.DOCUMENT_VALIDATION_OCR_TIMEOUT_MS,
+  DEFAULT_VALIDATION_OCR_TIMEOUT_MS,
 );
 const VALIDATION_OCR_LANGUAGES = String(
-  process.env.DOCUMENT_VALIDATION_OCR_LANGUAGES || "eng+hin"
+  process.env.DOCUMENT_VALIDATION_OCR_LANGUAGES || "eng+hin",
 ).trim();
 const ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS =
-  String(process.env.ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS || "false").toLowerCase() === "true";
+  String(
+    process.env.ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS || "false",
+  ).toLowerCase() === "true";
 const validDocumentCategories = ["Report", "Prescription", "Bill", "Insurance"];
 const allowedMimeTypes = new Set([
   "application/pdf",
@@ -73,7 +96,8 @@ const validateUploadFilename = (name = "") => {
   const normalized = String(name || "").toLowerCase();
   return /\.(pdf|jpg|jpeg|png)$/.test(normalized);
 };
-const isValidObjectId = (value) => /^[a-fA-F0-9]{24}$/.test(String(value || ""));
+const isValidObjectId = (value) =>
+  /^[a-fA-F0-9]{24}$/.test(String(value || ""));
 const documentReader = new DocumentReader();
 
 const clinicalMedicalKeywords = [
@@ -162,22 +186,33 @@ const highSignalMedicalPhrases = [
   "hospital claim",
 ];
 
-const isRole = (req, role) => String(req.auth?.role || "").toLowerCase() === role;
+const isRole = (req, role) =>
+  String(req.auth?.role || "").toLowerCase() === role;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const localUploadsRoot = path.resolve(__dirname, "../uploads");
-const localMedicalVaultUploadsRoot = path.resolve(localUploadsRoot, "medical-vault");
+const localMedicalVaultUploadsRoot = path.resolve(
+  localUploadsRoot,
+  "medical-vault",
+);
 
 const getApiBaseUrl = (req) => {
-  const protoHeader = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
-  const hostHeader = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
+  const protoHeader = String(req.headers["x-forwarded-proto"] || "")
+    .split(",")[0]
+    .trim();
+  const hostHeader = String(
+    req.headers["x-forwarded-host"] || req.headers.host || "",
+  )
+    .split(",")[0]
+    .trim();
   const proto = protoHeader || req.protocol || "http";
   const host = hostHeader || `localhost:${process.env.PORT || 5000}`;
   return `${proto}://${host}`;
 };
 
 const buildProxyUrl = (req, docId, disposition = "inline") => {
-  const safeDisposition = disposition === "attachment" ? "attachment" : "inline";
+  const safeDisposition =
+    disposition === "attachment" ? "attachment" : "inline";
   return `${getApiBaseUrl(req)}/api/files/${docId}/proxy?disposition=${safeDisposition}`;
 };
 
@@ -196,10 +231,13 @@ const cleanupRejectedUpload = async ({
         new DeleteObjectCommand({
           Bucket: s3Bucket,
           Key: s3Key,
-        })
+        }),
       );
     } catch (cleanupError) {
-      console.error("Failed to cleanup rejected S3 upload:", cleanupError.message);
+      console.error(
+        "Failed to cleanup rejected S3 upload:",
+        cleanupError.message,
+      );
     }
     return;
   }
@@ -208,7 +246,10 @@ const cleanupRejectedUpload = async ({
     try {
       fs.unlinkSync(localFilePath);
     } catch (cleanupError) {
-      console.error("Failed to cleanup rejected local upload:", cleanupError.message);
+      console.error(
+        "Failed to cleanup rejected local upload:",
+        cleanupError.message,
+      );
     }
   }
 };
@@ -231,7 +272,7 @@ const hasMedicalTerm = (normalizedText, term) => {
   }
 
   const termPattern = new RegExp(
-    `(^|[^a-z0-9])${escapeRegex(normalizedTerm)}([^a-z0-9]|$)`
+    `(^|[^a-z0-9])${escapeRegex(normalizedTerm)}([^a-z0-9]|$)`,
   );
   return termPattern.test(normalizedText);
 };
@@ -260,13 +301,13 @@ const evaluateMedicalKeywordConfidence = (normalizedText) => {
   }
 
   const matchedHighSignal = highSignalMedicalPhrases.filter((phrase) =>
-    hasMedicalTerm(normalizedText, phrase)
+    hasMedicalTerm(normalizedText, phrase),
   );
   const matchedClinical = clinicalMedicalKeywords.filter((keyword) =>
-    hasMedicalTerm(normalizedText, keyword)
+    hasMedicalTerm(normalizedText, keyword),
   );
-  const matchedSupporting = supportingMedicalDocumentKeywords.filter((keyword) =>
-    hasMedicalTerm(normalizedText, keyword)
+  const matchedSupporting = supportingMedicalDocumentKeywords.filter(
+    (keyword) => hasMedicalTerm(normalizedText, keyword),
   );
   const matchedKeywords = [
     ...new Set([
@@ -281,7 +322,9 @@ const evaluateMedicalKeywordConfidence = (normalizedText) => {
   const keywordHits = matchedKeywords.length;
 
   const level =
-    highSignal || clinicalHits >= 2 || (clinicalHits >= 1 && supportingHits >= 1)
+    highSignal ||
+    clinicalHits >= 2 ||
+    (clinicalHits >= 1 && supportingHits >= 1)
       ? "strong"
       : clinicalHits === 1 || supportingHits >= 2
         ? "weak"
@@ -298,7 +341,9 @@ const evaluateMedicalKeywordConfidence = (normalizedText) => {
 };
 
 const normalizeDocumentCategory = (category = "") => {
-  const normalized = String(category || "").toLowerCase().trim();
+  const normalized = String(category || "")
+    .toLowerCase()
+    .trim();
   if (!normalized) return "";
   if (normalized.includes("prescription") || normalized.includes("rx")) {
     return "Prescription";
@@ -386,7 +431,7 @@ const buildCategoryClassificationText = ({
   normalizedText,
 }) =>
   normalizeExtractedText(
-    [title, originalName, notes, normalizedText].filter(Boolean).join(" ")
+    [title, originalName, notes, normalizedText].filter(Boolean).join(" "),
   );
 
 const inferDocumentCategoryByHeuristic = (classificationText) => {
@@ -394,7 +439,7 @@ const inferDocumentCategoryByHeuristic = (classificationText) => {
   if (!text) return "Report";
 
   const scores = Object.fromEntries(
-    validDocumentCategories.map((category) => [category, 0])
+    validDocumentCategories.map((category) => [category, 0]),
   );
 
   for (const [category, keywords] of Object.entries(categoryKeywordGroups)) {
@@ -440,8 +485,7 @@ const classifyDocumentCategoryWithAI = async ({
         messages: [
           {
             role: "system",
-            content:
-              "Return only one: Report, Prescription, Bill, Insurance.",
+            content: "Return only one: Report, Prescription, Bill, Insurance.",
           },
           {
             role: "user",
@@ -456,13 +500,13 @@ const classifyDocumentCategoryWithAI = async ({
         },
         timeout: Number(
           process.env.DOCUMENT_CATEGORY_CLASSIFIER_TIMEOUT_MS ||
-            DEFAULT_CATEGORY_CLASSIFIER_TIMEOUT_MS
+            DEFAULT_CATEGORY_CLASSIFIER_TIMEOUT_MS,
         ),
-      }
+      },
     );
 
     const raw = String(
-      response?.data?.choices?.[0]?.message?.content || ""
+      response?.data?.choices?.[0]?.message?.content || "",
     ).trim();
     const aiCategory = normalizeDocumentCategory(raw);
     return {
@@ -480,7 +524,10 @@ const classifyMedicalTextWithAI = async (normalizedText) => {
     return { success: false, label: "UNKNOWN", reason: "missing_openai_key" };
   }
 
-  const textSample = String(normalizedText || "").slice(0, MAX_AI_CLASSIFIER_CHARS);
+  const textSample = String(normalizedText || "").slice(
+    0,
+    MAX_AI_CLASSIFIER_CHARS,
+  );
   if (!textSample) {
     return { success: false, label: "UNKNOWN", reason: "empty_text" };
   }
@@ -511,18 +558,17 @@ const classifyMedicalTextWithAI = async (normalizedText) => {
         },
         timeout: Number(
           process.env.DOCUMENT_CLASSIFIER_TIMEOUT_MS ||
-            DEFAULT_CLASSIFIER_TIMEOUT_MS
+            DEFAULT_CLASSIFIER_TIMEOUT_MS,
         ),
-      }
+      },
     );
 
-    const raw = String(
-      response?.data?.choices?.[0]?.message?.content || ""
-    )
+    const raw = String(response?.data?.choices?.[0]?.message?.content || "")
       .trim()
       .toUpperCase()
       .replace(/[^A-Z_]/g, "");
-    const label = raw === "MEDICAL" || raw === "NON_MEDICAL" ? raw : "NON_MEDICAL";
+    const label =
+      raw === "MEDICAL" || raw === "NON_MEDICAL" ? raw : "NON_MEDICAL";
     return { success: true, label, reason: "ai_classified" };
   } catch (error) {
     console.error("Medical classifier AI fallback failed:", error.message);
@@ -530,20 +576,46 @@ const classifyMedicalTextWithAI = async (normalizedText) => {
   }
 };
 
+const withTimeout = (promise, timeoutMs, label) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(`${label}_timeout`)), timeoutMs);
+    }),
+  ]);
+
 const extractTextForMedicalValidation = async ({
   usingS3Storage,
   s3Key,
   s3Bucket,
   localFilePath,
   mimeType,
+  skipImageOcr = false,
 }) => {
+  const normalizedMimeType = String(mimeType || "").toLowerCase();
+  const isImage = normalizedMimeType.startsWith("image/");
+  if (isImage && skipImageOcr) {
+    return { success: false, text: "", reason: "image_ocr_skipped" };
+  }
+
   if (usingS3Storage && s3Key && s3Bucket) {
-    const extracted = await documentReader.extractTextFromS3(s3Key, s3Bucket, {
-      pdfParseParams: { first: VALIDATION_PDF_PAGES },
-      imageOcrOptions: { languages: VALIDATION_OCR_LANGUAGES },
-    });
+    const extracted = await withTimeout(
+      documentReader.extractTextFromS3(s3Key, s3Bucket, {
+        pdfParseParams: { first: VALIDATION_PDF_PAGES },
+        imageOcrOptions: {
+          languages: VALIDATION_OCR_LANGUAGES,
+          timeoutMs: VALIDATION_OCR_TIMEOUT_MS,
+        },
+      }),
+      isImage ? VALIDATION_OCR_TIMEOUT_MS : VALIDATION_TEXT_TIMEOUT_MS,
+      isImage ? "ocr" : "text_extraction",
+    );
     if (!extracted?.success) {
-      return { success: false, text: "", reason: extracted?.error || "s3_extract_failed" };
+      return {
+        success: false,
+        text: "",
+        reason: extracted?.error || "s3_extract_failed",
+      };
     }
     return { success: true, text: extracted.text || "" };
   }
@@ -553,19 +625,32 @@ const extractTextForMedicalValidation = async ({
   }
 
   try {
-    if (String(mimeType || "").toLowerCase() === "application/pdf") {
-      const extracted = await documentReader.extractFromPDF(localFilePath, {
-        parseParams: { first: VALIDATION_PDF_PAGES },
-      });
+    if (normalizedMimeType === "application/pdf") {
+      const extracted = await withTimeout(
+        documentReader.extractFromPDF(localFilePath, {
+          parseParams: { first: VALIDATION_PDF_PAGES },
+        }),
+        VALIDATION_TEXT_TIMEOUT_MS,
+        "pdf_text_extraction",
+      );
       return { success: true, text: extracted?.text || "" };
     }
 
-    const extracted = await documentReader.extractFromImage(localFilePath, {
-      languages: VALIDATION_OCR_LANGUAGES,
-    });
+    const extracted = await withTimeout(
+      documentReader.extractFromImage(localFilePath, {
+        languages: VALIDATION_OCR_LANGUAGES,
+        timeoutMs: VALIDATION_OCR_TIMEOUT_MS,
+      }),
+      VALIDATION_OCR_TIMEOUT_MS,
+      "ocr",
+    );
     return { success: true, text: extracted?.text || "" };
   } catch (error) {
-    return { success: false, text: "", reason: error.message || "local_extract_failed" };
+    return {
+      success: false,
+      text: "",
+      reason: error.message || "local_extract_failed",
+    };
   }
 };
 
@@ -577,12 +662,39 @@ const validateMedicalDocumentContent = async ({
   mimeType,
   title,
   originalName,
+  category,
 }) => {
-  // User-entered labels can help later categorization, but they cannot prove
-  // the uploaded file itself is medical.
   const metadataText = normalizeExtractedText(
-    [title, originalName].filter(Boolean).join(" ")
+    [category, title, originalName].filter(Boolean).join(" "),
   );
+  const metadataKeywordDecision =
+    evaluateMedicalKeywordConfidence(metadataText);
+  const normalizedMimeType = String(mimeType || "").toLowerCase();
+  const isPdf = normalizedMimeType === "application/pdf";
+  const isImage = normalizedMimeType.startsWith("image/");
+
+  if (
+    isImage &&
+    ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS &&
+    metadataKeywordDecision.level === "strong"
+  ) {
+    return {
+      allow: true,
+      reason: "metadata_medical_accept",
+      normalizedText: "",
+      classificationText: metadataText,
+      keywordDecision: metadataKeywordDecision,
+      verification: buildVerificationPayload({
+        status: "accepted",
+        label: "MEDICAL",
+        method: "metadata",
+        reason:
+          "The selected category and file metadata look medical; OCR was skipped for a fast safe upload.",
+        confidence: "low",
+        keywordDecision: metadataKeywordDecision,
+      }),
+    };
+  }
 
   const extracted = await extractTextForMedicalValidation({
     usingS3Storage,
@@ -590,14 +702,40 @@ const validateMedicalDocumentContent = async ({
     s3Bucket,
     localFilePath,
     mimeType,
+    skipImageOcr:
+      isImage &&
+      ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS &&
+      metadataKeywordDecision.level === "strong",
   });
 
   const normalizedText = normalizeExtractedText(extracted?.text || "");
   const classificationText = normalizeExtractedText(
-    [normalizedText, metadataText].filter(Boolean).join(" ")
+    [normalizedText, metadataText].filter(Boolean).join(" "),
   );
   if (!extracted?.success || normalizedText.length < MIN_MEDICAL_TEXT_LENGTH) {
-    const partialKeywordDecision = evaluateMedicalKeywordConfidence(normalizedText);
+    const partialKeywordDecision =
+      evaluateMedicalKeywordConfidence(normalizedText);
+    if (
+      ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS &&
+      metadataKeywordDecision.level === "strong"
+    ) {
+      return {
+        allow: true,
+        reason: "metadata_medical_accept",
+        normalizedText,
+        classificationText: classificationText || metadataText,
+        keywordDecision: metadataKeywordDecision,
+        verification: buildVerificationPayload({
+          status: "accepted",
+          label: "MEDICAL",
+          method: "metadata",
+          reason:
+            "Readable document text was limited, but category/title/filename metadata is medical.",
+          confidence: "low",
+          keywordDecision: metadataKeywordDecision,
+        }),
+      };
+    }
     if (
       ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS &&
       partialKeywordDecision.level === "strong"
@@ -611,9 +749,28 @@ const validateMedicalDocumentContent = async ({
         verification: buildVerificationPayload({
           status: "accepted",
           label: "MEDICAL",
-          method: "keyword",
+          method: isPdf ? "pdf_text" : "ocr",
           reason:
             "Readable text was limited, but the extracted content contained strong medical terms.",
+          confidence: "low",
+          keywordDecision: partialKeywordDecision,
+        }),
+      };
+    }
+
+    if (ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS) {
+      return {
+        allow: true,
+        reason: "manual_review_required",
+        normalizedText,
+        classificationText: classificationText || metadataText,
+        keywordDecision: partialKeywordDecision,
+        verification: buildVerificationPayload({
+          status: "accepted",
+          label: "UNKNOWN",
+          method: "manual_review_required",
+          reason:
+            "Document passed file security checks, but verification confidence is limited.",
           confidence: "low",
           keywordDecision: partialKeywordDecision,
         }),
@@ -630,7 +787,8 @@ const validateMedicalDocumentContent = async ({
         status: "rejected",
         label: "UNKNOWN",
         method: "inconclusive",
-        reason: "Could not extract enough readable text to verify the document.",
+        reason:
+          "Could not extract enough readable text to verify the document.",
         confidence: "low",
       }),
     };
@@ -647,7 +805,7 @@ const validateMedicalDocumentContent = async ({
       verification: buildVerificationPayload({
         status: "verified",
         label: "MEDICAL",
-        method: "keyword",
+        method: isPdf ? "pdf_text" : "ocr",
         reason: "Medical terms were found in the document text.",
         confidence: "high",
         keywordDecision,
@@ -665,13 +823,14 @@ const validateMedicalDocumentContent = async ({
         allow: true,
         reason: "ai_medical_allow",
         normalizedText,
-        classificationText: classificationText || normalizedText || metadataText,
+        classificationText:
+          classificationText || normalizedText || metadataText,
         keywordDecision,
         aiDecision,
         verification: buildVerificationPayload({
           status: "verified",
           label: "MEDICAL",
-          method: "ai",
+          method: "ai_classifier",
           reason: "AI classified the document as medical.",
           confidence: "medium",
           keywordDecision,
@@ -680,28 +839,36 @@ const validateMedicalDocumentContent = async ({
     }
   }
 
+  const allowWeakInconclusive =
+    ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS && keywordDecision.level === "weak";
+
   return {
-    allow: false,
-    reason: "non_medical_reject",
+    allow: allowWeakInconclusive,
+    reason: allowWeakInconclusive
+      ? "manual_review_required"
+      : "non_medical_reject",
     message: DOCUMENT_REJECT_MESSAGE,
     normalizedText,
     classificationText: classificationText || normalizedText || metadataText,
     keywordDecision,
     aiDecision,
     verification: buildVerificationPayload({
-      status: "rejected",
-      label: "NON_MEDICAL",
-      method: aiDecision?.success ? "ai" : "keyword",
-      reason: aiDecision?.success
-        ? "AI classified the document as non-medical."
-        : "The document text did not contain reliable medical evidence.",
+      status: allowWeakInconclusive ? "accepted" : "rejected",
+      label: allowWeakInconclusive ? "UNKNOWN" : "NON_MEDICAL",
+      method: aiDecision?.success ? "ai_classifier" : "manual_review_required",
+      reason: allowWeakInconclusive
+        ? "Document passed file security checks, but verification confidence is limited."
+        : aiDecision?.success
+          ? "AI classified the document as non-medical."
+          : "The document text did not contain reliable medical evidence.",
       confidence: aiDecision?.success ? "medium" : "low",
       keywordDecision,
     }),
   };
 };
 
-const getOptionalDocumentField = (doc, key) => doc?.get?.(key) ?? doc?.[key] ?? null;
+const getOptionalDocumentField = (doc, key) =>
+  doc?.get?.(key) ?? doc?.[key] ?? null;
 
 const resolveStoredDocumentUrl = (req, doc) => {
   const candidates = [
@@ -732,7 +899,10 @@ const resolveLocalDocumentPath = (doc) => {
 
   const addUploadRelativePath = (rawValue) => {
     if (!rawValue) return;
-    const normalized = rawValue.replace(/\\/g, "/").replace(/^\/+/, "").replace(/^uploads\//i, "");
+    const normalized = rawValue
+      .replace(/\\/g, "/")
+      .replace(/^\/+/, "")
+      .replace(/^uploads\//i, "");
     if (!normalized) return;
     candidates.push(path.resolve(process.cwd(), "uploads", normalized));
     candidates.push(path.resolve(localUploadsRoot, normalized));
@@ -748,7 +918,9 @@ const resolveLocalDocumentPath = (doc) => {
         const pathname = decodeURIComponent(new URL(trimmed).pathname || "");
         const uploadsIndex = pathname.toLowerCase().lastIndexOf("/uploads/");
         if (uploadsIndex >= 0) {
-          addUploadRelativePath(pathname.slice(uploadsIndex + "/uploads/".length));
+          addUploadRelativePath(
+            pathname.slice(uploadsIndex + "/uploads/".length),
+          );
         }
         return;
       }
@@ -759,14 +931,23 @@ const resolveLocalDocumentPath = (doc) => {
     const normalized = trimmed.replace(/\\/g, "/");
     const uploadsIndex = normalized.toLowerCase().lastIndexOf("/uploads/");
     if (uploadsIndex >= 0) {
-      addUploadRelativePath(normalized.slice(uploadsIndex + "/uploads/".length));
+      addUploadRelativePath(
+        normalized.slice(uploadsIndex + "/uploads/".length),
+      );
     } else if (normalized.toLowerCase().startsWith("uploads/")) {
       addUploadRelativePath(normalized.slice("uploads/".length));
     }
 
     candidates.push(path.resolve(trimmed));
-    candidates.push(path.resolve(process.cwd(), normalized.replace(/^\/+/, "")));
-    candidates.push(path.resolve(localUploadsRoot, normalized.replace(/^uploads\/+/i, "").replace(/^\/+/, "")));
+    candidates.push(
+      path.resolve(process.cwd(), normalized.replace(/^\/+/, "")),
+    );
+    candidates.push(
+      path.resolve(
+        localUploadsRoot,
+        normalized.replace(/^uploads\/+/i, "").replace(/^\/+/, ""),
+      ),
+    );
   };
 
   [
@@ -786,25 +967,41 @@ const resolveLocalDocumentPath = (doc) => {
 
   if (typeof fileName === "string" && fileName.trim()) {
     candidates.push(path.resolve(process.cwd(), "uploads", fileName.trim()));
-    candidates.push(path.resolve(process.cwd(), "uploads", "medical-vault", fileName.trim()));
+    candidates.push(
+      path.resolve(process.cwd(), "uploads", "medical-vault", fileName.trim()),
+    );
     candidates.push(path.resolve(localUploadsRoot, fileName.trim()));
-    candidates.push(path.resolve(localUploadsRoot, "medical-vault", fileName.trim()));
+    candidates.push(
+      path.resolve(localUploadsRoot, "medical-vault", fileName.trim()),
+    );
   }
 
-  return [...new Set(candidates.filter(Boolean))].find((candidatePath) => fs.existsSync(candidatePath)) || "";
+  return (
+    [...new Set(candidates.filter(Boolean))].find((candidatePath) =>
+      fs.existsSync(candidatePath),
+    ) || ""
+  );
 };
 
 const resolvePreviewFallbackUrl = (req, doc) => {
   if (resolveLocalDocumentPath(doc)) {
     return buildProxyUrl(req, doc._id.toString(), "inline");
   }
-  return resolveStoredDocumentUrl(req, doc) || buildProxyUrl(req, doc._id.toString(), "inline");
+  return (
+    resolveStoredDocumentUrl(req, doc) ||
+    buildProxyUrl(req, doc._id.toString(), "inline")
+  );
 };
 
 const resolveDownloadFallbackUrl = (req, doc) =>
   buildProxyUrl(req, doc._id.toString(), "attachment");
 
-const tryProxyStoredDocument = async (req, res, doc, disposition = "inline") => {
+const tryProxyStoredDocument = async (
+  req,
+  res,
+  doc,
+  disposition = "inline",
+) => {
   const storedUrl = resolveStoredDocumentUrl(req, doc);
   if (!storedUrl) return false;
 
@@ -813,13 +1010,24 @@ const tryProxyStoredDocument = async (req, res, doc, disposition = "inline") => 
       responseType: "arraybuffer",
       timeout: 10000,
     });
-    res.setHeader("Content-Type", response.headers["content-type"] || doc.fileType || "application/octet-stream");
-    res.setHeader("Content-Disposition", disposition === "attachment" ? "attachment" : "inline");
+    res.setHeader(
+      "Content-Type",
+      response.headers["content-type"] ||
+        doc.fileType ||
+        "application/octet-stream",
+    );
+    res.setHeader(
+      "Content-Disposition",
+      disposition === "attachment" ? "attachment" : "inline",
+    );
     res.setHeader("Cache-Control", "public, max-age=3600");
     res.end(Buffer.from(response.data));
     return true;
   } catch (error) {
-    console.error(`Stored URL proxy failed for doc ${doc?._id}:`, error?.message || error);
+    console.error(
+      `Stored URL proxy failed for doc ${doc?._id}:`,
+      error?.message || error,
+    );
     return false;
   }
 };
@@ -848,7 +1056,7 @@ const runMalwareScan = async ({ bucket, key, mimeType, size }) => {
   const response = await axios.post(
     MALWARE_SCAN_API_URL,
     { bucket, key, mimeType, size },
-    { timeout: Number(process.env.MALWARE_SCAN_TIMEOUT_MS || 15000) }
+    { timeout: Number(process.env.MALWARE_SCAN_TIMEOUT_MS || 15000) },
   );
 
   const clean = response?.data?.clean === true;
@@ -867,23 +1075,46 @@ const readStreamToBuffer = async (stream) => {
   return Buffer.concat(chunks);
 };
 
-const hasSignature = (buffer, signature) => signature.every((byte, idx) => buffer[idx] === byte);
+const hasSignature = (buffer, signature) =>
+  signature.every((byte, idx) => buffer[idx] === byte);
 
-const validateMagicBytes = async ({ bucket, key, mimeType }) => {
-  const allowedSignatures = magicSignatureByMime[String(mimeType || "").toLowerCase()];
-  if (!allowedSignatures || allowedSignatures.length === 0) return true;
-  const object = await s3Client.send(
-    new GetObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      Range: "bytes=0-15",
-    })
-  );
-  const firstBytes = await readStreamToBuffer(object.Body);
-  if (String(mimeType).toLowerCase() === "image/webp") {
-    return hasSignature(firstBytes, [0x52, 0x49, 0x46, 0x46]) && firstBytes.includes(Buffer.from("WEBP"));
+const readFirstBytesFromLocalFile = async (filePath, byteCount = 16) => {
+  const handle = await fs.promises.open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(byteCount);
+    const { bytesRead } = await handle.read(buffer, 0, byteCount, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
   }
-  return allowedSignatures.some((signature) => hasSignature(firstBytes, signature));
+};
+
+const validateMagicBytes = async ({ bucket, key, mimeType, localFilePath }) => {
+  const allowedSignatures =
+    magicSignatureByMime[String(mimeType || "").toLowerCase()];
+  if (!allowedSignatures || allowedSignatures.length === 0) return true;
+  let firstBytes;
+  if (localFilePath) {
+    firstBytes = await readFirstBytesFromLocalFile(localFilePath);
+  } else {
+    const object = await s3Client.send(
+      new GetObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Range: "bytes=0-15",
+      }),
+    );
+    firstBytes = await readStreamToBuffer(object.Body);
+  }
+  if (String(mimeType).toLowerCase() === "image/webp") {
+    return (
+      hasSignature(firstBytes, [0x52, 0x49, 0x46, 0x46]) &&
+      firstBytes.includes(Buffer.from("WEBP"))
+    );
+  }
+  return allowedSignatures.some((signature) =>
+    hasSignature(firstBytes, signature),
+  );
 };
 
 // ---------------- AWS S3 Storage ----------------
@@ -936,32 +1167,17 @@ const createUploadMiddleware = (storage) =>
 const s3Upload = createUploadMiddleware(s3Storage);
 const localUpload = createUploadMiddleware(localDiskStorage);
 
-const canUseS3Upload = async () => {
-  try {
-    const credentialProvider = s3Client?.config?.credentials;
-    if (!credentialProvider) return false;
-    const credentials =
-      typeof credentialProvider === "function" ? await credentialProvider() : await credentialProvider;
-    return Boolean(credentials?.accessKeyId && credentials?.secretAccessKey);
-  } catch (error) {
-    const message = String(error?.message || "");
-    if (message) {
-      console.warn(`[document-upload] S3 credentials unavailable, using local storage fallback: ${message}`);
-    }
-    return false;
-  }
-};
-
 const singleDocumentUpload = (req, res, next) => {
-  canUseS3Upload()
-    .then((useS3Upload) => {
-      req.documentUploadStorage = useS3Upload ? "s3" : "local";
-      const selectedUpload = useS3Upload ? s3Upload : localUpload;
+  resolveUploadStorage("document-upload")
+    .then((storageMode) => {
+      req.documentUploadStorage = storageMode;
+      const selectedUpload = storageMode === "s3" ? s3Upload : localUpload;
 
       selectedUpload.single("file")(req, res, (err) => {
         if (!err) {
           if (req.file && req.documentUploadStorage === "local") {
-            const storedFileName = req.file.filename || path.basename(req.file.path || "");
+            const storedFileName =
+              req.file.filename || path.basename(req.file.path || "");
             req.file.key = `medical-vault/${storedFileName}`;
             req.file.bucket = "local";
             req.file.location = buildLocalUploadUrl(req, storedFileName);
@@ -984,8 +1200,9 @@ const singleDocumentUpload = (req, res, next) => {
     })
     .catch((err) => {
       const message = err?.message || "Upload failed";
+      const statusCode = Number(err?.statusCode) || 500;
       console.error("Document upload middleware bootstrap error:", err);
-      return res.status(500).json({
+      return res.status(statusCode).json({
         success: false,
         msg: message,
         error: message,
@@ -994,97 +1211,138 @@ const singleDocumentUpload = (req, res, next) => {
 };
 
 // ---------------- Upload ----------------
-router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUpload, async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
+router.post(
+  "/upload",
+  auth,
+  requireVerified,
+  uploadLimiter,
+  singleDocumentUpload,
+  async (req, res) => {
+    const uploadStartedAt = Date.now();
+    try {
+      if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
 
-    const { title, category, date, notes, userId } = req.body;
+      const { title, category, date, notes, userId } = req.body;
 
-    const requestedCategory = normalizeDocumentCategory(category);
-    const categoryWasProvided = Boolean(requestedCategory);
-    let chosenCategory = requestedCategory;
-    let categoryDetectionMethod = categoryWasProvided ? "manual" : "ai";
+      const requestedCategory = normalizeDocumentCategory(category);
+      const categoryWasProvided = Boolean(requestedCategory);
+      let chosenCategory = requestedCategory;
+      let categoryDetectionMethod = categoryWasProvided ? "manual" : "ai";
 
-    // ✅ Store S3 information
-    const usingS3Storage = req.documentUploadStorage !== "local";
-    const s3Key = req.file.key;
-    const s3Bucket = req.file.bucket;
-    const localFilePath = usingS3Storage ? "" : String(req.file.path || "");
-    const storedUrl =
-      req.file.location ||
-      (req.file.filename ? buildLocalUploadUrl(req, req.file.filename) : "");
+      // ✅ Store S3 information
+      const usingS3Storage = req.documentUploadStorage !== "local";
+      const s3Key = req.file.key;
+      const s3Bucket = req.file.bucket;
+      const localFilePath = usingS3Storage ? "" : String(req.file.path || "");
+      const storedUrl =
+        req.file.location ||
+        (req.file.filename ? buildLocalUploadUrl(req, req.file.filename) : "");
 
-    // ✅ Support both doctor uploads (userId from req.body) and patient uploads (userId from req.auth.id)
-    const requesterRole = String(req.auth?.role || "").toLowerCase();
-    const requesterId = String(req.auth?.id || "");
-    const requestedTargetId = String(req.body.userId || req.body.patientId || "").trim();
-    let targetUserId = requesterId;
+      // ✅ Support both doctor uploads (userId from req.body) and patient uploads (userId from req.auth.id)
+      const requesterRole = String(req.auth?.role || "").toLowerCase();
+      const requesterId = String(req.auth?.id || "");
+      const requestedTargetId = String(
+        req.body.userId || req.body.patientId || "",
+      ).trim();
+      let targetUserId = requesterId;
 
-    if (requesterRole === "patient") {
-      if (requestedTargetId && requestedTargetId !== requesterId) {
-        return res.status(403).json({ success: false, msg: "Patients can only upload to their own records" });
+      if (requesterRole === "patient") {
+        if (requestedTargetId && requestedTargetId !== requesterId) {
+          return res
+            .status(403)
+            .json({
+              success: false,
+              msg: "Patients can only upload to their own records",
+            });
+        }
+        targetUserId = requesterId;
+      } else if (requesterRole === "doctor") {
+        let activeSessionPatientId = "";
+        if (requestedTargetId && isValidObjectId(requestedTargetId)) {
+          const activeSession = await Session.findOne({
+            doctorId: requesterId,
+            patientId: requestedTargetId,
+            status: "accepted",
+            isActive: true,
+            expiresAt: { $gt: new Date() },
+          })
+            .select("patientId")
+            .lean();
+
+          activeSessionPatientId = String(
+            activeSession?.patientId || "",
+          ).trim();
+        }
+
+        targetUserId = activeSessionPatientId || requestedTargetId || "";
+        if (!targetUserId) {
+          return res
+            .status(400)
+            .json({
+              success: false,
+              msg: "Doctors must provide target patient userId",
+            });
+        }
+        if (!isValidObjectId(targetUserId)) {
+          return res
+            .status(400)
+            .json({ success: false, msg: "Invalid target patient userId" });
+        }
+        const allowed = await canDoctorAccessPatient(requesterId, targetUserId);
+        if (!allowed) {
+          return res
+            .status(403)
+            .json({
+              success: false,
+              msg: "No active doctor-patient relationship",
+            });
+        }
+      } else if (privilegedRoles.has(requesterRole)) {
+        targetUserId = requestedTargetId || "";
+        if (!targetUserId) {
+          return res
+            .status(400)
+            .json({ success: false, msg: "target userId is required" });
+        }
+        if (!isValidObjectId(targetUserId)) {
+          return res
+            .status(400)
+            .json({ success: false, msg: "Invalid target userId" });
+        }
+      } else {
+        return res
+          .status(403)
+          .json({ success: false, msg: "Unauthorized role for upload" });
       }
-      targetUserId = requesterId;
-    } else if (requesterRole === "doctor") {
-      let activeSessionPatientId = "";
-      if (requestedTargetId && isValidObjectId(requestedTargetId)) {
-        const activeSession = await Session.findOne({
-          doctorId: requesterId,
-          patientId: requestedTargetId,
-          status: "accepted",
-          isActive: true,
-          expiresAt: { $gt: new Date() },
-        })
-          .select("patientId")
-          .lean();
 
-        activeSessionPatientId = String(activeSession?.patientId || "").trim();
+      const targetUser = await User.findById(targetUserId).select("_id").lean();
+      if (!targetUser) {
+        return res
+          .status(404)
+          .json({ success: false, msg: "Target user not found" });
       }
 
-      targetUserId = activeSessionPatientId || requestedTargetId || "";
-      if (!targetUserId) {
-        return res.status(400).json({ success: false, msg: "Doctors must provide target patient userId" });
-      }
-      if (!isValidObjectId(targetUserId)) {
-        return res.status(400).json({ success: false, msg: "Invalid target patient userId" });
-      }
-      const allowed = await canDoctorAccessPatient(requesterId, targetUserId);
-      if (!allowed) {
-        return res.status(403).json({ success: false, msg: "No active doctor-patient relationship" });
-      }
-    } else if (privilegedRoles.has(requesterRole)) {
-      targetUserId = requestedTargetId || "";
-      if (!targetUserId) {
-        return res.status(400).json({ success: false, msg: "target userId is required" });
-      }
-      if (!isValidObjectId(targetUserId)) {
-        return res.status(400).json({ success: false, msg: "Invalid target userId" });
-      }
-    } else {
-      return res.status(403).json({ success: false, msg: "Unauthorized role for upload" });
-    }
-
-    const targetUser = await User.findById(targetUserId).select("_id").lean();
-    if (!targetUser) {
-      return res.status(404).json({ success: false, msg: "Target user not found" });
-    }
-
-    if (usingS3Storage) {
+      // Security checks always run (both storage modes) before any medical
+      // classification. Malware scanning is S3-only because the external
+      // scanner fetches objects by bucket/key.
       try {
         const magicOk = await validateMagicBytes({
           bucket: s3Bucket,
           key: s3Key,
           mimeType: req.file.mimetype,
+          localFilePath: usingS3Storage ? "" : localFilePath,
         });
         if (!magicOk) {
           throw new Error("Magic-byte validation failed");
         }
-        await runMalwareScan({
-          bucket: s3Bucket,
-          key: s3Key,
-          mimeType: req.file.mimetype,
-          size: req.file.size,
-        });
+        if (usingS3Storage) {
+          await runMalwareScan({
+            bucket: s3Bucket,
+            key: s3Key,
+            mimeType: req.file.mimetype,
+            size: req.file.size,
+          });
+        }
       } catch (scanError) {
         await cleanupRejectedUpload({
           usingS3Storage,
@@ -1098,183 +1356,210 @@ router.post("/upload", auth, requireVerified, uploadLimiter, singleDocumentUploa
           msg: "Uploaded file failed security checks",
         });
       }
-    }
 
-    // ✅ Properly handle date conversion
-    const validationResult = await validateMedicalDocumentContent({
-      usingS3Storage,
-      s3Key,
-      s3Bucket,
-      localFilePath,
-      mimeType: req.file.mimetype,
-      title,
-      originalName: req.file.originalname,
-    });
-
-    if (!validationResult.allow) {
-      await cleanupRejectedUpload({
+      // ✅ Properly handle date conversion
+      const validationResult = await validateMedicalDocumentContent({
         usingS3Storage,
-        s3Bucket,
         s3Key,
+        s3Bucket,
         localFilePath,
-      });
-
-      return res.status(400).json({
-        success: false,
-        code: "DOCUMENT_NOT_MEDICAL",
-        msg: validationResult.message || DOCUMENT_REJECT_MESSAGE,
-        medicalVerification: validationResult.verification,
-      });
-    }
-
-    const medicalVerification =
-      validationResult.verification ||
-      buildVerificationPayload({
-        status: "accepted",
-        label: "MEDICAL",
-        method: "inconclusive",
-        reason: "The file passed upload validation.",
-        confidence: "unknown",
-      });
-
-    if (!categoryWasProvided) {
-      const categoryDecision = await classifyDocumentCategoryWithAI({
+        mimeType: req.file.mimetype,
         title,
-        notes,
         originalName: req.file.originalname,
-        normalizedText:
-          validationResult.classificationText ||
-          validationResult.normalizedText ||
-          "",
+        category: requestedCategory || category,
       });
-      chosenCategory = categoryDecision.category || "Report";
-      categoryDetectionMethod = categoryDecision.method || "heuristic";
-    }
 
-    let uploadDate = new Date(); // Default to current time
-    if (date && date.trim() !== '') {
-      try {
-        const parsedDate = new Date(date);
-        if (!isNaN(parsedDate.getTime())) {
-          uploadDate = parsedDate;
-        }
-      } catch (error) {
-        // Keep default upload date when input is malformed.
+      if (!validationResult.allow) {
+        await cleanupRejectedUpload({
+          usingS3Storage,
+          s3Bucket,
+          s3Key,
+          localFilePath,
+        });
+
+        return res.status(400).json({
+          success: false,
+          code: "DOCUMENT_NOT_MEDICAL",
+          msg: validationResult.message || DOCUMENT_REJECT_MESSAGE,
+          medicalVerification: validationResult.verification,
+          verificationStatus:
+            validationResult.verification?.status || "rejected",
+          verificationReason:
+            validationResult.verification?.reason ||
+            validationResult.message ||
+            DOCUMENT_REJECT_MESSAGE,
+          verificationMode:
+            validationResult.verification?.method || "manual_review_required",
+          processingTimeMs: Date.now() - uploadStartedAt,
+        });
       }
-    }
 
-    const doc = await Document.create({
-      userId: targetUserId,
-      doctorId: req.auth?.role === "doctor" ? req.auth.id : undefined,
-      title: title || req.file.originalname,
-      description: notes || "",
-      type: chosenCategory,
-      category: chosenCategory,
-      originalName: req.file.originalname,
-      mimeType: req.file.mimetype,
-      fileType: req.file.mimetype,
-      size: req.file.size,
-      fileSize: req.file.size,
-      s3Key: s3Key,
-      s3Bucket: s3Bucket,
-      s3Region: REGION,
-      url: storedUrl,
-      uploadedAt: uploadDate,
-      medicalVerified:
-        medicalVerification.status === "verified" &&
-        medicalVerification.label === "MEDICAL",
-      medicalVerification,
-    });
+      const medicalVerification =
+        validationResult.verification ||
+        buildVerificationPayload({
+          status: "accepted",
+          label: "MEDICAL",
+          method: "inconclusive",
+          reason: "The file passed upload validation.",
+          confidence: "unknown",
+        });
 
-    // ✅ Link the document to the target user's medicalRecords array
-    await User.findByIdAndUpdate(targetUserId, { $push: { medicalRecords: doc._id } });
-
-
-    // Send notification to patient if doctor uploaded the document
-    if (req.auth?.role === "doctor" && (req.body.userId || req.body.patientId)) {
-      try {
-        // Get doctor info for the notification
-        const doctor = await DoctorUser.findById(req.auth.id);
-        if (doctor) {
-          // Create notification record in database
-          const { Notification } = await import('../models/Notification.js');
-          const notification = new Notification({
-            title: "New Document Uploaded",
-            body: `Dr. ${doctor.name} uploaded a new ${chosenCategory.toLowerCase()} to your medical records`,
-            type: "document",
-            data: {
-              documentId: doc._id.toString(),
-              category: chosenCategory,
-              doctorId: doctor._id.toString(),
-              doctorName: doctor.name,
-              title: doc.title
-            },
-            recipientId: targetUserId,
-            recipientRole: "patient",
-            senderId: doctor._id.toString(),
-            senderRole: "doctor"
-          });
-          await notification.save();
-
-          // Send push notification
-          await sendNotification(
-            targetUserId,
-            "New Document Uploaded",
-            `Dr. ${doctor.name} uploaded a new ${chosenCategory.toLowerCase()} to your medical records`,
-            {
-              type: "FILE_UPLOAD",
-              documentId: doc._id.toString(),
-              category: chosenCategory,
-              doctorId: doctor._id.toString(),
-              doctorName: doctor.name,
-              title: doc.title
-            }
-          );
-
-          // Broadcast to SSE connections
-          const { broadcastNotification } = await import('../controllers/notificationController.js');
-          await broadcastNotification(notification);
-
-          console.log('✅ Document upload notification created and sent');
-        }
-      } catch (notificationError) {
-        console.error("❌ Failed to send file upload notification:", notificationError);
-        // Don't fail the upload if notification fails
+      if (!categoryWasProvided) {
+        const categoryDecision = await classifyDocumentCategoryWithAI({
+          title,
+          notes,
+          originalName: req.file.originalname,
+          normalizedText:
+            validationResult.classificationText ||
+            validationResult.normalizedText ||
+            "",
+        });
+        chosenCategory = categoryDecision.category || "Report";
+        categoryDetectionMethod = categoryDecision.method || "heuristic";
       }
-    }
 
-    await writeAuditLog({
-      req,
-      action: "UPLOAD_DOCUMENT",
-      resourceType: "DOCUMENT",
-      resourceId: doc._id?.toString(),
-      patientId: targetUserId,
-      statusCode: 200,
-      metadata: {
+      let uploadDate = new Date(); // Default to current time
+      if (date && date.trim() !== "") {
+        try {
+          const parsedDate = new Date(date);
+          if (!isNaN(parsedDate.getTime())) {
+            uploadDate = parsedDate;
+          }
+        } catch (error) {
+          // Keep default upload date when input is malformed.
+        }
+      }
+
+      const doc = await Document.create({
+        userId: targetUserId,
+        doctorId: req.auth?.role === "doctor" ? req.auth.id : undefined,
+        title: title || req.file.originalname,
+        description: notes || "",
+        type: chosenCategory,
         category: chosenCategory,
+        originalName: req.file.originalname,
+        mimeType: req.file.mimetype,
+        fileType: req.file.mimetype,
+        size: req.file.size,
+        fileSize: req.file.size,
+        s3Key: s3Key,
+        s3Bucket: s3Bucket,
+        s3Region: REGION,
+        url: storedUrl,
+        uploadedAt: uploadDate,
+        medicalVerified:
+          medicalVerification.status === "verified" &&
+          medicalVerification.label === "MEDICAL",
+        medicalVerification,
+      });
+
+      // ✅ Link the document to the target user's medicalRecords array
+      await User.findByIdAndUpdate(targetUserId, {
+        $push: { medicalRecords: doc._id },
+      });
+
+      // Send notification to patient if doctor uploaded the document
+      if (
+        req.auth?.role === "doctor" &&
+        (req.body.userId || req.body.patientId)
+      ) {
+        try {
+          // Get doctor info for the notification
+          const doctor = await DoctorUser.findById(req.auth.id);
+          if (doctor) {
+            // Create notification record in database
+            const { Notification } = await import("../models/Notification.js");
+            const notification = new Notification({
+              title: "New Document Uploaded",
+              body: `Dr. ${doctor.name} uploaded a new ${chosenCategory.toLowerCase()} to your medical records`,
+              type: "document",
+              data: {
+                documentId: doc._id.toString(),
+                category: chosenCategory,
+                doctorId: doctor._id.toString(),
+                doctorName: doctor.name,
+                title: doc.title,
+              },
+              recipientId: targetUserId,
+              recipientRole: "patient",
+              senderId: doctor._id.toString(),
+              senderRole: "doctor",
+            });
+            await notification.save();
+
+            // Send push notification
+            await sendNotification(
+              targetUserId,
+              "New Document Uploaded",
+              `Dr. ${doctor.name} uploaded a new ${chosenCategory.toLowerCase()} to your medical records`,
+              {
+                type: "FILE_UPLOAD",
+                documentId: doc._id.toString(),
+                category: chosenCategory,
+                doctorId: doctor._id.toString(),
+                doctorName: doctor.name,
+                title: doc.title,
+              },
+            );
+
+            // Broadcast to SSE connections
+            const { broadcastNotification } =
+              await import("../controllers/notificationController.js");
+            await broadcastNotification(notification);
+
+            console.log("✅ Document upload notification created and sent");
+          }
+        } catch (notificationError) {
+          console.error(
+            "❌ Failed to send file upload notification:",
+            notificationError,
+          );
+          // Don't fail the upload if notification fails
+        }
+      }
+
+      await writeAuditLog({
+        req,
+        action: "UPLOAD_DOCUMENT",
+        resourceType: "DOCUMENT",
+        resourceId: doc._id?.toString(),
+        patientId: targetUserId,
+        statusCode: 200,
+        metadata: {
+          category: chosenCategory,
+          categoryAutoDetected: !categoryWasProvided,
+          categoryDetectionMethod,
+          mimeType: req.file.mimetype,
+          medicalVerificationStatus: medicalVerification.status,
+          medicalVerificationMethod: medicalVerification.method,
+        },
+      });
+
+      res.json({
+        success: true,
+        msg:
+          medicalVerification.status === "verified"
+            ? "Medical document verified and uploaded"
+            : "Document uploaded and accepted for your medical vault",
+        medicalVerification,
+        verificationStatus: medicalVerification.status,
+        verificationReason: medicalVerification.reason,
+        verificationMode: medicalVerification.method,
+        processingTimeMs: Date.now() - uploadStartedAt,
         categoryAutoDetected: !categoryWasProvided,
         categoryDetectionMethod,
-        mimeType: req.file.mimetype,
-        medicalVerificationStatus: medicalVerification.status,
-        medicalVerificationMethod: medicalVerification.method,
-      },
-    });
-
-    res.json({
-      success: true,
-      msg:
-        medicalVerification.status === "verified"
-          ? "Medical document verified and uploaded"
-          : "Document uploaded and accepted for your medical vault",
-      medicalVerification,
-      categoryAutoDetected: !categoryWasProvided,
-      categoryDetectionMethod,
-      document: doc,
-    });
-  } catch (err) {
-    res.status(500).json({ msg: "Upload failed", error: err.message });
-  }
-});
+        document: doc,
+      });
+    } catch (err) {
+      res.status(500).json({
+        success: false,
+        msg: "Upload failed",
+        error: err.message,
+        processingTimeMs: Date.now() - uploadStartedAt,
+      });
+    }
+  },
+);
 
 // ---------------- List Files ----------------
 router.get("/user/:userId", auth, checkSession, async (req, res) => {
@@ -1297,10 +1582,10 @@ router.get("/user/:userId", auth, checkSession, async (req, res) => {
           return {
             ...doc.toObject(),
             url: null,
-            error: "Failed to generate access URL"
+            error: "Failed to generate access URL",
           };
         }
-      })
+      }),
     );
 
     res.json({
@@ -1311,7 +1596,11 @@ router.get("/user/:userId", auth, checkSession, async (req, res) => {
   } catch (err) {
     res
       .status(500)
-      .json({ success: false, msg: "Error fetching files", error: err.message });
+      .json({
+        success: false,
+        msg: "Error fetching files",
+        error: err.message,
+      });
   }
 });
 
@@ -1336,10 +1625,10 @@ router.get("/patient/:patientId", auth, checkSession, async (req, res) => {
           return {
             ...doc.toObject(),
             url: null,
-            error: "Failed to generate access URL"
+            error: "Failed to generate access URL",
           };
         }
-      })
+      }),
     );
 
     res.json({
@@ -1350,7 +1639,11 @@ router.get("/patient/:patientId", auth, checkSession, async (req, res) => {
   } catch (err) {
     res
       .status(500)
-      .json({ success: false, msg: "Error fetching files", error: err.message });
+      .json({
+        success: false,
+        msg: "Error fetching files",
+        error: err.message,
+      });
   }
 });
 
@@ -1362,7 +1655,7 @@ router.get("/user/:userId/grouped", auth, checkSession, async (req, res) => {
     const grouped = {
       reports: docs.filter((d) => d.category?.toLowerCase() === "report"),
       prescriptions: docs.filter(
-        (d) => d.category?.toLowerCase() === "prescription"
+        (d) => d.category?.toLowerCase() === "prescription",
       ),
       bills: docs.filter((d) => d.category?.toLowerCase() === "bill"),
       insurance: docs.filter((d) => d.category?.toLowerCase() === "insurance"),
@@ -1376,95 +1669,124 @@ router.get("/user/:userId/grouped", auth, checkSession, async (req, res) => {
           await Promise.all(
             docs.map(async (doc) => {
               try {
-                const signedUrl = await generateSignedUrl(doc.s3Key, doc.s3Bucket);
+                const signedUrl = await generateSignedUrl(
+                  doc.s3Key,
+                  doc.s3Bucket,
+                );
                 return {
                   ...doc.toObject(),
                   url: signedUrl,
                 };
               } catch (error) {
-                console.error(`Error generating URL for doc ${doc._id}:`, error);
-                return {
-                  ...doc.toObject(),
-                  url: null,
-                  error: "Failed to generate access URL"
-                };
-              }
-            })
-          ),
-        ])
-      )
-    );
-
-    res.json({
-      success: true,
-      userId: req.params.userId,
-      counts: Object.fromEntries(
-        Object.entries(groupedWithUrl).map(([k, v]) => [k, v.length])
-      ),
-      records: groupedWithUrl,
-    });
-  } catch (err) {
-    res
-      .status(500)
-      .json({ success: false, msg: "Error grouping files", error: err.message });
-  }
-});
-
-// ---------------- Grouped Files (patient alias for web compatibility) ----------------
-// GET /api/files/patient/:patientId/grouped
-router.get("/patient/:patientId/grouped", auth, checkSession, async (req, res) => {
-  try {
-    // Delegate to the canonical user grouping logic
-    const userId = req.params.patientId;
-    const docs = await Document.find({ userId });
-
-    const grouped = {
-      reports: docs.filter((d) => d.category?.toLowerCase() === "report"),
-      prescriptions: docs.filter((d) => d.category?.toLowerCase() === "prescription"),
-      bills: docs.filter((d) => d.category?.toLowerCase() === "bill"),
-      insurance: docs.filter((d) => d.category?.toLowerCase() === "insurance"),
-    };
-
-    const groupedWithUrl = Object.fromEntries(
-      await Promise.all(
-        Object.entries(grouped).map(async ([key, docs]) => [
-          key,
-          await Promise.all(
-            docs.map(async (doc) => {
-              try {
-                const signedUrl = await generateSignedUrl(doc.s3Key, doc.s3Bucket);
-                return {
-                  ...doc.toObject(),
-                  url: signedUrl,
-                };
-              } catch (error) {
-                console.error(`Error generating URL for doc ${doc._id}:`, error);
+                console.error(
+                  `Error generating URL for doc ${doc._id}:`,
+                  error,
+                );
                 return {
                   ...doc.toObject(),
                   url: null,
                   error: "Failed to generate access URL",
                 };
               }
-            })
+            }),
           ),
-        ])
-      )
+        ]),
+      ),
     );
 
     res.json({
       success: true,
-      userId,
+      userId: req.params.userId,
       counts: Object.fromEntries(
-        Object.entries(groupedWithUrl).map(([k, v]) => [k, v.length])
+        Object.entries(groupedWithUrl).map(([k, v]) => [k, v.length]),
       ),
       records: groupedWithUrl,
     });
   } catch (err) {
     res
       .status(500)
-      .json({ success: false, msg: "Error grouping files", error: err.message });
+      .json({
+        success: false,
+        msg: "Error grouping files",
+        error: err.message,
+      });
   }
 });
+
+// ---------------- Grouped Files (patient alias for web compatibility) ----------------
+// GET /api/files/patient/:patientId/grouped
+router.get(
+  "/patient/:patientId/grouped",
+  auth,
+  checkSession,
+  async (req, res) => {
+    try {
+      // Delegate to the canonical user grouping logic
+      const userId = req.params.patientId;
+      const docs = await Document.find({ userId });
+
+      const grouped = {
+        reports: docs.filter((d) => d.category?.toLowerCase() === "report"),
+        prescriptions: docs.filter(
+          (d) => d.category?.toLowerCase() === "prescription",
+        ),
+        bills: docs.filter((d) => d.category?.toLowerCase() === "bill"),
+        insurance: docs.filter(
+          (d) => d.category?.toLowerCase() === "insurance",
+        ),
+      };
+
+      const groupedWithUrl = Object.fromEntries(
+        await Promise.all(
+          Object.entries(grouped).map(async ([key, docs]) => [
+            key,
+            await Promise.all(
+              docs.map(async (doc) => {
+                try {
+                  const signedUrl = await generateSignedUrl(
+                    doc.s3Key,
+                    doc.s3Bucket,
+                  );
+                  return {
+                    ...doc.toObject(),
+                    url: signedUrl,
+                  };
+                } catch (error) {
+                  console.error(
+                    `Error generating URL for doc ${doc._id}:`,
+                    error,
+                  );
+                  return {
+                    ...doc.toObject(),
+                    url: null,
+                    error: "Failed to generate access URL",
+                  };
+                }
+              }),
+            ),
+          ]),
+        ),
+      );
+
+      res.json({
+        success: true,
+        userId,
+        counts: Object.fromEntries(
+          Object.entries(groupedWithUrl).map(([k, v]) => [k, v.length]),
+        ),
+        records: groupedWithUrl,
+      });
+    } catch (err) {
+      res
+        .status(500)
+        .json({
+          success: false,
+          msg: "Error grouping files",
+          error: err.message,
+        });
+    }
+  },
+);
 
 // ---------------- Grouped by Email ----------------
 router.get("/grouped/:email", auth, checkSessionByEmail, async (req, res) => {
@@ -1501,7 +1823,9 @@ router.get("/grouped/:email", auth, checkSessionByEmail, async (req, res) => {
       }),
     };
 
-    console.log(`📊 Grouped counts: Reports: ${grouped.reports.length}, Prescriptions: ${grouped.prescriptions.length}, Bills: ${grouped.bills.length}, Insurance: ${grouped.insurance.length}`);
+    console.log(
+      `📊 Grouped counts: Reports: ${grouped.reports.length}, Prescriptions: ${grouped.prescriptions.length}, Bills: ${grouped.bills.length}, Insurance: ${grouped.insurance.length}`,
+    );
 
     // Generate signed URLs for each group
     const groupedWithUrl = Object.fromEntries(
@@ -1511,41 +1835,55 @@ router.get("/grouped/:email", auth, checkSessionByEmail, async (req, res) => {
           await Promise.all(
             docs.map(async (doc) => {
               try {
-                const signedUrl = await generateSignedUrl(doc.s3Key, doc.s3Bucket);
+                const signedUrl = await generateSignedUrl(
+                  doc.s3Key,
+                  doc.s3Bucket,
+                );
                 return {
                   ...doc.toObject(),
                   url: signedUrl,
                 };
               } catch (error) {
-                console.error(`Error generating URL for doc ${doc._id}:`, error);
+                console.error(
+                  `Error generating URL for doc ${doc._id}:`,
+                  error,
+                );
                 return {
                   ...doc.toObject(),
                   url: null,
-                  error: "Failed to generate access URL"
+                  error: "Failed to generate access URL",
                 };
               }
-            })
+            }),
           ),
-        ])
-      )
+        ]),
+      ),
     );
 
     const response = {
       success: true,
       userId: user._id.toString(),
       counts: Object.fromEntries(
-        Object.entries(groupedWithUrl).map(([k, v]) => [k, v.length])
+        Object.entries(groupedWithUrl).map(([k, v]) => [k, v.length]),
       ),
       records: groupedWithUrl,
     };
 
-    console.log(`✅ Sending response with ${Object.values(response.records).map((list) => list.length).join(', ')} documents`);
+    console.log(
+      `✅ Sending response with ${Object.values(response.records)
+        .map((list) => list.length)
+        .join(", ")} documents`,
+    );
     res.json(response);
   } catch (err) {
     console.error("❌ Grouped fetch error:", err);
     res
       .status(500)
-      .json({ success: false, msg: "Error grouping files", error: err.message });
+      .json({
+        success: false,
+        msg: "Error grouping files",
+        error: err.message,
+      });
   }
 });
 
@@ -1571,9 +1909,16 @@ router.get("/:id/preview", auth, checkSession, async (req, res) => {
         buildProxyUrl(req, doc._id.toString(), "inline");
     } else {
       try {
-        previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket, doc.mimeType);
+        previewUrl = await generatePreviewUrl(
+          doc.s3Key,
+          doc.s3Bucket,
+          doc.mimeType,
+        );
       } catch (error) {
-        console.error(`Preview signed URL fallback for doc ${doc?._id}:`, error?.message || error);
+        console.error(
+          `Preview signed URL fallback for doc ${doc?._id}:`,
+          error?.message || error,
+        );
         previewUrl = resolvePreviewFallbackUrl(req, doc);
       }
     }
@@ -1583,7 +1928,10 @@ router.get("/:id/preview", auth, checkSession, async (req, res) => {
     if (isDocumentNavigation) {
       try {
         if (localFilePath && fs.existsSync(localFilePath)) {
-          res.setHeader("Content-Type", doc.mimeType || doc.fileType || "application/octet-stream");
+          res.setHeader(
+            "Content-Type",
+            doc.mimeType || doc.fileType || "application/octet-stream",
+          );
           res.setHeader("Content-Disposition", "inline");
 
           return fs.createReadStream(localFilePath).pipe(res);
@@ -1637,7 +1985,10 @@ router.get("/:id/download", auth, checkSession, async (req, res) => {
       try {
         downloadUrl = await generateDownloadUrl(doc.s3Key, doc.s3Bucket);
       } catch (error) {
-        console.error(`Download signed URL fallback for doc ${doc?._id}:`, error?.message || error);
+        console.error(
+          `Download signed URL fallback for doc ${doc?._id}:`,
+          error?.message || error,
+        );
         downloadUrl = resolveDownloadFallbackUrl(req, doc);
       }
     } else {
@@ -1646,7 +1997,10 @@ router.get("/:id/download", auth, checkSession, async (req, res) => {
 
     // If client prefers JSON (e.g., web app), return the URL instead of redirecting
     const acceptHeader = String(req.headers["accept"] || "").toLowerCase();
-    if (acceptHeader.includes("application/json") || req.query.json === "true") {
+    if (
+      acceptHeader.includes("application/json") ||
+      req.query.json === "true"
+    ) {
       const mode = String(req.auth?.role || "patient").toLowerCase();
       await writeAuditLog({
         req,
@@ -1697,10 +2051,13 @@ router.get("/:id/proxy", auth, checkSession, async (req, res) => {
 
     const localFilePath = resolveLocalDocumentPath(doc);
     if (localFilePath) {
-      res.setHeader("Content-Type", doc.mimeType || doc.fileType || "application/octet-stream");
+      res.setHeader(
+        "Content-Type",
+        doc.mimeType || doc.fileType || "application/octet-stream",
+      );
       res.setHeader(
         "Content-Disposition",
-        req.query.disposition === "attachment" ? "attachment" : "inline"
+        req.query.disposition === "attachment" ? "attachment" : "inline",
       );
       res.setHeader("Cache-Control", "public, max-age=3600");
       await writeAuditLog({
@@ -1716,17 +2073,24 @@ router.get("/:id/proxy", auth, checkSession, async (req, res) => {
 
     if (doc.s3Key) {
       try {
-        const previewUrl = await generatePreviewUrl(doc.s3Key, doc.s3Bucket, doc.mimeType);
+        const previewUrl = await generatePreviewUrl(
+          doc.s3Key,
+          doc.s3Bucket,
+          doc.mimeType,
+        );
 
         const response = await axios.get(previewUrl, {
           responseType: "arraybuffer",
-          timeout: 10000 // 10 second timeout
+          timeout: 10000, // 10 second timeout
         });
 
-        res.setHeader("Content-Type", doc.fileType || "application/octet-stream");
+        res.setHeader(
+          "Content-Type",
+          doc.fileType || "application/octet-stream",
+        );
         res.setHeader(
           "Content-Disposition",
-          req.query.disposition === "attachment" ? "attachment" : "inline"
+          req.query.disposition === "attachment" ? "attachment" : "inline",
         );
         res.setHeader("Cache-Control", "public, max-age=3600"); // Cache for 1 hour
         await writeAuditLog({
@@ -1739,7 +2103,10 @@ router.get("/:id/proxy", auth, checkSession, async (req, res) => {
         });
         return res.end(Buffer.from(response.data));
       } catch (error) {
-        console.error(`Proxy S3 fallback for doc ${doc?._id}:`, error?.message || error);
+        console.error(
+          `Proxy S3 fallback for doc ${doc?._id}:`,
+          error?.message || error,
+        );
       }
     }
 
@@ -1760,7 +2127,10 @@ router.get("/:id/proxy", auth, checkSession, async (req, res) => {
       const filePath = file?.path ? path.resolve(file.path) : "";
 
       if (filePath && fs.existsSync(filePath)) {
-        res.setHeader("Content-Type", file.mimeType || "application/octet-stream");
+        res.setHeader(
+          "Content-Type",
+          file.mimeType || "application/octet-stream",
+        );
         res.setHeader("Content-Disposition", "inline");
         await writeAuditLog({
           req,
@@ -1798,11 +2168,14 @@ router.put("/:id", auth, requireVerified, checkSession, async (req, res) => {
       return res.status(400).json({ success: false, msg: "Invalid file id" });
     }
     const doc = await Document.findById(req.params.id);
-    if (!doc) return res.status(404).json({ success: false, msg: "File not found" });
+    if (!doc)
+      return res.status(404).json({ success: false, msg: "File not found" });
 
     const allowed = await canAccessDocument(req, doc);
     if (!allowed) {
-      return res.status(403).json({ success: false, msg: "Unauthorized access" });
+      return res
+        .status(403)
+        .json({ success: false, msg: "Unauthorized access" });
     }
 
     const { title, category, date, description, notes } = req.body;
@@ -1833,7 +2206,7 @@ router.put("/:id", auth, requireVerified, checkSession, async (req, res) => {
     }
     if (description !== undefined) updateData.description = description;
     if (notes !== undefined) updateData.notes = notes;
-    if (date !== undefined && date.trim() !== '') {
+    if (date !== undefined && date.trim() !== "") {
       try {
         const parsedDate = new Date(date);
         if (!isNaN(parsedDate.getTime())) {
@@ -1841,7 +2214,10 @@ router.put("/:id", auth, requireVerified, checkSession, async (req, res) => {
           updateData.date = date;
         }
       } catch (error) {
-        console.log('⚠️ Invalid date provided, keeping existing date:', error.message);
+        console.log(
+          "⚠️ Invalid date provided, keeping existing date:",
+          error.message,
+        );
       }
     }
 
@@ -1849,14 +2225,17 @@ router.put("/:id", auth, requireVerified, checkSession, async (req, res) => {
     const updatedDoc = await Document.findByIdAndUpdate(
       req.params.id,
       updateData,
-      { new: true, runValidators: true }
+      { new: true, runValidators: true },
     );
 
     // Generate signed URL for response
     let signedUrl = null;
     if (updatedDoc.s3Key) {
       try {
-        signedUrl = await generateSignedUrl(updatedDoc.s3Key, updatedDoc.s3Bucket);
+        signedUrl = await generateSignedUrl(
+          updatedDoc.s3Key,
+          updatedDoc.s3Bucket,
+        );
       } catch (error) {
         console.error("Error generating signed URL:", error);
       }
@@ -1871,7 +2250,9 @@ router.put("/:id", auth, requireVerified, checkSession, async (req, res) => {
     });
   } catch (err) {
     console.error("Update error:", err);
-    res.status(500).json({ success: false, msg: "Update failed", error: err.message });
+    res
+      .status(500)
+      .json({ success: false, msg: "Update failed", error: err.message });
   }
 });
 
@@ -1909,7 +2290,9 @@ router.delete("/:id", auth, requireVerified, checkSession, async (req, res) => {
     await doc.deleteOne();
 
     // ✅ Remove the document reference from user's medicalRecords array
-    await User.findByIdAndUpdate(doc.userId, { $pull: { medicalRecords: req.params.id } });
+    await User.findByIdAndUpdate(doc.userId, {
+      $pull: { medicalRecords: req.params.id },
+    });
 
     console.log(`Document ${req.params.id} deleted successfully`);
     res.json({ success: true, msg: "File deleted successfully" });

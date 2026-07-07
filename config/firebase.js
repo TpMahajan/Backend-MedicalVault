@@ -42,7 +42,7 @@ const initializeFirebase = () => {
       }
 
       firebaseApp = admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
+        credential: admin.cert(serviceAccount),
         projectId: process.env.FIREBASE_PROJECT_ID,
       });
 

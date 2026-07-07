@@ -6,7 +6,7 @@ async function testSessionHistoryAPI() {
 
         // First, login as a doctor to get a token
         console.log('1️⃣ Logging in as doctor...');
-        const loginResponse = await fetch('http://localhost:5000/api/doctor-auth/login', {
+        const loginResponse = await fetch('http://localhost:5001/api/doctor-auth/login', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
@@ -21,7 +21,7 @@ async function testSessionHistoryAPI() {
             console.log('❌ Login failed. Trying alternative credentials...');
 
             // Try another login
-            const altLoginResponse = await fetch('http://localhost:5000/api/doctor-auth/login', {
+            const altLoginResponse = await fetch('http://localhost:5001/api/doctor-auth/login', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -58,7 +58,7 @@ async function testSessionHistoryAPI() {
 async function testWithToken(token) {
     console.log('2️⃣ Fetching all sessions for this doctor...');
 
-    const sessionsResponse = await fetch('http://localhost:5000/api/sessions/all-sessions', {
+    const sessionsResponse = await fetch('http://localhost:5001/api/sessions/all-sessions', {
         headers: {
             'Authorization': `Bearer ${token}`,
             'Content-Type': 'application/json'

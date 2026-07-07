@@ -38,7 +38,7 @@ const buildSignedAvatarUrl = async (avatarValue) => {
 
     // If it starts with /uploads, it's a local path
     if (avatarValue.startsWith('/uploads/')) {
-      const baseUrl = process.env.API_BASE_URL || 'http://localhost:5000';
+      const baseUrl = process.env.API_BASE_URL || 'http://localhost:5001';
       return `${baseUrl}${avatarValue}`;
     }
 
@@ -811,7 +811,7 @@ router.post("/profile/avatar", auth, avatarUploader, async (req, res) => {
       // Local storage - store relative path in DB
       const doctorId = req.doctor._id.toString();
       avatarKey = `/uploads/doctor-avatars/${doctorId}/${req.file.filename}`;
-      avatarUrl = `${process.env.API_BASE_URL || 'http://localhost:5000'}${avatarKey}`;
+      avatarUrl = `${process.env.API_BASE_URL || 'http://localhost:5001'}${avatarKey}`;
     }
 
     // Update doctor with new avatar

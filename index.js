@@ -270,6 +270,21 @@ const startServer = async () => {
     // Log email configuration readiness at startup
     checkEmailConfig();
 
+    // Surface upload-storage posture early (S3 vs local fallback vs disabled).
+    const { hasUsableS3Credentials, isLocalUploadFallbackAllowed } =
+      await import("./services/uploadStoragePolicy.js");
+    if (!(await hasUsableS3Credentials("startup"))) {
+      if (isLocalUploadFallbackAllowed()) {
+        console.warn(
+          "⚠️ S3 credentials missing; uploads will use the public local /uploads fallback (development only).",
+        );
+      } else {
+        console.error(
+          "❌ S3 credentials missing and local upload fallback is disabled; upload endpoints will return 503 until storage is configured.",
+        );
+      }
+    }
+
     // Initialize cron jobs for reminders
     const { initializeCronJobs } = await import('./services/cronService.js');
     initializeCronJobs();

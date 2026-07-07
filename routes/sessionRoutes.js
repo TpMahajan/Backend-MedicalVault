@@ -54,7 +54,7 @@ const resolveDoctorAvatarUrl = async (doctor) => {
 
   if (/^https?:\/\//i.test(raw)) return raw;
   if (raw.startsWith("/uploads/")) {
-    const baseUrl = process.env.API_BASE_URL || "http://localhost:5000";
+    const baseUrl = process.env.API_BASE_URL || "http://localhost:5001";
     return `${baseUrl}${raw}`;
   }
 

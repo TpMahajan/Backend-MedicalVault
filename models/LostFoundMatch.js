@@ -20,18 +20,22 @@ const LostFoundMatchSchema = new mongoose.Schema(
     },
     reviewedByAdminId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
+      ref: "AdminUser",
       default: null,
     },
     reviewedAt: { type: Date, default: null },
   },
-  { timestamps: true }
+  { timestamps: true },
 );
 
 LostFoundMatchSchema.index({ status: 1, score: -1 });
+// One match record per lost/found pair; concurrent matchers must not duplicate.
+LostFoundMatchSchema.index(
+  { lostReportId: 1, foundReportId: 1 },
+  { unique: true },
+);
 
 export const LostFoundMatch = mongoose.model(
   "LostFoundMatch",
-  LostFoundMatchSchema
+  LostFoundMatchSchema,
 );
-
