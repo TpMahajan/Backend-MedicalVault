@@ -62,6 +62,30 @@ const nonEmptyOrUndefined = (value) => {
   return text ? text : undefined;
 };
 
+const publicServerBaseUrl = () => {
+  const configured = asText(
+      process.env.PUBLIC_SERVER_BASE_URL ||
+      process.env.APP_API_BASE_URL ||
+      process.env.API_PUBLIC_BASE_URL ||
+      process.env.API_BASE_URL ||
+      process.env.BASE_URL,
+  );
+  const fallback = `http://localhost:${process.env.PORT || 5000}`;
+  const rawBase = configured || fallback;
+  return rawBase.replace(/\/api(?:\/v\d+)?\/?$/i, "").replace(/\/+$/, "");
+};
+
+const absoluteUploadUrl = (value) => {
+  const text = asText(value);
+  if (text.startsWith("/uploads/")) {
+    return `${publicServerBaseUrl()}${text}`;
+  }
+  if (text.startsWith("uploads/")) {
+    return `${publicServerBaseUrl()}/${text}`;
+  }
+  return text;
+};
+
 export const createLostReport = async (req, res) => {
   try {
     const {
@@ -145,6 +169,14 @@ export const createLostReport = async (req, res) => {
       }
     }
 
+    if (!asText(resolvedPhotoUrl)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "A clear photo is required for lost person reports so nearby people can identify the person.",
+      });
+    }
+
     const location = buildPoint(lastSeenLat, lastSeenLng);
     const seenTime = parseDateOrNull(lastSeenTime);
     if (lastSeenTime && !seenTime) {
@@ -153,6 +185,8 @@ export const createLostReport = async (req, res) => {
         message: "Invalid lastSeenTime. Provide a valid ISO date.",
       });
     }
+
+    const notificationImageUrl = await resolvePhotoUrl(resolvedPhotoUrl);
 
     const payload = {
       reportedByUserId: req.user?._id || req.auth?.id,
@@ -191,9 +225,9 @@ export const createLostReport = async (req, res) => {
       allowReporterContact: parseBoolean(allowReporterContact),
       publicContactName: nonEmptyOrUndefined(publicContactName),
       publicContactPhone: nonEmptyOrUndefined(publicContactPhone),
-      // Notification-safe image (already a signed/public URL when present).
-      notificationImageUrl: /^https?:\/\//i.test(asText(resolvedPhotoUrl))
-        ? asText(resolvedPhotoUrl)
+      // Notification-safe image (absolute public/signed URL when possible).
+      notificationImageUrl: /^https?:\/\//i.test(asText(notificationImageUrl))
+        ? asText(notificationImageUrl)
         : undefined,
     };
 
@@ -205,10 +239,16 @@ export const createLostReport = async (req, res) => {
       broadcastLostPersonAlert(lostReport),
     );
 
+    const reportObj =
+      typeof lostReport.toObject === "function"
+        ? lostReport.toObject()
+        : { ...lostReport };
+    reportObj.photoUrl = await resolvePhotoUrl(reportObj.photoUrl);
+
     res.status(201).json({
       success: true,
       message: "Lost person report created",
-      data: { lostReport, matchingQueued: true },
+      data: { lostReport: reportObj, matchingQueued: true },
     });
   } catch (error) {
     console.error("createLostReport error:", error);
@@ -284,39 +324,48 @@ export const createFoundReport = async (req, res) => {
   }
 };
 
-// Helper to generate signed URL if photoUrl is an S3 key
+// Helper to generate a public/signed URL for API consumers.
 const resolvePhotoUrl = async (photoUrl) => {
   if (!photoUrl) return null;
-  const text = String(photoUrl).trim();
-  if (text.startsWith("/uploads/")) return text;
-  if (text.startsWith("uploads/")) return `/${text}`;
+  const text = asText(photoUrl);
+  if (!text) return null;
+  if (text.startsWith("data:image/")) return text;
+  if (text.startsWith("/uploads/") || text.startsWith("uploads/")) {
+    return absoluteUploadUrl(text);
+  }
 
-  // If it's already a full URL (starts with http/https), return as is
-  if (text.startsWith("http://") || text.startsWith("https://")) {
-    // Check if it's a direct S3 URL that needs signing
-    if (text.includes(".s3.") && text.includes(BUCKET_NAME)) {
-      // Extract S3 key from URL
-      const urlParts = text.split("/");
-      const keyIndex = urlParts.findIndex((part) => part.includes(".s3."));
-      if (keyIndex !== -1 && keyIndex < urlParts.length - 1) {
-        const s3Key = urlParts.slice(keyIndex + 1).join("/");
-        try {
-          return await generateSignedUrl(s3Key, BUCKET_NAME, 3600 * 24 * 7); // 7 days
-        } catch (err) {
-          console.error("Error generating signed URL:", err);
-          return text; // Fallback to original
+  if (/^https?:\/\//i.test(text)) {
+    if (BUCKET_NAME && text.includes(".s3.") && text.includes(BUCKET_NAME)) {
+      try {
+        const parsed = new URL(text);
+        const key = decodeURIComponent(parsed.pathname.replace(/^\/+/, ""));
+        if (key) {
+          return await generateSignedUrl(key, BUCKET_NAME, 3600 * 24 * 7);
         }
+      } catch (err) {
+        console.error("Error generating signed URL:", err);
       }
     }
     return text;
   }
 
-  // If it looks like an S3 key (no http), generate signed URL
+  if (BUCKET_NAME && text.startsWith("lost-found/")) {
+    try {
+      return await generateSignedUrl(text, BUCKET_NAME, 3600 * 24 * 7);
+    } catch (err) {
+      console.error("Error generating signed URL for key:", err);
+    }
+  }
+
+  if (text.startsWith("lost-found/")) {
+    return absoluteUploadUrl(`/uploads/${text}`);
+  }
+
   try {
-    return await generateSignedUrl(text, BUCKET_NAME, 3600 * 24 * 7); // 7 days
+    return await generateSignedUrl(text, BUCKET_NAME, 3600 * 24 * 7);
   } catch (err) {
     console.error("Error generating signed URL for key:", err);
-    return text; // Fallback to original
+    return text;
   }
 };
 

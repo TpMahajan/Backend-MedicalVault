@@ -86,6 +86,25 @@ export const lostReportLimiter =
         ...sharedOptions,
       });
 
+// Photo-assisted lost-person search accepts image uploads and is intentionally
+// kept strict so future AI/vision matching cannot be abused accidentally.
+export const lostPhotoSearchLimiter = rateLimit({
+  windowMs: parseEnvInt(
+    process.env.LOST_PHOTO_SEARCH_RATE_LIMIT_WINDOW_MS,
+    15 * 60 * 1000,
+  ),
+  max: parseEnvInt(process.env.LOST_PHOTO_SEARCH_RATE_LIMIT_MAX, 3),
+  message: {
+    success: false,
+    code: "LOST_PHOTO_SEARCH_RATE_LIMITED",
+    errorCode: "LOST_PHOTO_SEARCH_RATE_LIMITED",
+    message:
+      "Photo search is temporarily rate limited. Please try again later.",
+  },
+  skip: (req) => req.method === "OPTIONS",
+  ...sharedOptions,
+});
+
 // File uploads
 export const uploadLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,

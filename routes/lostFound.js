@@ -14,7 +14,10 @@ import {
   getLostReportDetail,
   getLostReportNameSuggestions,
 } from "../controllers/lostFoundController.js";
-import { lostReportLimiter } from "../middleware/rateLimit.js";
+import {
+  lostPhotoSearchLimiter,
+  lostReportLimiter,
+} from "../middleware/rateLimit.js";
 import s3Client, { BUCKET_NAME } from "../config/s3.js";
 import { generateSignedUrl } from "../utils/s3Utils.js";
 import { resolveUploadStorage } from "../services/uploadStoragePolicy.js";
@@ -23,6 +26,15 @@ const router = express.Router();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const lostFoundUploadsRoot = path.resolve(__dirname, "../uploads/lost-found");
+const parsePositiveInt = (value, fallback) => {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+const PHOTO_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+const PHOTO_SEARCH_MAX_BYTES = parsePositiveInt(
+  process.env.LOST_PHOTO_SEARCH_MAX_BYTES,
+  4 * 1024 * 1024,
+);
 
 const allowedPhotoMimeTypes = new Set(["image/jpeg", "image/png"]);
 
@@ -75,7 +87,7 @@ const s3PhotoUpload = multer({
       });
     },
   }),
-  limits: { fileSize: 10 * 1024 * 1024 },
+  limits: { fileSize: PHOTO_UPLOAD_MAX_BYTES },
   fileFilter,
 });
 
@@ -95,13 +107,13 @@ const localPhotoUpload = multer({
       cb(null, `${Date.now()}-${unique}-${baseName}${ext}`);
     },
   }),
-  limits: { fileSize: 10 * 1024 * 1024 },
+  limits: { fileSize: PHOTO_UPLOAD_MAX_BYTES },
   fileFilter,
 });
 
 const photoSearchUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 },
+  limits: { fileSize: PHOTO_SEARCH_MAX_BYTES },
   fileFilter,
 });
 
@@ -133,6 +145,28 @@ const singlePhotoUpload = (req, res, next) => {
     });
 };
 
+const singlePhotoSearchUpload = (req, res, next) => {
+  photoSearchUpload.single("photo")(req, res, (err) => {
+    if (!err) return next();
+    const message =
+      err?.code === "LIMIT_FILE_SIZE"
+        ? "Photo search image is too large. Please use a JPG or PNG under 4 MB."
+        : err?.message || "Photo search upload failed";
+    return res.status(400).json({
+      success: false,
+      code:
+        err?.code === "LIMIT_FILE_SIZE"
+          ? "PHOTO_SEARCH_FILE_TOO_LARGE"
+          : "PHOTO_SEARCH_UPLOAD_INVALID",
+      errorCode:
+        err?.code === "LIMIT_FILE_SIZE"
+          ? "PHOTO_SEARCH_FILE_TOO_LARGE"
+          : "PHOTO_SEARCH_UPLOAD_INVALID",
+      message,
+    });
+  });
+};
+
 router.post("/lost", auth, lostReportLimiter, createLostReport);
 router.post("/found", auth, lostReportLimiter, createFoundReport);
 router.get("/my-lost-reports", auth, getMyLostReports);
@@ -142,7 +176,8 @@ router.get("/search", auth, searchLostReports);
 router.post(
   "/search-photo",
   auth,
-  photoSearchUpload.single("photo"),
+  lostPhotoSearchLimiter,
+  singlePhotoSearchUpload,
   searchLostReportsByPhoto,
 );
 router.get("/lost/:id", auth, getLostReportDetail);

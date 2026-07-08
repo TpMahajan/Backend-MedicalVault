@@ -1,8 +1,8 @@
 {
-    "latestVersion": "1.0.20",
+    "latestVersion": "1.0.21",
     "minimumSupportedVersion": "1.0.18",
     "apkUrl": "",
     "releaseNotes": "Lost and Found improvements.\nNearby Healthcare now opens with Google Maps fallback actions when Places is unavailable.\nDocument upload and update flow reliability improvements.",
-    "sha256": "63d1e664801301e715896d4d99428b0d0a010ed58007abd8de119c6ead90936c",
-    "checksum": "63d1e664801301e715896d4d99428b0d0a010ed58007abd8de119c6ead90936c"
+    "sha256": "393d75766f15f1627b56474228421a420508c7c83cb41a14d0aa941c75eb061c",
+    "checksum": "393d75766f15f1627b56474228421a420508c7c83cb41a14d0aa941c75eb061c"
 }

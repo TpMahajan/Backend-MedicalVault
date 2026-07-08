@@ -160,6 +160,7 @@ await jest.unstable_mockModule("../services/lostFoundBroadcast.js", () => ({
 }));
 await jest.unstable_mockModule("../middleware/rateLimit.js", () => ({
   lostReportLimiter: (req, res, next) => next(),
+  lostPhotoSearchLimiter: (req, res, next) => next(),
 }));
 
 const { default: lostFoundRouter } = await import("./lostFound.js");
