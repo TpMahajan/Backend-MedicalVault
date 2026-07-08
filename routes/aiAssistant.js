@@ -1777,6 +1777,7 @@ router.post("/ask", auth, async (req, res) => {
       const chatFilter = {
         userId: String(req.auth?.id || currentUser?._id || ""),
         userRole: persona,
+        assistantScope: "medical",
         ...(targetPatientId ? { patientId: String(targetPatientId) } : { patientId: null })
       };
       let chatDoc = null;
@@ -1786,6 +1787,7 @@ router.post("/ask", auth, async (req, res) => {
           candidate &&
           candidate.userId === chatFilter.userId &&
           candidate.userRole === chatFilter.userRole &&
+          (candidate.assistantScope || "medical") === "medical" &&
           String(candidate.patientId || "") === String(chatFilter.patientId || "")
         ) {
           chatDoc = candidate;
@@ -1793,6 +1795,14 @@ router.post("/ask", auth, async (req, res) => {
       }
       if (!chatDoc) {
         chatDoc = await AIChat.findOne(chatFilter).sort({ updatedAt: -1 });
+      }
+      if (!chatDoc) {
+        const legacyFilter = { ...chatFilter };
+        delete legacyFilter.assistantScope;
+        chatDoc = await AIChat.findOne({
+          ...legacyFilter,
+          assistantScope: { $exists: false },
+        }).sort({ updatedAt: -1 });
       }
       if (!chatDoc) {
         chatDoc = new AIChat({ ...chatFilter, messages: [] });
@@ -1818,8 +1828,10 @@ router.post("/ask", auth, async (req, res) => {
           },
         }
       );
+      chatDoc.assistantScope = "medical";
       chatDoc.lastActivityAt = new Date();
       chatDoc.context = {
+        assistantScope: "medical",
         resolvedPersona: persona,
         resolvedLanguage: language,
         preferredLanguage: languageResolution.preferredLanguage,
@@ -2080,7 +2092,10 @@ router.get("/chat", auth, async (req, res) => {
       userRole: resolvePersona(role),
       ...(queryPatientId ? { patientId: queryPatientId } : { patientId: null }),
     };
-    const chat = await AIChat.findOne(filter).sort({ updatedAt: -1 }).lean();
+    const chat = await AIChat.findOne({
+      ...filter,
+      $or: [{ assistantScope: "medical" }, { assistantScope: { $exists: false } }],
+    }).sort({ updatedAt: -1 }).lean();
     if (!chat) return res.json({ success: true, messages: [], conversationId: null });
     await AIChat.updateOne({ _id: chat._id }, { $unset: { expiresAt: 1 } });
     res.json({
@@ -2115,7 +2130,10 @@ router.delete("/chat", auth, async (req, res) => {
       userRole: resolvePersona(role),
       ...(queryPatientId ? { patientId: queryPatientId } : { patientId: null }),
     };
-    await AIChat.deleteMany(filter);
+    await AIChat.deleteMany({
+      ...filter,
+      $or: [{ assistantScope: "medical" }, { assistantScope: { $exists: false } }],
+    });
     res.json({ success: true, message: 'Chat cleared' });
   } catch (error) {
     console.error('Chat clear error:', error);

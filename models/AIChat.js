@@ -18,6 +18,12 @@ const aiChatSchema = new mongoose.Schema(
       enum: ["doctor", "patient", "admin", "superadmin"],
       required: true,
     },
+    assistantScope: {
+      type: String,
+      enum: ["medical", "khoj"],
+      default: "medical",
+      index: true,
+    },
     patientId: { type: String }, // optional context for doctor chats
     messages: { type: [messageSchema], default: [] },
     context: { type: Object, default: {} }, // resolved persona/language/scope metadata
@@ -26,8 +32,7 @@ const aiChatSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-aiChatSchema.index({ userId: 1, userRole: 1, patientId: 1 });
+aiChatSchema.index({ userId: 1, userRole: 1, patientId: 1, assistantScope: 1 });
 
 export const AIChat = mongoose.model("AIChat", aiChatSchema, "ai_chats");
-
 

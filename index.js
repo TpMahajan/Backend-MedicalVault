@@ -45,6 +45,7 @@ import superAdminRoutes from "./routes/superAdmin.js";
 import publicConfigRoutes from "./routes/publicConfig.js";
 import lostFoundRoutes from "./routes/lostFound.js"; // lost & found (user)
 import adminLostFoundRoutes from "./routes/adminLostFound.js"; // lost & found admin
+import khojRoutes from "./routes/khoj.js"; // KHOJ AI scoped lost/found assistant
 import adminInventoryRoutes from "./routes/adminInventory.js"; // admin inventory
 import inventoryRoutes from "./routes/inventory.js"; // public inventory (checkout)
 import storeRoutes from "./routes/store.js"; // store (products/cart/orders)
@@ -243,6 +244,7 @@ app.use("/api/superadmin", superAdminRoutes);
 app.use("/api/public", publicConfigRoutes);
 app.use("/api/lost-found", lostFoundRoutes); // lost & found
 app.use("/api/admin/lost-found", adminLostFoundRoutes); // admin lost & found
+app.use("/api/khoj", khojRoutes); // KHOJ AI
 app.use("/api/admin/inventory", adminInventoryRoutes); // admin inventory ✅
 app.use("/api", inventoryRoutes); // inventory/order API
 app.use("/api/inventory", inventoryRoutes); // compatibility mount

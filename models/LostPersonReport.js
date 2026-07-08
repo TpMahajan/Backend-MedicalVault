@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 
 const LostPersonReportSchema = new mongoose.Schema(
   {
+    reportId: { type: String, trim: true, index: true },
     reportType: {
       type: String,
       default: "lost",
@@ -18,6 +19,8 @@ const LostPersonReportSchema = new mongoose.Schema(
       default: null,
     },
     personName: { type: String, trim: true },
+    photoUrls: [{ type: String, trim: true }],
+    estimatedAge: { type: Number },
     approxAge: { type: Number },
     gender: {
       type: String,
@@ -29,6 +32,7 @@ const LostPersonReportSchema = new mongoose.Schema(
       type: { type: String, enum: ["Point"], default: "Point" },
       coordinates: { type: [Number], default: undefined },
     },
+    lastSeenDateTime: { type: Date },
     lastSeenTime: { type: Date },
     photoUrl: { type: String, trim: true },
     photoSource: {
@@ -43,10 +47,23 @@ const LostPersonReportSchema = new mongoose.Schema(
     },
     selectedProfileName: { type: String, trim: true },
     clothingDescription: { type: String, trim: true },
+    clothesDescription: { type: String, trim: true },
     identificationDetails: { type: String, trim: true },
+    identifyingMarks: { type: String, trim: true },
     medicalNotes: { type: String, trim: true },
+    medicalCondition: { type: String, trim: true },
+    languageSpoken: { type: String, trim: true },
+    guardian: { type: String, trim: true },
+    contactPerson: { type: String, trim: true },
+    emergencyContactPhone: { type: String, trim: true },
+    policeComplaintNumber: { type: String, trim: true },
     reporterName: { type: String, trim: true },
     reporterPhone: { type: String, trim: true },
+    reportedByName: { type: String, trim: true },
+    reportedByPhone: { type: String, trim: true },
+    reportedAt: { type: Date, default: Date.now },
+    createdBy: { type: String, trim: true },
+    updatedBy: { type: String, trim: true },
     alternateContact: { type: String, trim: true },
     reporterEmail: { type: String, trim: true, lowercase: true },
     relationshipToPerson: { type: String, trim: true },
@@ -64,7 +81,16 @@ const LostPersonReportSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["open", "under_review", "matched", "found", "resolved", "closed"],
+      enum: [
+        "open",
+        "active",
+        "under_review",
+        "matched",
+        "found",
+        "resolved",
+        "closed",
+        "false_report",
+      ],
       default: "open",
     },
     assignedAdminId: {
@@ -120,6 +146,15 @@ const LostPersonReportSchema = new mongoose.Schema(
         changedAt: { type: Date, default: Date.now },
       },
     ],
+    auditTrail: [
+      {
+        action: { type: String, trim: true, default: "updated" },
+        changedBy: { type: String, trim: true, default: "" },
+        changedByRole: { type: String, trim: true, default: "" },
+        changes: { type: mongoose.Schema.Types.Mixed, default: {} },
+        changedAt: { type: Date, default: Date.now },
+      },
+    ],
     matchedFoundReportId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "FoundPersonReport",
@@ -149,9 +184,12 @@ const LostPersonReportSchema = new mongoose.Schema(
 
 LostPersonReportSchema.index({ lastSeenLocation: "2dsphere" });
 LostPersonReportSchema.index({ status: 1, createdAt: -1 });
+LostPersonReportSchema.index({ reportedByUserId: 1, createdAt: -1 });
+LostPersonReportSchema.index({ lastSeenTime: -1 });
+LostPersonReportSchema.index({ lastSeenDateTime: -1 });
+LostPersonReportSchema.index({ personName: "text", description: "text" });
 
 export const LostPersonReport = mongoose.model(
   "LostPersonReport",
   LostPersonReportSchema
 );
-

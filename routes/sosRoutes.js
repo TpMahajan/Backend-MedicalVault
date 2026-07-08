@@ -15,6 +15,139 @@ const MASS_RADIUS_METERS = 15;
 const MASS_THRESHOLD = 8;
 
 const normalizeRole = (role) => String(role || "").toLowerCase();
+const asText = (value) => (value == null ? "" : String(value).trim());
+
+const parseDateOrNow = (value) => {
+  if (!value) return new Date();
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? new Date() : date;
+};
+
+const parseFiniteNumber = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const normalizeSource = (value) => {
+  const source = asText(value).toLowerCase();
+  if (["android", "ios", "web", "patient_app", "doctor_app", "volunteer"].includes(source)) {
+    return source;
+  }
+  return "other";
+};
+
+const normalizeNetworkMode = (value) => {
+  const mode = asText(value).toLowerCase();
+  if (mode === "online" || mode === "offline") return mode;
+  return "unknown";
+};
+
+const normalizeSyncStatus = (value) => {
+  const status = asText(value).toLowerCase();
+  if (status === "pending" || status === "failed") return status;
+  return "synced";
+};
+
+const mapRecipientStatus = (value) => {
+  const status = asText(value).toLowerCase();
+  if (!status) return "unknown";
+  return status.slice(0, 60);
+};
+
+const sanitizeRecipients = (items) => {
+  if (!Array.isArray(items)) return [];
+  return items.slice(0, 25).map((entry) => {
+    const item = entry && typeof entry === "object" ? entry : {};
+    return {
+      name: asText(item.name).slice(0, 120),
+      phone: asText(item.phone || item.recipient).slice(0, 32),
+      relation: asText(item.relation || item.relationship).slice(0, 80),
+      status: mapRecipientStatus(item.status),
+      error: asText(item.error || item.errorMessage || item.errorCode).slice(0, 240),
+    };
+  });
+};
+
+const resolveEventLocation = (locationPayload = {}) => {
+  const lat = parseFiniteNumber(locationPayload.lat ?? locationPayload.latitude);
+  const lng = parseFiniteNumber(locationPayload.lng ?? locationPayload.longitude);
+  const accuracy = parseFiniteNumber(locationPayload.accuracy ?? locationPayload.accuracyMeters);
+  const hasCoordinates = lat !== null && lng !== null;
+  const mapsUrl = hasCoordinates
+    ? `https://maps.google.com/?q=${lat},${lng}`
+    : asText(locationPayload.mapsUrl);
+
+  return {
+    hasCoordinates,
+    lat,
+    lng,
+    accuracy,
+    mapsUrl,
+    geo: hasCoordinates
+      ? {
+          type: "Point",
+          coordinates: [lng, lat],
+        }
+      : undefined,
+    snapshot: {
+      ...(hasCoordinates ? { lat, lng } : {}),
+      ...(accuracy !== null ? { accuracy } : {}),
+      mapsUrl,
+      unavailable: !hasCoordinates,
+    },
+  };
+};
+
+const canListAllSosEvents = (req) => {
+  const role = normalizeRole(req.auth?.role);
+  if (role === "superadmin") return true;
+  if (role !== "admin") return false;
+  const adminRole = String(req.admin?.role || "").toUpperCase();
+  if (adminRole === "SUPER_ADMIN") return true;
+  const assigned = new Set(
+    (Array.isArray(req.admin?.permissions) ? req.admin.permissions : [])
+      .map((entry) => String(entry || "").trim().toUpperCase())
+  );
+  return assigned.has("VIEW_SOS");
+};
+
+const toEventResponse = (event) => {
+  const obj = typeof event.toObject === "function" ? event.toObject() : event;
+  const coordinates = obj.location?.coordinates;
+  const lat =
+    obj.locationSnapshot?.lat ??
+    (Array.isArray(coordinates) && coordinates.length === 2 ? coordinates[1] : undefined);
+  const lng =
+    obj.locationSnapshot?.lng ??
+    (Array.isArray(coordinates) && coordinates.length === 2 ? coordinates[0] : undefined);
+  return {
+    id: obj._id,
+    eventId: obj.eventId || String(obj._id || ""),
+    userId: obj.userId,
+    profileId: obj.profileId || "",
+    userName: obj.userName || "",
+    phone: obj.phone || "",
+    timestamp: obj.timestamp || obj.createdAt,
+    location: {
+      ...(lat !== undefined ? { lat } : {}),
+      ...(lng !== undefined ? { lng } : {}),
+      accuracy: obj.locationSnapshot?.accuracy ?? obj.accuracyMeters ?? null,
+      mapsUrl: obj.locationSnapshot?.mapsUrl || (lat !== undefined && lng !== undefined
+        ? `https://maps.google.com/?q=${lat},${lng}`
+        : ""),
+      unavailable: obj.locationSnapshot?.unavailable === true || lat === undefined || lng === undefined,
+    },
+    messagePreview: obj.messagePreview || "",
+    recipients: obj.recipients || [],
+    source: obj.source || "other",
+    networkMode: obj.networkMode || "unknown",
+    syncStatus: obj.syncStatus || "synced",
+    status: obj.status || "open",
+    createdAt: obj.createdAt,
+    updatedAt: obj.updatedAt,
+  };
+};
 
 // Create SOS message (patient/doctor/admin)
 router.post("/", auth, async (req, res) => {
@@ -241,6 +374,162 @@ router.post("/", auth, async (req, res) => {
   } catch (e) {
     console.error("SOS create error:", e);
     return res.status(500).json({ success: false, message: "Failed to create SOS" });
+  }
+});
+
+router.post("/events", auth, async (req, res) => {
+  try {
+    const role = normalizeRole(req.auth?.role || "patient");
+    const userId = req.user?._id || req.user?.id || req.auth?.id;
+
+    if (!userId || role !== "patient") {
+      return res.status(403).json({
+        success: false,
+        message: "Only authenticated patients can create SOS event logs.",
+      });
+    }
+
+    const body = req.body || {};
+    const eventId = asText(body.eventId);
+    if (eventId) {
+      const existing = await SosEvent.findOne({ eventId, userId }).lean();
+      if (existing) {
+        return res.status(200).json({
+          success: true,
+          data: { event: toEventResponse(existing), deduped: true },
+        });
+      }
+    }
+
+    const location = resolveEventLocation(body.location || {
+      lat: body.latitude,
+      lng: body.longitude,
+      accuracy: body.accuracyMeters,
+    });
+    const timestamp = parseDateOrNow(body.timestamp || body.capturedAt);
+    const recipients = sanitizeRecipients(body.recipients || body.attemptedContacts);
+    const userName = asText(body.userName || body.name || req.user?.name).slice(0, 160);
+    const phone = asText(body.phone || body.mobile || req.user?.mobile).slice(0, 32);
+    const profileId = asText(body.profileId || userId).slice(0, 120);
+    const messagePreview = asText(body.messagePreview).slice(0, 480);
+
+    const sosEvent = await SosEvent.create({
+      eventId: eventId || undefined,
+      userId,
+      profileId,
+      userName,
+      phone,
+      timestamp,
+      source: normalizeSource(body.source),
+      ...(location.geo ? { location: location.geo } : {}),
+      locationSnapshot: location.snapshot,
+      accuracyMeters: location.accuracy ?? undefined,
+      notes: asText(body.notes).slice(0, 500) || undefined,
+      messagePreview,
+      recipients,
+      networkMode: normalizeNetworkMode(body.networkMode),
+      syncStatus: "synced",
+      severity: "red",
+      status: "open",
+    });
+
+    await SOS.create({
+      patientId: userId,
+      profileId,
+      name: userName,
+      mobile: phone,
+      location: location.hasCoordinates
+        ? `${location.lat.toFixed(6)},${location.lng.toFixed(6)}`
+        : "Location unavailable",
+      submittedByRole: role,
+      notes: "Client SOS SMS event",
+      accuracyMeters: location.accuracy ?? undefined,
+      geoLat: location.lat ?? undefined,
+      geoLng: location.lng ?? undefined,
+    });
+
+    await writeAuditLog({
+      req,
+      action: "CREATE_SOS_EVENT",
+      resourceType: "SosEvent",
+      resourceId: sosEvent._id?.toString(),
+      patientId: userId?.toString?.() || String(userId),
+      statusCode: 201,
+      metadata: {
+        eventId: eventId || sosEvent._id?.toString(),
+        recipientCount: recipients.length,
+        networkMode: sosEvent.networkMode,
+        source: sosEvent.source,
+        hasLocation: location.hasCoordinates,
+      },
+    });
+
+    return res.status(201).json({
+      success: true,
+      data: { event: toEventResponse(sosEvent) },
+    });
+  } catch (e) {
+    console.error("SOS event create error:", e);
+    return res.status(500).json({ success: false, message: "Failed to create SOS event" });
+  }
+});
+
+router.get("/events/me", auth, async (req, res) => {
+  try {
+    const userId = req.user?._id || req.user?.id || req.auth?.id;
+    if (!userId || normalizeRole(req.auth?.role) !== "patient") {
+      return res.status(403).json({ success: false, message: "Access denied" });
+    }
+    const limit = Math.min(parseInt(req.query.limit || "50", 10), 100);
+    const events = await SosEvent.find({ userId })
+      .sort({ timestamp: -1, createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    return res.json({
+      success: true,
+      data: events.map(toEventResponse),
+    });
+  } catch (e) {
+    console.error("SOS event self list error:", e);
+    return res.status(500).json({ success: false, message: "Failed to fetch SOS events" });
+  }
+});
+
+router.get("/events", auth, async (req, res) => {
+  try {
+    const role = normalizeRole(req.auth?.role);
+    if (!canListAllSosEvents(req)) {
+      if (role === "patient") {
+        const userId = req.user?._id || req.user?.id || req.auth?.id;
+        const events = await SosEvent.find({ userId })
+          .sort({ timestamp: -1, createdAt: -1 })
+          .limit(Math.min(parseInt(req.query.limit || "50", 10), 100))
+          .lean();
+        return res.json({ success: true, data: events.map(toEventResponse) });
+      }
+      return res.status(403).json({ success: false, message: "Insufficient permissions" });
+    }
+
+    const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);
+    const events = await SosEvent.find({})
+      .sort({ timestamp: -1, createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    await writeAuditLog({
+      req,
+      action: "LIST_SOS_EVENTS",
+      resourceType: "SosEvent",
+      resourceId: "",
+      statusCode: 200,
+      metadata: { count: events.length },
+    });
+
+    return res.json({ success: true, data: events.map(toEventResponse) });
+  } catch (e) {
+    console.error("SOS event list error:", e);
+    return res.status(500).json({ success: false, message: "Failed to fetch SOS events" });
   }
 });
 
