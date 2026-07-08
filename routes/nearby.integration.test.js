@@ -1,6 +1,13 @@
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeEach, describe, expect, it, jest } from "@jest/globals";
+import {
+  afterAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  jest,
+} from "@jest/globals";
 
 const axiosGetMock = jest.fn();
 const axiosPostMock = jest.fn();
@@ -25,7 +32,10 @@ const app = express();
 app.use(express.json());
 app.use("/api/nearby", nearbyRouter);
 
-const originalEnv = { GOOGLE_MAPS_API_KEY: process.env.GOOGLE_MAPS_API_KEY };
+const originalEnv = {
+  GOOGLE_MAPS_API_KEY: process.env.GOOGLE_MAPS_API_KEY,
+  GOOGLE_PLACES_ENABLED: process.env.GOOGLE_PLACES_ENABLED,
+};
 
 const hospitalResult = (overrides = {}) => ({
   place_id: "place-hospital-1",
@@ -51,6 +61,7 @@ describe("nearby services route (Google Places legacy)", () => {
     axiosGetMock.mockReset();
     axiosPostMock.mockReset();
     process.env.GOOGLE_MAPS_API_KEY = "maps-test-key";
+    process.env.GOOGLE_PLACES_ENABLED = "true";
   });
 
   afterAll(() => {
@@ -97,14 +108,12 @@ describe("nearby services route (Google Places legacy)", () => {
         : { status: "OK", results: [hospitalResult()] },
     );
 
-    const res = await request(app)
-      .get("/api/nearby/services")
-      .query({
-        lat: 19.9975,
-        lng: 73.7898,
-        radiusKm: 10,
-        type: "hospital,clinic,doctor,pharmacy,ambulance",
-      });
+    const res = await request(app).get("/api/nearby/services").query({
+      lat: 19.9975,
+      lng: 73.7898,
+      radiusKm: 10,
+      type: "hospital,clinic,doctor,pharmacy,ambulance",
+    });
 
     expect(res.status).toBe(200);
     // hospital + doctor + pharmacy => nearbysearch; clinic + ambulance => textsearch.
@@ -142,21 +151,29 @@ describe("nearby services route (Google Places legacy)", () => {
     expect(res.body.criticalServices.length).toBeGreaterThan(0);
   });
 
-  it("returns GOOGLE_MAPS_REQUEST_DENIED + fallback when the key is not allowed", async () => {
+  it("returns GOOGLE_MAPS_REQUEST_DENIED + maps fallback when the key is not allowed", async () => {
     mockGoogle(() => ({
       status: "REQUEST_DENIED",
-      error_message: "You're calling a legacy API, which is not enabled for your project.",
+      error_message:
+        "You're calling a legacy API, which is not enabled for your project.",
       results: [],
     }));
 
     const res = await request(app)
       .get("/api/nearby/services")
-      .query({ lat: 19.9975, lng: 73.7898, radiusKm: 5, type: "hospital,clinic" });
+      .query({
+        lat: 19.9975,
+        lng: 73.7898,
+        radiusKm: 5,
+        type: "hospital,clinic",
+      });
 
-    expect(res.body.success).toBe(false);
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
     expect(res.body.code).toBe("GOOGLE_MAPS_REQUEST_DENIED");
-    expect(res.body.message).toMatch(/not allowed to access Places API/i);
-    expect(res.body.fallback.length).toBeGreaterThan(0);
+    expect(res.body.source).toBe("maps_url_fallback");
+    expect(res.body.message).toMatch(/Places API is not enabled/i);
+    expect(res.body.actionCards.length).toBeGreaterThan(0);
     expect(axiosPostMock).not.toHaveBeenCalled();
   });
 
@@ -176,7 +193,12 @@ describe("nearby services route (Google Places legacy)", () => {
 
     const res = await request(app)
       .get("/api/nearby/services")
-      .query({ lat: 19.9975, lng: 73.7898, radiusKm: 5, type: "hospital,doctor,pharmacy" });
+      .query({
+        lat: 19.9975,
+        lng: 73.7898,
+        radiusKm: 5,
+        type: "hospital,doctor,pharmacy",
+      });
 
     // Same place_id from 3 type queries collapses to one.
     expect(res.body.services).toHaveLength(1);
@@ -193,16 +215,49 @@ describe("nearby services route (Google Places legacy)", () => {
     expect(axiosGetMock.mock.calls[0][1].params.radius).toBe(25000);
   });
 
-  it("returns a degraded response with fallback when the key is missing", async () => {
+  it("returns a degraded maps fallback when the key is missing", async () => {
     delete process.env.GOOGLE_MAPS_API_KEY;
 
     const res = await request(app)
       .get("/api/nearby/services")
       .query({ lat: 19.9975, lng: 73.7898, radiusKm: 5, type: "hospital" });
 
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
     expect(res.body.code).toBe("GOOGLE_MAPS_API_KEY_MISSING");
-    expect(res.body.fallback.length).toBeGreaterThan(0);
+    expect(res.body.source).toBe("maps_url_fallback");
+    expect(res.body.actionCards.length).toBeGreaterThan(0);
     expect(axiosGetMock).not.toHaveBeenCalled();
+  });
+
+  it("does not call Google Places when GOOGLE_PLACES_ENABLED is false", async () => {
+    process.env.GOOGLE_PLACES_ENABLED = "false";
+
+    const res = await request(app).get("/api/nearby/services").query({
+      lat: 19.9975,
+      lng: 73.7898,
+      radiusKm: 5,
+      type: "hospital,clinic,pharmacy,diagnostic_lab,ambulance",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.code).toBe("GOOGLE_PLACES_DISABLED");
+    expect(res.body.source).toBe("maps_url_fallback");
+    expect(res.body.services).toEqual([]);
+    expect(res.body.actionCards).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "hospital",
+          mapsUrl: expect.stringContaining("google.com/maps/search"),
+        }),
+        expect.objectContaining({
+          type: "diagnostic_lab",
+          mapsUrl: expect.stringContaining("google.com/maps/search"),
+        }),
+      ]),
+    );
+    expect(axiosGetMock).not.toHaveBeenCalled();
+    expect(axiosPostMock).not.toHaveBeenCalled();
   });
 });

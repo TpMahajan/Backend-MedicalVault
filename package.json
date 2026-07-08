@@ -11,6 +11,7 @@
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "security:audit": "npm audit --omit=dev",
     "security:check": "node --check index.js && npm run security:audit",
+    "app-update:metadata": "node ./scripts/update-app-apk-metadata.js",
     "backup:create": "node ./scripts/backup-db.js",
     "backup:restore": "node ./scripts/restore-db.js",
     "migrate:dedupe-lost-found-matches": "node ./scripts/dedupe-lost-found-matches.js"

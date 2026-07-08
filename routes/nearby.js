@@ -6,7 +6,7 @@ import { auth } from "../middleware/auth.js";
 const router = express.Router();
 
 // ---------------------------------------------------------------------------
-// Provider: Google Places LEGACY Web Service (default and only provider).
+// Provider: Google Places LEGACY Web Service (opt-in provider).
 // Places API (New) — https://places.googleapis.com/v1 — is intentionally NOT
 // called by default. All Google location features use the single env key
 // GOOGLE_MAPS_API_KEY.
@@ -26,6 +26,11 @@ const MAX_RADIUS_METERS = MAX_RADIUS_KM * 1000;
 const GOOGLE_TIMEOUT_MS = 5000;
 const MAX_RESULTS_PER_TYPE = 10;
 const MAX_TOTAL_RESULTS = 40;
+
+const isGooglePlacesEnabled = () =>
+  String(process.env.GOOGLE_PLACES_ENABLED || "false")
+    .trim()
+    .toLowerCase() === "true";
 
 const defaultCriticalServices = [
   { type: "AMBULANCE", name: "Emergency Ambulance", phone: "108" },
@@ -97,16 +102,21 @@ const normalizeRequestedType = (value) => {
     .toLowerCase()
     .replace(/[\s_-]+/g, "");
 
-  if (["all", "any", "healthcare", "medical"].includes(normalized)) return "all";
+  if (["all", "any", "healthcare", "medical"].includes(normalized))
+    return "all";
   if (["hospital", "hospitals"].includes(normalized)) return "hospital";
   if (["clinic", "clinics"].includes(normalized)) return "clinic";
   if (["doctor", "doctors", "physician", "physicians"].includes(normalized)) {
     return "doctor";
   }
   if (
-    ["pharmacy", "pharmacies", "medicalstore", "medicalstores", "chemist"].includes(
-      normalized,
-    )
+    [
+      "pharmacy",
+      "pharmacies",
+      "medicalstore",
+      "medicalstores",
+      "chemist",
+    ].includes(normalized)
   ) {
     return "pharmacy";
   }
@@ -117,6 +127,13 @@ const normalizeRequestedType = (value) => {
   ) {
     return "ambulance";
   }
+  if (
+    ["diagnosticlab", "diagnosticlabs", "lab", "labs", "pathology"].includes(
+      normalized,
+    )
+  ) {
+    return "diagnostic_lab";
+  }
   return "";
 };
 
@@ -126,7 +143,14 @@ const parseTypes = (query = {}) => {
     ...(Array.isArray(query.types) ? query.types : [query.types || ""]),
     ...(Array.isArray(query.type) ? query.type : [query.type || ""]),
   ];
-  const allowed = new Set(["hospital", "clinic", "ambulance", "doctor", "pharmacy"]);
+  const allowed = new Set([
+    "hospital",
+    "clinic",
+    "ambulance",
+    "doctor",
+    "pharmacy",
+    "diagnostic_lab",
+  ]);
 
   const normalized = raw
     .flatMap((entry) =>
@@ -137,14 +161,28 @@ const parseTypes = (query = {}) => {
     )
     .flatMap((entry) =>
       entry === "all"
-        ? ["hospital", "clinic", "doctor", "pharmacy", "ambulance"]
+        ? [
+            "hospital",
+            "clinic",
+            "doctor",
+            "pharmacy",
+            "diagnostic_lab",
+            "ambulance",
+          ]
         : [entry],
     )
     .filter((entry) => allowed.has(entry));
 
   return normalized.length > 0
     ? [...new Set(normalized)]
-    : ["hospital", "clinic", "doctor", "pharmacy", "ambulance"];
+    : [
+        "hospital",
+        "clinic",
+        "doctor",
+        "pharmacy",
+        "diagnostic_lab",
+        "ambulance",
+      ];
 };
 
 const haversineDistanceKm = (lat1, lon1, lat2, lon2) => {
@@ -170,6 +208,8 @@ const toLegacyServiceType = (type) => {
       return "PHARMACY";
     case "ambulance":
       return "AMBULANCE";
+    case "diagnostic_lab":
+      return "DIAGNOSTIC_LAB";
     default:
       return "HEALTHCARE";
   }
@@ -189,10 +229,67 @@ const legacyStrategyForType = (type) => {
       return { endpoint: "text", params: { query: "clinic" } };
     case "ambulance":
       return { endpoint: "text", params: { query: "ambulance service" } };
+    case "diagnostic_lab":
+      return { endpoint: "text", params: { query: "diagnostic lab" } };
     default:
       return { endpoint: "text", params: { query: "medical" } };
   }
 };
+
+const mapsSearchLabelByType = {
+  hospital: "Search hospitals near you on Google Maps",
+  clinic: "Search clinics near you on Google Maps",
+  doctor: "Search doctors near you on Google Maps",
+  pharmacy: "Search pharmacies near you on Google Maps",
+  diagnostic_lab: "Search diagnostic labs near you on Google Maps",
+  ambulance: "Search emergency care near you on Google Maps",
+};
+
+const mapsSearchQueryByType = {
+  hospital: "hospitals",
+  clinic: "clinics",
+  doctor: "doctors",
+  pharmacy: "pharmacies",
+  diagnostic_lab: "diagnostic labs",
+  ambulance: "emergency hospitals",
+};
+
+const buildMapsSearchUrl = ({ type, lat, lng }) => {
+  const query = encodeURIComponent(mapsSearchQueryByType[type] || "healthcare");
+  return `https://www.google.com/maps/search/${query}/@${lat},${lng},15z`;
+};
+
+const buildMapsUrlFallback = ({
+  types,
+  lat,
+  lng,
+  radiusKm,
+  nowIso,
+  code,
+  message,
+}) => ({
+  success: true,
+  code,
+  message:
+    message ||
+    "Structured nearby provider data is unavailable. Use Google Maps search actions below.",
+  services: [],
+  fallback: types.includes("ambulance") ? fallbackEmergencyContacts : [],
+  criticalServices: defaultCriticalServices,
+  source: "maps_url_fallback",
+  radiusKm,
+  lastUpdatedAt: nowIso,
+  count: 0,
+  actionCards: types.map((type) => ({
+    id: `maps_${type}`,
+    type,
+    label:
+      mapsSearchLabelByType[type] ||
+      "Search healthcare near you on Google Maps",
+    query: mapsSearchQueryByType[type] || "healthcare",
+    mapsUrl: buildMapsSearchUrl({ type, lat, lng }),
+  })),
+});
 
 const mapLegacyResult = ({ place, queryType, fromLat, fromLng, nowIso }) => {
   const location = place?.geometry?.location || {};
@@ -248,9 +345,17 @@ class GoogleStatusError extends Error {
   }
 }
 
-const fetchLegacyForType = async ({ type, lat, lng, radius, apiKey, nowIso }) => {
+const fetchLegacyForType = async ({
+  type,
+  lat,
+  lng,
+  radius,
+  apiKey,
+  nowIso,
+}) => {
   const strategy = legacyStrategyForType(type);
-  const url = strategy.endpoint === "nearby" ? LEGACY_NEARBY_URL : LEGACY_TEXT_URL;
+  const url =
+    strategy.endpoint === "nearby" ? LEGACY_NEARBY_URL : LEGACY_TEXT_URL;
   const params = {
     location: `${lat},${lng}`,
     radius,
@@ -267,7 +372,13 @@ const fetchLegacyForType = async ({ type, lat, lng, radius, apiKey, nowIso }) =>
     return results
       .slice(0, MAX_RESULTS_PER_TYPE)
       .map((place) =>
-        mapLegacyResult({ place, queryType: type, fromLat: lat, fromLng: lng, nowIso }),
+        mapLegacyResult({
+          place,
+          queryType: type,
+          fromLat: lat,
+          fromLng: lng,
+          nowIso,
+        }),
       );
   }
 
@@ -319,21 +430,38 @@ router.get("/services", auth, async (req, res) => {
     const types = parseTypes(req.query);
     const nowIso = new Date().toISOString();
 
+    const placesEnabled = isGooglePlacesEnabled();
+    if (!placesEnabled) {
+      return res.status(200).json(
+        buildMapsUrlFallback({
+          types,
+          lat,
+          lng,
+          radiusKm,
+          nowIso,
+          code: "GOOGLE_PLACES_DISABLED",
+          message:
+            "Google Places lookup is disabled. Open results in Google Maps using the actions below.",
+        }),
+      );
+    }
+
     const googleMapsApiKey = getGoogleMapsApiKey();
 
-    // No key — clear degraded response with emergency contacts. Never blank.
+    // No key — clear degraded response with Maps actions. Never blank.
     if (!googleMapsApiKey) {
-      return res.status(503).json({
-        success: false,
-        code: "GOOGLE_MAPS_API_KEY_MISSING",
-        message: "Google Maps API key is not configured on the backend.",
-        services: [],
-        fallback: fallbackEmergencyContacts,
-        criticalServices: defaultCriticalServices,
-        source: "fallback",
-        radiusKm,
-        lastUpdatedAt: nowIso,
-      });
+      return res.status(200).json(
+        buildMapsUrlFallback({
+          types,
+          lat,
+          lng,
+          radiusKm,
+          nowIso,
+          code: "GOOGLE_MAPS_API_KEY_MISSING",
+          message:
+            "Google Places lookup is not configured. Open results in Google Maps using the actions below.",
+        }),
+      );
     }
 
     // Guard against any accidental non-legacy provider wiring.
@@ -374,18 +502,18 @@ router.get("/services", auth, async (req, res) => {
 
     // All calls denied and nothing collected — clear, actionable error.
     if (requestDenied && collected.length === 0) {
-      return res.status(200).json({
-        success: false,
-        code: "GOOGLE_MAPS_REQUEST_DENIED",
-        message:
-          "Google Maps API key is not allowed to access Places API. Enable Places API and allow it on the key.",
-        services: [],
-        fallback: fallbackEmergencyContacts,
-        criticalServices: defaultCriticalServices,
-        source: "fallback",
-        radiusKm,
-        lastUpdatedAt: nowIso,
-      });
+      return res.status(200).json(
+        buildMapsUrlFallback({
+          types,
+          lat,
+          lng,
+          radiusKm,
+          nowIso,
+          code: "GOOGLE_MAPS_REQUEST_DENIED",
+          message:
+            "Google Places API is not enabled or not allowed for this key. Open results in Google Maps using the actions below.",
+        }),
+      );
     }
 
     const services = dedupeServices(collected)
@@ -416,14 +544,18 @@ router.get("/services", auth, async (req, res) => {
       code: error?.code,
       message: error?.message,
     });
-    return res.status(502).json({
-      success: false,
-      code: "NEARBY_UNAVAILABLE",
-      message: "Nearby lookup is temporarily unavailable.",
-      services: [],
-      fallback: fallbackEmergencyContacts,
-      criticalServices: defaultCriticalServices,
-    });
+    return res.status(200).json(
+      buildMapsUrlFallback({
+        types: parseTypes(req.query),
+        lat: toNumber(req.query.lat, 0),
+        lng: toNumber(req.query.lng, 0),
+        radiusKm: DEFAULT_RADIUS_KM,
+        nowIso: new Date().toISOString(),
+        code: "NEARBY_UNAVAILABLE",
+        message:
+          "Structured nearby lookup is temporarily unavailable. Open results in Google Maps using the fallback actions.",
+      }),
+    );
   }
 });
 

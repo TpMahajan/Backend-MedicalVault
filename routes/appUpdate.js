@@ -1,4 +1,5 @@
 import express from "express";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -12,6 +13,8 @@ const updateConfigPath = path.join(projectRoot, "app-update.json");
 const apkDirectory = path.join(projectRoot, "apk");
 
 const VERSION_REGEX = /^\d+(?:\.\d+){0,5}$/;
+const SHA256_REGEX = /^[a-f0-9]{64}$/;
+const apkHashCache = new Map();
 
 function parseVersionSegments(version) {
   return String(version || "")
@@ -39,7 +42,9 @@ function compareVersions(left, right) {
 }
 
 function normalizeApiBase(baseUrl) {
-  const trimmed = String(baseUrl || "").trim().replace(/\/+$/, "");
+  const trimmed = String(baseUrl || "")
+    .trim()
+    .replace(/\/+$/, "");
   if (!trimmed) return "";
   return trimmed.endsWith("/api") ? trimmed.slice(0, -4) : trimmed;
 }
@@ -48,7 +53,9 @@ function requestBase(req) {
   const forwardedProto = req.headers["x-forwarded-proto"];
   const protocol = Array.isArray(forwardedProto)
     ? forwardedProto[0]
-    : String(forwardedProto || req.protocol).split(",")[0].trim();
+    : String(forwardedProto || req.protocol)
+        .split(",")[0]
+        .trim();
   const host = req.get("host");
   return `${protocol}://${host}`;
 }
@@ -81,7 +88,7 @@ function loadUpdateConfig() {
 
   let parsed;
   try {
-    const raw = fs.readFileSync(updateConfigPath, "utf-8");
+    const raw = fs.readFileSync(updateConfigPath, "utf8");
     const normalizedRaw = raw.replace(/^\uFEFF/, "").trim();
     parsed = JSON.parse(normalizedRaw);
   } catch (error) {
@@ -90,13 +97,17 @@ function loadUpdateConfig() {
 
   const latestVersion = String(parsed.latestVersion || "").trim();
   const minimumSupportedVersion = String(
-    parsed.minimumSupportedVersion || ""
+    parsed.minimumSupportedVersion || "",
   ).trim();
   const releaseNotes = String(parsed.releaseNotes || "").trim();
   const sha256 = String(parsed.sha256 || parsed.checksum || "")
     .trim()
     .toLowerCase();
+  const checksum = String(parsed.checksum || "")
+    .trim()
+    .toLowerCase();
   const apkUrl = String(parsed.apkUrl || "").trim();
+  const apkFileName = String(parsed.apkFileName || "").trim();
 
   if (!VERSION_REGEX.test(latestVersion)) {
     throw new Error("latestVersion must be a dotted numeric version");
@@ -107,6 +118,20 @@ function loadUpdateConfig() {
   if (compareVersions(minimumSupportedVersion, latestVersion) > 0) {
     throw new Error("minimumSupportedVersion cannot exceed latestVersion");
   }
+  if (!SHA256_REGEX.test(sha256)) {
+    throw new Error("sha256 must be a 64-character SHA256 hex checksum");
+  }
+  if (checksum && checksum !== sha256) {
+    throw new Error("checksum and sha256 must match when both are configured");
+  }
+  if (
+    apkFileName &&
+    (apkFileName.includes("/") ||
+      apkFileName.includes("\\") ||
+      !apkFileName.toLowerCase().endsWith(".apk"))
+  ) {
+    throw new Error("apkFileName must be a plain APK filename");
+  }
 
   return {
     latestVersion,
@@ -115,6 +140,7 @@ function loadUpdateConfig() {
     sha256,
     checksum: sha256,
     apkUrl,
+    apkFileName,
   };
 }
 
@@ -122,17 +148,34 @@ function resolveApkUrl(req, config) {
   if (config.apkUrl) {
     return withVersionQuery(config.apkUrl, config.latestVersion);
   }
-  const envBase = normalizeApiBase(process.env.APP_API_BASE_URL);
+  const envBase =
+    normalizeApiBase(process.env.APP_API_BASE_URL) ||
+    normalizeApiBase(process.env.API_PUBLIC_BASE_URL);
   const base = envBase || normalizeApiBase(requestBase(req));
-  return withVersionQuery(`${base}/api/app/apk/${config.latestVersion}`, config.latestVersion);
+  return withVersionQuery(
+    `${base}/api/v1/app/apk/${config.latestVersion}`,
+    config.latestVersion,
+  );
 }
 
-function resolveApkFilePath(version) {
+function safeApkPath(fileName) {
+  const absoluteDirectory = path.resolve(apkDirectory);
+  const absolutePath = path.resolve(absoluteDirectory, fileName);
+  if (!absolutePath.startsWith(`${absoluteDirectory}${path.sep}`)) {
+    return null;
+  }
+  return absolutePath;
+}
+
+function resolveApkFilePath(version, config = null) {
   if (!fs.existsSync(apkDirectory)) {
     return null;
   }
 
   const candidates = [
+    config?.apkFileName && config.latestVersion === version
+      ? config.apkFileName
+      : "",
     `${version}.apk`,
     `healthvault_v${version}.apk`,
     `medicalvault_v${version}.apk`,
@@ -140,8 +183,9 @@ function resolveApkFilePath(version) {
     `app-${version}.apk`,
   ];
 
-  for (const fileName of candidates) {
-    const absolutePath = path.join(apkDirectory, fileName);
+  for (const fileName of candidates.filter(Boolean)) {
+    const absolutePath = safeApkPath(fileName);
+    if (!absolutePath) continue;
     if (fs.existsSync(absolutePath) && fs.statSync(absolutePath).isFile()) {
       return absolutePath;
     }
@@ -153,13 +197,92 @@ function resolveApkFilePath(version) {
   });
 
   if (files.length === 0) return null;
-  return path.join(apkDirectory, files[0]);
+  return safeApkPath(files.sort()[0]);
 }
 
-router.get("/update", (req, res) => {
+async function computeFileSha256(filePath) {
+  const stat = fs.statSync(filePath);
+  const cacheKey = `${filePath}:${stat.size}:${stat.mtimeMs}`;
+  const cached = apkHashCache.get(cacheKey);
+  if (cached) return cached;
+
+  const hash = crypto.createHash("sha256");
+  await new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", resolve);
+  });
+  const digest = hash.digest("hex").toLowerCase();
+  apkHashCache.clear();
+  apkHashCache.set(cacheKey, digest);
+  return digest;
+}
+
+async function validateConfiguredApk(config) {
+  const apkPath = resolveApkFilePath(config.latestVersion, config);
+  if (!apkPath) {
+    return {
+      ok: false,
+      code: "APP_UPDATE_APK_NOT_FOUND",
+      message: "APK file missing on server",
+    };
+  }
+
+  const actualSha256 = await computeFileSha256(apkPath);
+  if (actualSha256 !== config.sha256) {
+    return {
+      ok: false,
+      code: "APP_UPDATE_SHA_MISMATCH",
+      message: "Configured sha256 does not match served APK",
+      fileName: path.basename(apkPath),
+    };
+  }
+
+  const stat = fs.statSync(apkPath);
+  return {
+    ok: true,
+    fileName: path.basename(apkPath),
+    size: stat.size,
+  };
+}
+
+export async function validateAppUpdateConfigOnStartup() {
+  try {
+    const config = loadUpdateConfig();
+    const validation = await validateConfiguredApk(config);
+    if (!validation.ok) {
+      console.warn("[app-update] Startup validation warning:", {
+        code: validation.code,
+        message: validation.message,
+        latestVersion: config.latestVersion,
+      });
+      return validation;
+    }
+    console.info("[app-update] Startup validation passed:", {
+      latestVersion: config.latestVersion,
+      apkFileName: validation.fileName,
+      size: validation.size,
+    });
+    return validation;
+  } catch (error) {
+    console.warn("[app-update] Startup validation warning:", {
+      code: "APP_UPDATE_CONFIG_INVALID",
+      message: error?.message || "Invalid app update config",
+    });
+    return {
+      ok: false,
+      code: "APP_UPDATE_CONFIG_INVALID",
+      message: error?.message || "Invalid app update config",
+    };
+  }
+}
+
+router.get("/update", async (req, res) => {
   try {
     const currentVersion = String(req.query.currentVersion || "0.0.0").trim();
     const config = loadUpdateConfig();
+    const apkValidation = await validateConfiguredApk(config);
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
 
     const hasUpdate = compareVersions(currentVersion, config.latestVersion) < 0;
@@ -171,6 +294,8 @@ router.get("/update", (req, res) => {
       latestVersion: config.latestVersion,
       minimumSupportedVersion: config.minimumSupportedVersion,
       apkUrl: resolveApkUrl(req, config),
+      apkFileName: apkValidation.fileName || config.apkFileName || "",
+      apkAvailable: apkValidation.ok,
       releaseNotes: config.releaseNotes,
       checksum: config.sha256,
       sha256: config.sha256,
@@ -179,8 +304,11 @@ router.get("/update", (req, res) => {
     });
   } catch (error) {
     res.status(500).json({
-      message: "Unable to resolve app update metadata",
-      error: error.message,
+      success: false,
+      code: "APP_UPDATE_CONFIG_INVALID",
+      errorCode: "APP_UPDATE_CONFIG_INVALID",
+      message: "Update metadata invalid",
+      detail: error.message,
     });
   }
 });
@@ -194,29 +322,43 @@ router.get("/apk/:version", (req, res) => {
   }
 
   try {
-    const apkPath = resolveApkFilePath(version);
+    const config = loadUpdateConfig();
+    const apkPath = resolveApkFilePath(version, config);
     if (!apkPath) {
       return res.status(404).json({
-        message: `APK not found for version ${version}`,
+        success: false,
+        code: "APP_UPDATE_APK_NOT_FOUND",
+        errorCode: "APP_UPDATE_APK_NOT_FOUND",
+        message: "APK file missing on server",
       });
     }
 
     const downloadName = path.basename(apkPath);
+    const stat = fs.statSync(apkPath);
     res.setHeader("Content-Type", "application/vnd.android.package-archive");
+    res.setHeader("Content-Length", String(stat.size));
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${downloadName}"`,
+    );
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
 
-    return res.download(apkPath, downloadName, (error) => {
+    return res.sendFile(apkPath, (error) => {
       if (error && !res.headersSent) {
         res.status(500).json({
+          success: false,
+          code: "APP_UPDATE_APK_STREAM_FAILED",
+          errorCode: "APP_UPDATE_APK_STREAM_FAILED",
           message: "Failed to stream APK",
-          error: error.message,
         });
       }
     });
   } catch (error) {
     return res.status(500).json({
+      success: false,
+      code: "APP_UPDATE_APK_DOWNLOAD_FAILED",
+      errorCode: "APP_UPDATE_APK_DOWNLOAD_FAILED",
       message: "Failed to process APK download",
-      error: error.message,
     });
   }
 });

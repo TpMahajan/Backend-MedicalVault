@@ -102,9 +102,43 @@ const validateUploadFilename = (name = "") => {
   const normalized = String(name || "").toLowerCase();
   return /\.(pdf|jpg|jpeg|png)$/.test(normalized);
 };
+const sanitizeUploadFileName = (name = "") =>
+  path
+    .basename(String(name || "document"))
+    .replace(/[^\w.\- ()]/g, "_")
+    .slice(0, 160);
 const isValidObjectId = (value) =>
   /^[a-fA-F0-9]{24}$/.test(String(value || ""));
 const documentReader = new DocumentReader();
+
+const uploadErrorPayload = ({
+  code = "UPLOAD_FAILED",
+  message = "Upload failed, please try again",
+  extra = {},
+} = {}) => ({
+  success: false,
+  code,
+  errorCode: code,
+  error: code,
+  message,
+  msg: message,
+  ...extra,
+});
+
+const logUploadStage = (stage, req, extra = {}) => {
+  const file = req.file || {};
+  console.info("[document-upload]", {
+    stage,
+    fileName: sanitizeUploadFileName(file.originalname || file.filename || ""),
+    mimeType: file.mimetype || "",
+    size: Number(file.size || 0),
+    userId: req.auth?.id || "",
+    role: req.auth?.role || "",
+    targetUserId: String(req.body?.userId || req.body?.patientId || "").trim(),
+    storageProvider: req.documentUploadStorage || "",
+    ...extra,
+  });
+};
 
 const clinicalMedicalKeywords = [
   "prescription",
@@ -1220,8 +1254,12 @@ const singleDocumentUpload = (req, res, next) => {
       req.documentUploadStorage = storageMode;
       const selectedUpload = storageMode === "s3" ? s3Upload : localUpload;
 
-      selectedUpload.single("file")(req, res, (err) => {
+      selectedUpload.fields([
+        { name: "file", maxCount: 1 },
+        { name: "document", maxCount: 1 },
+      ])(req, res, (err) => {
         if (!err) {
+          req.file = req.files?.file?.[0] || req.files?.document?.[0] || null;
           if (req.file && req.documentUploadStorage === "local") {
             const storedFileName =
               req.file.filename || path.basename(req.file.path || "");
@@ -1233,27 +1271,50 @@ const singleDocumentUpload = (req, res, next) => {
         }
 
         const message = err?.message || "Upload failed";
-        const statusCode =
-          err?.code === "LIMIT_FILE_SIZE" || /unsupported file/i.test(message)
-            ? 400
-            : 500;
-        console.error("Document upload middleware error:", err);
-        return res.status(statusCode).json({
-          success: false,
-          msg: message,
-          error: message,
+        const isTooLarge = err?.code === "LIMIT_FILE_SIZE";
+        const isUnsupported = /unsupported file/i.test(message);
+        const statusCode = isTooLarge || isUnsupported ? 400 : 500;
+        const code = isTooLarge
+          ? "FILE_TOO_LARGE"
+          : isUnsupported
+            ? "UNSUPPORTED_FILE_TYPE"
+            : "UPLOAD_MIDDLEWARE_FAILED";
+        console.warn("Document upload middleware error:", {
+          code,
+          message,
+          userId: req.auth?.id || "",
+          role: req.auth?.role || "",
         });
+        return res.status(statusCode).json(
+          uploadErrorPayload({
+            code,
+            message: isTooLarge
+              ? "File too large"
+              : isUnsupported
+                ? "Unsupported file type"
+                : "Upload failed, please try again",
+          }),
+        );
       });
     })
     .catch((err) => {
       const message = err?.message || "Upload failed";
       const statusCode = Number(err?.statusCode) || 500;
-      console.error("Document upload middleware bootstrap error:", err);
-      return res.status(statusCode).json({
-        success: false,
-        msg: message,
-        error: message,
+      const code =
+        statusCode === 503 ? "STORAGE_NOT_CONFIGURED" : "UPLOAD_STORAGE_FAILED";
+      console.warn("Document upload middleware bootstrap error:", {
+        code,
+        message,
       });
+      return res.status(statusCode).json(
+        uploadErrorPayload({
+          code,
+          message:
+            statusCode === 503
+              ? "Storage not configured"
+              : "Upload failed, please try again",
+        }),
+      );
     });
 };
 
@@ -1268,12 +1329,12 @@ router.post(
     const uploadStartedAt = Date.now();
     try {
       if (!req.file) {
-        return res.status(400).json({
-          success: false,
-          error: "NO_FILE_UPLOADED",
-          message: "No file uploaded",
-          msg: "No file uploaded",
-        });
+        return res.status(400).json(
+          uploadErrorPayload({
+            code: "NO_FILE_UPLOADED",
+            message: "No file uploaded",
+          }),
+        );
       }
 
       const { title, category, date, notes, userId } = req.body;
@@ -1291,6 +1352,33 @@ router.post(
       const storedUrl =
         req.file.location ||
         (req.file.filename ? buildLocalUploadUrl(req, req.file.filename) : "");
+      logUploadStage("received", req);
+
+      const rejectUploadedFile = async ({
+        statusCode = 400,
+        code,
+        message,
+        extra = {},
+      }) => {
+        await cleanupRejectedUpload({
+          usingS3Storage,
+          s3Bucket,
+          s3Key,
+          localFilePath,
+        });
+        logUploadStage("rejected", req, {
+          failureStage: code,
+          errorCode: code,
+          ...extra,
+        });
+        return res.status(statusCode).json(
+          uploadErrorPayload({
+            code,
+            message,
+            extra,
+          }),
+        );
+      };
 
       // ✅ Support both doctor uploads (userId from req.body) and patient uploads (userId from req.auth.id)
       const requesterRole = String(req.auth?.role || "").toLowerCase();
@@ -1302,12 +1390,12 @@ router.post(
 
       if (requesterRole === "patient") {
         if (requestedTargetId && requestedTargetId !== requesterId) {
-          return res
-            .status(403)
-            .json({
-              success: false,
-              msg: "Patients can only upload to their own records",
-            });
+          return rejectUploadedFile({
+            statusCode: 403,
+            code: "UPLOAD_FORBIDDEN",
+            message: "Patients can only upload to their own records",
+            extra: { targetUserId: requestedTargetId },
+          });
         }
         targetUserId = requesterId;
       } else if (requesterRole === "doctor") {
@@ -1330,50 +1418,62 @@ router.post(
 
         targetUserId = activeSessionPatientId || requestedTargetId || "";
         if (!targetUserId) {
-          return res
-            .status(400)
-            .json({
-              success: false,
-              msg: "Doctors must provide target patient userId",
-            });
+          return rejectUploadedFile({
+            statusCode: 400,
+            code: "MISSING_PATIENT_ID",
+            message: "Doctors must provide target patient userId",
+          });
         }
         if (!isValidObjectId(targetUserId)) {
-          return res
-            .status(400)
-            .json({ success: false, msg: "Invalid target patient userId" });
+          return rejectUploadedFile({
+            statusCode: 400,
+            code: "INVALID_PATIENT_ID",
+            message: "Invalid target patient userId",
+            extra: { targetUserId },
+          });
         }
         const allowed = await canDoctorAccessPatient(requesterId, targetUserId);
         if (!allowed) {
-          return res
-            .status(403)
-            .json({
-              success: false,
-              msg: "No active doctor-patient relationship",
-            });
+          return rejectUploadedFile({
+            statusCode: 403,
+            code: "UPLOAD_FORBIDDEN",
+            message: "No active doctor-patient relationship",
+            extra: { targetUserId },
+          });
         }
       } else if (privilegedRoles.has(requesterRole)) {
         targetUserId = requestedTargetId || "";
         if (!targetUserId) {
-          return res
-            .status(400)
-            .json({ success: false, msg: "target userId is required" });
+          return rejectUploadedFile({
+            statusCode: 400,
+            code: "MISSING_PATIENT_ID",
+            message: "target userId is required",
+          });
         }
         if (!isValidObjectId(targetUserId)) {
-          return res
-            .status(400)
-            .json({ success: false, msg: "Invalid target userId" });
+          return rejectUploadedFile({
+            statusCode: 400,
+            code: "INVALID_PATIENT_ID",
+            message: "Invalid target userId",
+            extra: { targetUserId },
+          });
         }
       } else {
-        return res
-          .status(403)
-          .json({ success: false, msg: "Unauthorized role for upload" });
+        return rejectUploadedFile({
+          statusCode: 403,
+          code: "UPLOAD_FORBIDDEN",
+          message: "Unauthorized role for upload",
+        });
       }
 
       const targetUser = await User.findById(targetUserId).select("_id").lean();
       if (!targetUser) {
-        return res
-          .status(404)
-          .json({ success: false, msg: "Target user not found" });
+        return rejectUploadedFile({
+          statusCode: 404,
+          code: "PATIENT_NOT_FOUND",
+          message: "Target user not found",
+          extra: { targetUserId },
+        });
       }
 
       // Security checks always run (both storage modes) before any medical
@@ -1404,13 +1504,16 @@ router.post(
           s3Key,
           localFilePath,
         });
-
-        return res.status(400).json({
-          success: false,
-          error: "FILE_SECURITY_CHECK_FAILED",
-          message: "Uploaded file failed security checks",
-          msg: "Uploaded file failed security checks",
+        logUploadStage("security_check_failed", req, {
+          targetUserId,
         });
+
+        return res.status(400).json(
+          uploadErrorPayload({
+            code: "FILE_SECURITY_CHECK_FAILED",
+            message: "Uploaded file failed security checks",
+          }),
+        );
       }
 
       // ✅ Properly handle date conversion
@@ -1434,10 +1537,17 @@ router.post(
           s3Key,
           localFilePath,
         });
+        logUploadStage("medical_validation_failed", req, {
+          targetUserId,
+          verificationStatus:
+            validationResult.verification?.status || "rejected",
+        });
 
         return res.status(400).json({
           success: false,
           code: "DOCUMENT_NOT_MEDICAL",
+          errorCode: "DOCUMENT_NOT_MEDICAL",
+          message: validationResult.message || DOCUMENT_REJECT_MESSAGE,
           msg: validationResult.message || DOCUMENT_REJECT_MESSAGE,
           medicalVerification: validationResult.verification,
           verificationStatus:
@@ -1592,9 +1702,18 @@ router.post(
           medicalVerificationMethod: medicalVerification.method,
         },
       });
+      logUploadStage("success", req, {
+        targetUserId,
+        documentId: doc._id?.toString(),
+        verificationStatus: medicalVerification.status,
+      });
 
       res.json({
         success: true,
+        message:
+          medicalVerification.status === "verified"
+            ? "Medical document verified and uploaded"
+            : "Document uploaded and accepted for your medical vault",
         msg:
           medicalVerification.status === "verified"
             ? "Medical document verified and uploaded"
@@ -1609,13 +1728,19 @@ router.post(
         document: doc,
       });
     } catch (err) {
-      res.status(500).json({
-        success: false,
-        error: "UPLOAD_FAILED",
-        message: err.message || "Upload failed",
-        msg: err.message || "Upload failed",
-        processingTimeMs: Date.now() - uploadStartedAt,
+      logUploadStage("failed", req, {
+        failureStage: "route_handler",
+        errorCode: "UPLOAD_FAILED",
       });
+      res.status(500).json(
+        uploadErrorPayload({
+          code: "UPLOAD_FAILED",
+          message: "Upload failed, please try again",
+          extra: {
+            processingTimeMs: Date.now() - uploadStartedAt,
+          },
+        }),
+      );
     }
   },
 );
@@ -1653,13 +1778,11 @@ router.get("/user/:userId", auth, checkSession, async (req, res) => {
       documents: docsWithUrl,
     });
   } catch (err) {
-    res
-      .status(500)
-      .json({
-        success: false,
-        msg: "Error fetching files",
-        error: err.message,
-      });
+    res.status(500).json({
+      success: false,
+      msg: "Error fetching files",
+      error: err.message,
+    });
   }
 });
 
@@ -1696,13 +1819,11 @@ router.get("/patient/:patientId", auth, checkSession, async (req, res) => {
       documents: docsWithUrl,
     });
   } catch (err) {
-    res
-      .status(500)
-      .json({
-        success: false,
-        msg: "Error fetching files",
-        error: err.message,
-      });
+    res.status(500).json({
+      success: false,
+      msg: "Error fetching files",
+      error: err.message,
+    });
   }
 });
 
@@ -1762,13 +1883,11 @@ router.get("/user/:userId/grouped", auth, checkSession, async (req, res) => {
       records: groupedWithUrl,
     });
   } catch (err) {
-    res
-      .status(500)
-      .json({
-        success: false,
-        msg: "Error grouping files",
-        error: err.message,
-      });
+    res.status(500).json({
+      success: false,
+      msg: "Error grouping files",
+      error: err.message,
+    });
   }
 });
 
@@ -1836,13 +1955,11 @@ router.get(
         records: groupedWithUrl,
       });
     } catch (err) {
-      res
-        .status(500)
-        .json({
-          success: false,
-          msg: "Error grouping files",
-          error: err.message,
-        });
+      res.status(500).json({
+        success: false,
+        msg: "Error grouping files",
+        error: err.message,
+      });
     }
   },
 );
@@ -1936,13 +2053,11 @@ router.get("/grouped/:email", auth, checkSessionByEmail, async (req, res) => {
     res.json(response);
   } catch (err) {
     console.error("❌ Grouped fetch error:", err);
-    res
-      .status(500)
-      .json({
-        success: false,
-        msg: "Error grouping files",
-        error: err.message,
-      });
+    res.status(500).json({
+      success: false,
+      msg: "Error grouping files",
+      error: err.message,
+    });
   }
 });
 

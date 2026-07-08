@@ -1,8 +1,8 @@
 {
-    "latestVersion":  "1.0.18",
-    "minimumSupportedVersion":  "1.0.17",
-    "apkUrl":  "",
-    "releaseNotes":  "Product page added \nNow user can view nearby ambulances , hospitals , etc \nPerformance Improvements",
-    "sha256":  "7dd8c6260c02cdf115f23f6f2c633272b9809c158eb076110d44995268e1d040",
-    "checksum":  "934d2b368cf9143704ce18b33c01593699fe920c246e2b00fede7b6ff0cef843"
+    "latestVersion": "1.0.20",
+    "minimumSupportedVersion": "1.0.18",
+    "apkUrl": "",
+    "releaseNotes": "Lost and Found improvements.\nNearby Healthcare now opens with Google Maps fallback actions when Places is unavailable.\nDocument upload and update flow reliability improvements.",
+    "sha256": "63d1e664801301e715896d4d99428b0d0a010ed58007abd8de119c6ead90936c",
+    "checksum": "63d1e664801301e715896d4d99428b0d0a010ed58007abd8de119c6ead90936c"
 }
