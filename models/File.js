@@ -5,6 +5,17 @@ const fileSchema = new mongoose.Schema(
   {
     // Linkage
     userId: { type: String, required: true, trim: true },   // ✅ Always use userId
+    patientProfileId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PatientProfile",
+      default: null,
+      index: true,
+    },
+    uploadedByUserId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
     doctorId: { type: mongoose.Schema.Types.ObjectId, ref: "DoctorUser" },
 
     // File info
@@ -59,7 +70,17 @@ const fileSchema = new mongoose.Schema(
       },
       method: {
         type: String,
-        enum: ["keyword", "ai", "metadata", "inconclusive", "security"],
+        enum: [
+          "keyword",
+          "ai",
+          "metadata",
+          "inconclusive",
+          "security",
+          "pdf_text",
+          "ocr",
+          "manual_review_required",
+          "ai_classifier",
+        ],
         default: "inconclusive",
       },
       reason: { type: String, default: "" },
@@ -92,6 +113,8 @@ const fileSchema = new mongoose.Schema(
     toObject: { getters: true },
   }
 );
+
+fileSchema.index({ patientProfileId: 1, uploadedAt: -1 });
 
 // ✅ Store in "files" collection
 export const Document = mongoose.model("Document", fileSchema, "files");

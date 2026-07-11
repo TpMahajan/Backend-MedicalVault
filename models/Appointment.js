@@ -7,6 +7,22 @@ const appointmentSchema = new mongoose.Schema({
     required: [true, "Patient ID is required"],
     ref: "User",
   },
+  patientProfileId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "PatientProfile",
+    default: null,
+    index: true,
+  },
+  createdByUserId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    default: null,
+  },
+  managedByCaregiverUserId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    default: null,
+  },
   patientName: {
     type: String,
     required: [true, "Patient name is required"],
@@ -72,6 +88,8 @@ appointmentSchema.pre("save", function (next) {
   this.updatedAt = new Date();
   next();
 });
+
+appointmentSchema.index({ patientProfileId: 1, appointmentDate: 1 });
 
 // ✅ Named export
 export const Appointment = mongoose.model("Appointment", appointmentSchema, "appointments");

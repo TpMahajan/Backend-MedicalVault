@@ -31,18 +31,20 @@ export const generatePreviewUrl = async (
   s3Key,
   s3Bucket,
   mimeType = null,
-  expiresIn = 300
+  expiresIn = 300,
+  fileName = null,
 ) => {
   try {
     const commandParams = {
       Bucket: s3Bucket,
       Key: s3Key,
-      ResponseContentDisposition: 'inline'
+      ResponseContentDisposition: fileName
+        ? `inline; filename="${String(fileName).replace(/["\\\\\r\n]/g, "_").slice(0, 180)}"`
+        : "inline",
     };
     
-    // Set ResponseContentType for PDFs to ensure proper rendering
-    if (mimeType && mimeType.includes('pdf')) {
-      commandParams.ResponseContentType = 'application/pdf';
+    if (mimeType) {
+      commandParams.ResponseContentType = mimeType;
     }
     
     const command = new GetObjectCommand(commandParams);

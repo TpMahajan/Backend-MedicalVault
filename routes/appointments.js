@@ -74,8 +74,11 @@ router.post("/", auth, requireDoctor, async (req, res) => {
       });
     }
 
+    const { findSelfPatientProfileId } = await import("../services/familyCareProfileService.js");
+    const patientProfileId = await findSelfPatientProfileId(patientId.trim());
     const appointment = new Appointment({
       patientId: patientId.trim(),
+      patientProfileId,
       patientName: patientName.trim(),
       patientEmail: patientEmail?.trim() || "",
       patientPhone: patientPhone?.trim() || "",

@@ -4,6 +4,12 @@ const SOSSchema = new mongoose.Schema(
   {
     patientId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     profileId: { type: String },
+    patientProfileId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PatientProfile",
+      default: null,
+      index: true,
+    },
     name: { type: String },
     age: { type: String },
     mobile: { type: String },
@@ -26,5 +32,4 @@ const SOSSchema = new mongoose.Schema(
 SOSSchema.index({ createdAt: 1 });
 
 export default mongoose.model("SOS", SOSSchema);
-
 

@@ -7,10 +7,21 @@ import { AdminUser } from "../models/AdminUser.js";
 import { Document } from "../models/File.js";
 import { Appointment } from "../models/Appointment.js";
 import { AIChat } from "../models/AIChat.js";
+import { PatientProfile } from "../models/PatientProfile.js";
+import { CareRelationship } from "../models/CareRelationship.js";
 import DocumentReader from "../services/documentReader.js";
 import { ok, fail } from "../utils/apiResponse.js";
 import { canDoctorAccessPatient } from "../services/accessControl.js";
 import { aiLimiter } from "../middleware/rateLimit.js";
+import { writeAuditLog } from "../middleware/auditLogger.js";
+import { ensureSelfPatientProfile } from "../services/familyCareProfileService.js";
+import {
+  activeConversationFilter,
+  isAiChatExpired,
+  markConversationInactive,
+  nextAiChatExpiry,
+  resolveActiveConversation,
+} from "../services/aiConversationService.js";
 import {
   buildAuthorizedScope,
   buildSafetyPayload,
@@ -31,6 +42,232 @@ import { buildLostFoundAiContext } from "../services/lostFoundAiContextService.j
 const router = express.Router();
 router.use(aiLimiter);
 const documentReader = new DocumentReader();
+
+const isObjectId = (value) => /^[a-f\d]{24}$/i.test(String(value || ""));
+
+const asText = (value, max = 240) => String(value ?? "").trim().slice(0, max);
+
+const safeDate = (value) => {
+  const date = value ? new Date(value) : null;
+  return date && !Number.isNaN(date.getTime()) ? date.toISOString() : null;
+};
+
+const processingStatusForPrompt = (prompt, { documentId = null } = {}) => {
+  const text = String(prompt || "").toLowerCase();
+  if (documentId || /\b(analy[sz]e|interpret)\b.*\b(report|document|result|lab)\b/.test(text)) {
+    return { stage: "analyzing_report", label: "Analyzing the selected report…" };
+  }
+  if (/\b(compare|comparison|versus|vs\.)\b/.test(text)) {
+    return { stage: "comparing_reports", label: "Comparing selected reports…" };
+  }
+  if (/\b(medicine|medication|dose|refill|tablet|prescription)\b/.test(text)) {
+    return { stage: "reviewing_medicines", label: "Reviewing medicine records…" };
+  }
+  if (/\b(appointment|consultation|follow[- ]?up|doctor visit)\b/.test(text)) {
+    return { stage: "reviewing_appointments", label: "Reviewing appointment history…" };
+  }
+  if (/\b(find|search|show|list|available|latest)\b.*\b(report|document|record|file)\b/.test(text)) {
+    return { stage: "searching_documents", label: "Searching your health records…" };
+  }
+  if (/\b(summary|summarize|timeline)\b/.test(text)) {
+    return { stage: "preparing_summary", label: "Preparing a health summary…" };
+  }
+  return { stage: "preparing_answer", label: "Preparing your answer…" };
+};
+
+const safeDocumentView = (doc) => ({
+  documentId: String(doc?._id || doc?.id || ""),
+  id: String(doc?._id || doc?.id || ""), // legacy client compatibility
+  displayName: asText(doc?.title || doc?.originalName || "Medical document", 160),
+  name: asText(doc?.title || doc?.originalName || "Medical document", 160),
+  documentType: asText(doc?.type || doc?.category || "Document", 60),
+  type: asText(doc?.type || doc?.category || "Document", 60),
+  fileType: asText(doc?.mimeType || doc?.fileType || "", 100) || null,
+  uploadedAt: safeDate(doc?.uploadedAt),
+  reportDate: safeDate(doc?.date),
+  date: safeDate(doc?.date || doc?.uploadedAt), // legacy client compatibility
+  previewAvailable: Boolean(doc?._id && (doc?.s3Key || doc?.url)),
+});
+
+const safeDocumentMetadata = ({ document, extractionConfidence }) => ({
+  displayName: asText(document?.title || document?.originalName || "Medical document", 160),
+  documentType: asText(document?.type || document?.category || "Document", 60),
+  fileType: asText(document?.mimeType || document?.fileType || "", 100) || null,
+  uploadedAt: safeDate(document?.uploadedAt),
+  reportDate: safeDate(document?.date),
+  extractionConfidence: extractionConfidence
+    ? {
+        level: asText(extractionConfidence.level, 20) || "unknown",
+        uncertain: extractionConfidence.level !== "high",
+      }
+    : null,
+});
+
+const responseBlocksFromSections = ({ sections, documents, safety }) => {
+  const blocks = (Array.isArray(sections) ? sections : []).map((section) => {
+    const type = asText(section?.type || "", 40).toLowerCase();
+    if (type === "table") {
+      return {
+        type: "table",
+        title: asText(section?.title, 120),
+        data: section?.data || { columns: [], rows: [] },
+      };
+    }
+    if (type === "bullets") {
+      return {
+        type: "insightList",
+        title: asText(section?.title, 120),
+        items: Array.isArray(section?.items)
+          ? section.items.slice(0, 30).map((item) => ({ description: asText(item, 900) }))
+          : [],
+      };
+    }
+    if (type === "list") {
+      const items = Array.isArray(section?.data?.items) ? section.data.items : [];
+      return {
+        type: "insightList",
+        title: asText(section?.title || section?.data?.title, 120),
+        items: items.slice(0, 30).map((item) => ({
+          description: item && typeof item === "object"
+            ? Object.entries(item)
+                .filter(([, value]) => value !== null && value !== undefined && String(value).trim())
+                .map(([key, value]) => `${key.replace(/([A-Z])/g, " $1")}: ${asText(value, 180)}`)
+                .join(" · ")
+            : asText(item, 900),
+        })),
+      };
+    }
+    return {
+      type: "markdown",
+      title: asText(section?.title, 120),
+      markdown: asText(section?.content, 12000),
+    };
+  }).filter((block) => block.markdown || block.data || block.items?.length);
+
+  if (Array.isArray(documents) && documents.length > 0) {
+    blocks.push({ type: "documentSources", documents });
+  }
+  if (Array.isArray(safety?.warnings) && safety.warnings.length > 0) {
+    blocks.push({
+      type: "disclaimer",
+      text: safety.warnings.map((warning) => asText(warning, 700)).join("\n"),
+    });
+  }
+  return blocks;
+};
+
+const resolvePatientProfileScope = async ({ currentUser, requesterId, patientProfileId }) => {
+  let profile;
+  if (patientProfileId) {
+    if (!isObjectId(patientProfileId)) {
+      const error = new Error("Invalid patient profile");
+      error.statusCode = 400;
+      error.code = "INVALID_PROFILE_ID";
+      throw error;
+    }
+    profile = await PatientProfile.findOne({ _id: patientProfileId, status: "active" });
+  } else {
+    profile = await ensureSelfPatientProfile(currentUser);
+  }
+
+  if (!profile) {
+    const error = new Error("The selected health profile is unavailable");
+    error.statusCode = 404;
+    error.code = "PROFILE_NOT_FOUND";
+    throw error;
+  }
+
+  const relationship = await CareRelationship.findOne({
+    patientProfileId: profile._id,
+    caregiverUserId: requesterId,
+    status: "active",
+    $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }],
+  });
+  if (!relationship || !relationship.permissions?.documentsView) {
+    const error = new Error("You no longer have access to this family member’s records.");
+    error.statusCode = 403;
+    error.code = "PROFILE_ACCESS_DENIED";
+    throw error;
+  }
+
+  return {
+    profile,
+    relationship,
+    profileId: profile._id,
+    profileDisplayName: asText(profile.displayName, 120) || "Health profile",
+    patientUserId: profile.identityUserId ? String(profile.identityUserId) : null,
+    isSelf: profile.profileType === "self" && String(profile.identityUserId || "") === String(requesterId),
+  };
+};
+
+const resolveAuthenticatedPatientProfileScope = async (req, patientProfileId) => {
+  if (normalizeRole(req.auth?.role) !== "patient") {
+    const error = new Error("Patient access is required for this conversation.");
+    error.statusCode = 403;
+    error.code = "PATIENT_ACCESS_REQUIRED";
+    throw error;
+  }
+  const currentUser = await User.findById(req.auth?.id).select("-password");
+  if (!currentUser) {
+    const error = new Error("User not found");
+    error.statusCode = 404;
+    error.code = "USER_NOT_FOUND";
+    throw error;
+  }
+  return resolvePatientProfileScope({
+    currentUser,
+    requesterId: String(req.auth?.id || ""),
+    patientProfileId,
+  });
+};
+
+const stripInternalMetadataText = (value) => String(value || "")
+  .split(/\r?\n/)
+  .filter((line) => !/\b(s3key|s3bucket|s3region|ocrengine|reusedworker|extractedat|storage path|internal storage|bucket name)\b/i.test(line))
+  .join("\n")
+  .trim();
+
+const safeStoredSections = (sections) => (Array.isArray(sections) ? sections : [])
+  .map((section) => {
+    const key = asText(section?.key, 80).toLowerCase();
+    if (key === "document_details") return null;
+    return {
+      ...section,
+      ...(section?.content ? { content: stripInternalMetadataText(section.content) } : {}),
+    };
+  })
+  .filter(Boolean);
+
+const safeStoredBlocks = (blocks) => (Array.isArray(blocks) ? blocks : [])
+  .map((block) => {
+    const type = asText(block?.type, 40);
+    if (type === "documentSources") {
+      return { type, documents: (Array.isArray(block.documents) ? block.documents : []).map(safeDocumentView) };
+    }
+    if (type === "markdown") {
+      return { ...block, markdown: stripInternalMetadataText(block.markdown) };
+    }
+    return block;
+  })
+  .filter(Boolean);
+
+const safeStoredMessage = (message) => {
+  const metadata = message?.metadata && typeof message.metadata === "object" ? message.metadata : {};
+  return {
+    role: asText(message?.role, 20),
+    content: stripInternalMetadataText(message?.content),
+    timestamp: safeDate(message?.timestamp) || new Date().toISOString(),
+    metadata: {
+      language: asText(metadata.language, 30) || null,
+      responseType: asText(metadata.responseType, 40) || null,
+      structuredData: metadata.structuredData || null,
+      sections: safeStoredSections(metadata.sections),
+      blocks: safeStoredBlocks(metadata.blocks),
+      safety: metadata.safety || null,
+      data: Array.isArray(metadata.data) ? metadata.data.map(safeDocumentView) : null,
+    },
+  };
+};
 
 // Helper function to detect document-related queries
 const isDocumentQuery = (prompt) => {
@@ -101,26 +338,8 @@ const getCurrentMonthRange = () => {
 };
 
 // Helper function to format document data for AI context
-const formatDocumentsForAI = (documents, category) => {
-  return documents.map(doc => ({
-    name: doc.title || doc.originalName,
-    date: doc.date || doc.uploadedAt,
-    type: doc.type || doc.category,
-    description: doc.description,
-    size: doc.size || doc.fileSize,
-    status: doc.status,
-    id: doc._id,
-    s3Key: doc.s3Key
-  }));
-};
-
-// Helper function to generate preview URLs
-const generatePreviewUrls = (documents) => {
-  return documents.map(doc => ({
-    ...doc,
-    previewUrl: `${process.env.BASE_URL || 'http://localhost:5001'}/api/files/${doc.id}/preview`
-  }));
-};
+const formatDocumentsForAI = (documents) =>
+  (Array.isArray(documents) ? documents : []).map(safeDocumentView);
 
 // Helper: parse natural-language date ranges like "past week", "last 7 days", "yesterday", or explicit ranges
 const parseDateRangeFromPrompt = (prompt) => {
@@ -239,6 +458,11 @@ const isScheduleQuery = (prompt) => {
   const lower = (prompt || '').toLowerCase();
   return keywords.some(k => lower.includes(k));
 };
+
+const isMedicationQuery = (prompt) =>
+  /\b(medicine|medication|dose|refill|tablet|prescription)\b/i.test(
+    String(prompt || ""),
+  );
 
 // Helper: extract a documentId mentioned in the prompt like "document <id>"
 const extractDocumentIdFromPrompt = (prompt) => {
@@ -543,13 +767,8 @@ const buildResponseSections = ({
     }
   }
 
-  if (documentMetadata) {
-    sections.push({
-      key: "document_details",
-      title: "Document Details",
-      data: documentMetadata,
-    });
-  }
+  // Document information is rendered as a dedicated source card, not a raw
+  // metadata table inside a medical explanation.
 
   if (safety?.warnings?.length) {
     const hasSafetySection = sections.some(
@@ -1109,7 +1328,7 @@ Always prioritize accuracy, safety, and appropriate medical boundaries.`;
 // POST /api/ai/ask - Main AI Assistant endpoint
 router.post("/ask", auth, async (req, res) => {
   try {
-    const { prompt, documentId, patientId, conversationContext, conversationId } =
+    const { prompt, documentId, patientId, patientProfileId, conversationContext, conversationId } =
       req.body || {};
     const requestContext =
       req.body && typeof req.body.context === "object" && req.body.context
@@ -1185,6 +1404,7 @@ router.post("/ask", auth, async (req, res) => {
     const isDocumentRequest = isDocumentQuery(prompt);
     const wantsDocumentAnalytics = isDocumentAnalyticsQuery(prompt);
     const isScheduleRequest = isScheduleQuery(prompt);
+    const isMedicationRequest = isMedicationQuery(prompt);
     const isUrgent = isUrgentQuery(prompt);
     const isPatientsList = isPatientsQuery(prompt);
 
@@ -1221,20 +1441,52 @@ router.post("/ask", auth, async (req, res) => {
       });
     }
 
-    const selectedPatientProfile = String(
-      requestContext.selectedPatientProfile || patientId || ""
+    const requestedPatientProfileId = String(
+      requestContext.patientProfileId ||
+      requestContext.selectedPatientProfile ||
+      patientProfileId ||
+      "",
     ).trim();
+    // `patientId` is retained only for legacy doctor/admin callers. A patient
+    // client must use an authorized PatientProfile, never a user ID supplied
+    // by the request body.
+    const selectedPatientProfile = requestedPatientProfileId;
     const activeProfile = String(requestContext.activeProfile || "").trim();
 
     let targetPatientId = null;
+    let patientProfileScope = null;
     if (role === "patient") {
-      targetPatientId = String(currentUser?._id || req.auth?.id || "");
+      if (requestedPatientProfileId) {
+        try {
+          patientProfileScope = await resolvePatientProfileScope({
+            currentUser,
+            requesterId,
+            patientProfileId: requestedPatientProfileId,
+          });
+        } catch (profileError) {
+          await writeAuditLog({
+            req,
+            action: "ai_access_denied",
+            resourceType: "AI_CONVERSATION",
+            patientProfileId: requestedPatientProfileId,
+            statusCode: profileError.statusCode || 403,
+            metadata: { code: profileError.code || "PROFILE_ACCESS_DENIED" },
+          });
+          return res.status(profileError.statusCode || 403).json({
+            success: false,
+            code: profileError.code || "PROFILE_ACCESS_DENIED",
+            message: profileError.message || "You do not have access to this health profile.",
+          });
+        }
+      }
+      targetPatientId = patientProfileScope?.patientUserId || String(currentUser?._id || req.auth?.id || "");
     } else if (["doctor", "admin", "superadmin"].includes(role)) {
-      targetPatientId = selectedPatientProfile || null;
+      targetPatientId = String(patientId || requestContext.selectedPatientProfile || "").trim() || null;
     }
 
-    const targetUserId =
-      role === "patient" ? String(currentUser?._id || "") : targetPatientId;
+    const targetUserId = role === "patient"
+      ? (patientProfileScope?.patientUserId || String(currentUser?._id || ""))
+      : targetPatientId;
 
     // Try to infer document by explicit id or fuzzy title
     let requestedDocumentId = documentId || extractDocumentIdFromPrompt(prompt);
@@ -1329,7 +1581,10 @@ router.post("/ask", auth, async (req, res) => {
         const selfUserId = String(currentUser?._id || "");
         let hasDocumentAccess = false;
         if (role === "patient") {
-          hasDocumentAccess = documentOwnerId === selfUserId;
+          hasDocumentAccess = patientProfileScope
+            ? String(document.patientProfileId || "") === String(patientProfileScope.profileId) ||
+                (patientProfileScope.isSelf && documentOwnerId === selfUserId)
+            : documentOwnerId === selfUserId;
         } else if (role === "doctor") {
           hasDocumentAccess = !!targetPatientId && documentOwnerId === String(targetPatientId);
         } else if (role === "admin" || role === "superadmin") {
@@ -1339,17 +1594,9 @@ router.post("/ask", auth, async (req, res) => {
           return res.status(403).json({ success: false, message: "Access denied to this document" });
         }
 
-        console.log(`📋 Document details:`, {
-          id: document._id,
-          title: document.title,
-          type: document.type,
-          s3Key: document.s3Key,
-          s3Bucket: document.s3Bucket
-        });
-
         // Check if document has S3 information
         if (!document.s3Key) {
-          console.log(`❌ Document missing S3 key: ${documentId}`);
+          console.log(`❌ Document unavailable for analysis: ${documentId}`);
           return res.status(400).json({
             success: false,
             message: "Document file not found in storage"
@@ -1357,10 +1604,9 @@ router.post("/ask", auth, async (req, res) => {
         }
 
         const bucketName = document.s3Bucket || process.env.AWS_S3_BUCKET_NAME;
-        console.log(`🪣 Using bucket: ${bucketName}`);
 
         // Extract text from the document
-        console.log(`🔍 Starting text extraction for: ${document.s3Key}`);
+        console.log(`🔍 Starting text extraction for document ${document._id}`);
         let extractionResult;
         try {
           extractionResult = await documentReader.extractTextFromS3(
@@ -1389,17 +1635,14 @@ router.post("/ask", auth, async (req, res) => {
             metadata: extractionResult.metadata,
             text: extractionResult.text,
           });
-          documentMetadata = {
-            ...extractionResult.metadata,
-            fileName: document.title || document.originalName,
-            documentType: document.type,
-            uploadedAt: document.uploadedAt,
+          documentMetadata = safeDocumentMetadata({
+            document,
             extractionConfidence,
-          };
+          });
           
           // Add to documents array for context
           documents = [document];
-          documentData = generatePreviewUrls(formatDocumentsForAI([document], document.type));
+          documentData = formatDocumentsForAI([document]);
           if (extractionConfidence.level !== "high") {
             missingDataWarnings.push(...extractionConfidence.reasons);
           }
@@ -1411,8 +1654,7 @@ router.post("/ask", auth, async (req, res) => {
           });
         }
       } catch (error) {
-        console.error("❌ Document analysis error:", error);
-        console.error("Error stack:", error.stack);
+        console.error("Document analysis failed:", error?.name || "unknown_error");
         return res.status(500).json({
           success: false,
           message: `Failed to analyze document: ${error.message}`
@@ -1421,13 +1663,23 @@ router.post("/ask", auth, async (req, res) => {
     } else if (requestedTitle) {
       // Fuzzy title match within patient's docs
       const targetUserIdForTitle = targetUserId;
-      if (!targetUserIdForTitle) {
+      if (!targetUserIdForTitle && !patientProfileScope) {
         return res.status(400).json({
           success: false,
           message: "Patient context is required for title-based document analysis",
         });
       } else {
-        const candidates = await Document.find({ userId: targetUserIdForTitle }).sort({ uploadedAt: -1 }).limit(50);
+        const candidateFilter = patientProfileScope
+          ? (patientProfileScope.isSelf
+              ? {
+                  $or: [
+                    { patientProfileId: patientProfileScope.profileId },
+                    { userId: targetUserIdForTitle },
+                  ],
+                }
+              : { patientProfileId: patientProfileScope.profileId })
+          : { userId: targetUserIdForTitle };
+        const candidates = await Document.find(candidateFilter).sort({ uploadedAt: -1 }).limit(50);
         const target = normalizeTitle(requestedTitle);
         let best = null;
         let bestScore = Number.MAX_SAFE_INTEGER;
@@ -1451,15 +1703,12 @@ router.post("/ask", auth, async (req, res) => {
                 metadata: extractionResult.metadata,
                 text: extractionResult.text,
               });
-              documentMetadata = {
-                ...extractionResult.metadata,
-                fileName: doc.title || doc.originalName,
-                documentType: doc.type,
-                uploadedAt: doc.uploadedAt,
+              documentMetadata = safeDocumentMetadata({
+                document: doc,
                 extractionConfidence,
-              };
+              });
               documents = [doc];
-              documentData = generatePreviewUrls(formatDocumentsForAI([doc], doc.type));
+              documentData = formatDocumentsForAI([doc]);
               if (extractionConfidence.level !== "high") {
                 missingDataWarnings.push(...extractionConfidence.reasons);
               }
@@ -1479,7 +1728,7 @@ router.post("/ask", auth, async (req, res) => {
       const lowerPrompt = prompt.toLowerCase();
       const dateRange = parseDateRangeFromPrompt(lowerPrompt);
       // If doctor without patient context, skip fetching documents (no target)
-      if (!targetUserId) {
+      if (!targetUserId && !patientProfileScope) {
         return res.status(400).json({
           success: false,
           code: "PATIENT_CONTEXT_REQUIRED",
@@ -1487,7 +1736,16 @@ router.post("/ask", auth, async (req, res) => {
         });
       } else {
       
-      const baseFilter = { userId: targetUserId };
+      const baseFilter = patientProfileScope
+        ? (patientProfileScope.isSelf
+            ? {
+                $or: [
+                  { patientProfileId: patientProfileScope.profileId },
+                  { userId: targetUserId },
+                ],
+              }
+            : { patientProfileId: patientProfileScope.profileId })
+        : { userId: targetUserId };
       if (dateRange) {
         baseFilter.uploadedAt = { $gte: dateRange.start, $lte: dateRange.end };
       }
@@ -1514,7 +1772,7 @@ router.post("/ask", auth, async (req, res) => {
       }
       }
       // Format documents for response with preview URLs
-      documentData = generatePreviewUrls(formatDocumentsForAI(documents, "general"));
+      documentData = formatDocumentsForAI(documents);
       if (!documents || documents.length === 0) {
         missingDataWarnings.push("No matching documents were found in the current authorized scope.");
       }
@@ -1540,6 +1798,39 @@ router.post("/ask", auth, async (req, res) => {
         formatted = formatted.filter(a => (a.type === 'emergency') || /urgent|critical|emergency/i.test(a.reason || ''));
       }
       appointmentData = formatted;
+    }
+
+    // Patient-side actions only use records already in the authorized profile
+    // scope. Managed profiles without a medication source intentionally return
+    // an empty list instead of falling back to the caregiver's medicines.
+    let medicationData = [];
+    if (role === "patient" && isMedicationRequest && patientProfileScope?.isSelf) {
+      medicationData = Array.isArray(currentUser.medications)
+        ? currentUser.medications.slice(0, 30).map((medicine) => ({
+            name: asText(medicine?.name, 120),
+            dosage: asText(medicine?.dosage, 120),
+            frequency: asText(medicine?.frequency, 120),
+          })).filter((medicine) => medicine.name)
+        : [];
+    }
+
+    let patientAppointmentData = [];
+    if (role === "patient" && isScheduleRequest) {
+      const appointmentFilter = patientProfileScope
+        ? { patientProfileId: patientProfileScope.profileId }
+        : { patientId: String(currentUser?._id || "") };
+      const upcoming = await Appointment.find({
+        ...appointmentFilter,
+        appointmentDate: { $gte: new Date() },
+        status: { $in: ["scheduled", "confirmed", "rescheduled"] },
+      }).sort({ appointmentDate: 1, appointmentTime: 1 }).limit(10);
+      patientAppointmentData = upcoming.map((appointment) => ({
+        doctorName: asText(appointment.doctorName, 120) || "Doctor",
+        date: safeDate(appointment.appointmentDate),
+        time: asText(appointment.appointmentTime, 20),
+        type: asText(appointment.appointmentType, 40),
+        status: asText(appointment.status, 40),
+      }));
     }
 
     // Optionally fetch recent patients list for doctor
@@ -1573,6 +1864,19 @@ router.post("/ask", auth, async (req, res) => {
       ? `\n\nActive Patients (last 30 days):\n` + patientsData.map((p, i) => `${i + 1}. ${p.name} - Last appointment: ${new Date(p.lastAppointmentDate).toLocaleDateString()}`).join('\n')
       : '';
 
+    const medicationContext = isMedicationRequest && role === "patient"
+      ? `\n\nCurrent medicines (${medicationData.length}):\n` +
+        (medicationData.length > 0
+          ? medicationData.map((medicine, index) => `${index + 1}. ${medicine.name}${medicine.dosage ? ` — ${medicine.dosage}` : ""}${medicine.frequency ? ` (${medicine.frequency})` : ""}`).join("\n")
+          : "No current medicine entries are available for this profile.")
+      : "";
+    const patientAppointmentContext = isScheduleRequest && role === "patient"
+      ? `\n\nUpcoming appointments (${patientAppointmentData.length}):\n` +
+        (patientAppointmentData.length > 0
+          ? patientAppointmentData.map((appointment, index) => `${index + 1}. ${appointment.date || "Date unavailable"} ${appointment.time || ""} — ${appointment.doctorName} (${appointment.type || "appointment"})`).join("\n")
+          : "No upcoming appointment entries are available for this profile.")
+      : "";
+
     let limitedDocumentContent = documentContent;
     if (limitedDocumentContent) {
       limitedDocumentContent = String(limitedDocumentContent).slice(
@@ -1591,7 +1895,7 @@ router.post("/ask", auth, async (req, res) => {
       persona,
       targetPatientId,
       conversationContext
-    ) + appointmentContext + patientsContext;
+    ) + appointmentContext + patientsContext + medicationContext + patientAppointmentContext;
 
     let effectiveSystemPrompt = systemPrompt;
     if (role === "admin" || role === "superadmin") {
@@ -1731,7 +2035,13 @@ router.post("/ask", auth, async (req, res) => {
     }
 
     // Provide structured lists for schedule/patients when available
-    if (!structuredData && isScheduleRequest && appointmentData.length > 0) {
+    if (!structuredData && isMedicationRequest && medicationData.length > 0) {
+      responseType = "list";
+      structuredData = { title: "Current medicines", items: medicationData };
+    } else if (!structuredData && isScheduleRequest && role === "patient" && patientAppointmentData.length > 0) {
+      responseType = "list";
+      structuredData = { title: "Upcoming appointments", items: patientAppointmentData };
+    } else if (!structuredData && isScheduleRequest && appointmentData.length > 0) {
       responseType = 'list';
       structuredData = {
         title: isUrgent ? "Today's Urgent Cases" : "Today's Appointments",
@@ -1770,17 +2080,50 @@ router.post("/ask", auth, async (req, res) => {
       documentMetadata,
       safety,
     });
+    const blocks = responseBlocksFromSections({
+      sections,
+      documents: documentData,
+      safety,
+    });
+    const processingStatus = processingStatusForPrompt(prompt, { documentId: requestedDocumentId });
+    const suggestedActions = [
+      ...(documentData.length > 0
+        ? documentData.slice(0, 3).flatMap((document) => [
+            {
+              id: "preview_document",
+              label: "Preview report",
+              documentId: document.documentId,
+            },
+            {
+              id: "analyze_document",
+              label: "Analyze report",
+              documentId: document.documentId,
+            },
+          ])
+        : []),
+      ...(isDocumentRequest && documentData.length > 1
+        ? [{ id: "compare_reports", label: "Compare reports" }]
+        : []),
+    ];
 
-    // Persist chat history until user clears manually.
+    // Persist only after both user and assistant content exist. Opening the
+    // screen never reaches this path, so it cannot create a conversation.
     let savedConversationId = incomingConversationId;
     try {
+      const now = new Date();
       const chatFilter = {
         userId: String(req.auth?.id || currentUser?._id || ""),
         userRole: persona,
         assistantScope: "medical",
-        ...(targetPatientId ? { patientId: String(targetPatientId) } : { patientId: null })
+        assistantType: "medical",
+        status: "active",
+        expiresAt: { $gt: now },
+        ...(patientProfileScope
+          ? { patientProfileId: patientProfileScope.profileId }
+          : (targetPatientId ? { patientId: String(targetPatientId) } : { patientId: null })),
       };
       let chatDoc = null;
+      let createdConversation = false;
       if (incomingConversationId) {
         const candidate = await AIChat.findById(incomingConversationId);
         if (
@@ -1788,7 +2131,12 @@ router.post("/ask", auth, async (req, res) => {
           candidate.userId === chatFilter.userId &&
           candidate.userRole === chatFilter.userRole &&
           (candidate.assistantScope || "medical") === "medical" &&
-          String(candidate.patientId || "") === String(chatFilter.patientId || "")
+          (candidate.assistantType || "medical") === "medical" &&
+          (candidate.status || "active") === "active" &&
+          !isAiChatExpired(candidate, now) &&
+          (patientProfileScope
+            ? String(candidate.patientProfileId || "") === String(patientProfileScope.profileId)
+            : String(candidate.patientId || "") === String(chatFilter.patientId || ""))
         ) {
           chatDoc = candidate;
         }
@@ -1796,16 +2144,25 @@ router.post("/ask", auth, async (req, res) => {
       if (!chatDoc) {
         chatDoc = await AIChat.findOne(chatFilter).sort({ updatedAt: -1 });
       }
-      if (!chatDoc) {
+      if (!chatDoc && !patientProfileScope) {
         const legacyFilter = { ...chatFilter };
         delete legacyFilter.assistantScope;
+        delete legacyFilter.assistantType;
+        delete legacyFilter.status;
+        delete legacyFilter.expiresAt;
         chatDoc = await AIChat.findOne({
           ...legacyFilter,
           assistantScope: { $exists: false },
         }).sort({ updatedAt: -1 });
       }
       if (!chatDoc) {
-        chatDoc = new AIChat({ ...chatFilter, messages: [] });
+        createdConversation = true;
+        chatDoc = new AIChat({
+          ...chatFilter,
+          expiresAt: nextAiChatExpiry(now),
+          startedAt: now,
+          messages: [],
+        });
       }
       chatDoc.messages.push(
         { role: 'user', content: prompt, timestamp: new Date() },
@@ -1818,18 +2175,27 @@ router.post("/ask", auth, async (req, res) => {
             responseType,
             structuredData,
             sections,
+            blocks,
             safety,
             documentMetadata,
             data: documentData.length > 0
               ? documentData
-              : (appointmentData.length > 0
-                  ? appointmentData
-                  : (patientsData.length > 0 ? patientsData : null)),
+              : (medicationData.length > 0
+                  ? medicationData
+                  : (patientAppointmentData.length > 0
+                      ? patientAppointmentData
+                      : (appointmentData.length > 0
+                          ? appointmentData
+                          : (patientsData.length > 0 ? patientsData : null)))),
           },
         }
       );
       chatDoc.assistantScope = "medical";
-      chatDoc.lastActivityAt = new Date();
+      chatDoc.assistantType = "medical";
+      chatDoc.status = "active";
+      chatDoc.patientProfileId = patientProfileScope?.profileId || chatDoc.patientProfileId || null;
+      chatDoc.lastActivityAt = now;
+      chatDoc.title = chatDoc.title || asText(prompt, 120);
       chatDoc.context = {
         assistantScope: "medical",
         resolvedPersona: persona,
@@ -1841,11 +2207,49 @@ router.post("/ask", auth, async (req, res) => {
         voiceMode: asBoolean(requestContext.voiceMode, false),
         activeProfile: activeProfile || null,
         selectedPatientProfile: selectedPatientProfile || null,
+        patientProfileId: patientProfileScope?.profileId?.toString() || null,
+        profileDisplayName: patientProfileScope?.profileDisplayName || null,
       };
+      chatDoc.expiresAt = nextAiChatExpiry(now);
       await chatDoc.save();
-      // Remove legacy TTL field if present on older chat documents.
-      await AIChat.updateOne({ _id: chatDoc._id }, { $unset: { expiresAt: 1 } });
       savedConversationId = chatDoc._id.toString();
+      await writeAuditLog({
+        req,
+        action: "ai_message_sent",
+        resourceType: "AI_CONVERSATION",
+        resourceId: savedConversationId,
+        patientId: targetPatientId || "",
+        patientProfileId: patientProfileScope?.profileId?.toString() || "",
+        metadata: { intent: processingStatus.stage },
+      });
+      if (createdConversation) {
+        await writeAuditLog({
+          req,
+          action: "ai_conversation_created",
+          resourceType: "AI_CONVERSATION",
+          resourceId: savedConversationId,
+          patientId: targetPatientId || "",
+          patientProfileId: patientProfileScope?.profileId?.toString() || "",
+        });
+      }
+      if (documentData.isNotEmpty) {
+        await writeAuditLog({
+          req,
+          action: "ai_document_context_used",
+          resourceType: "AI_CONVERSATION",
+          resourceId: savedConversationId,
+          patientProfileId: patientProfileScope?.profileId?.toString() || "",
+          metadata: { documentCount: documentData.length },
+        });
+      }
+      await writeAuditLog({
+        req,
+        action: "ai_response_generated",
+        resourceType: "AI_CONVERSATION",
+        resourceId: savedConversationId,
+        patientProfileId: patientProfileScope?.profileId?.toString() || "",
+        metadata: { intent: processingStatus.stage },
+      });
     } catch (persistErr) {
       console.warn('⚠️ Failed to persist AI chat:', persistErr.message);
     }
@@ -1856,21 +2260,41 @@ router.post("/ask", auth, async (req, res) => {
       user: currentUser.name || "User",
       assistant: "AI Ally Assistant",
       reply: aiReply,
+      message: aiReply,
       language,
+      intent: processingStatus.stage,
+      status: "completed",
+      summary: asText(aiReply.split(/\n+/).find(Boolean), 600),
       responseType,
       structuredData,
       sections,
+      blocks,
+      suggestedActions,
       safety,
       documentMetadata,
-      data: documentData.length > 0 ? documentData : (appointmentData.length > 0 ? appointmentData : (patientsData.length > 0 ? patientsData : null)),
+      data: documentData.length > 0
+        ? documentData
+        : (medicationData.length > 0
+            ? medicationData
+            : (patientAppointmentData.length > 0
+                ? patientAppointmentData
+                : (appointmentData.length > 0
+                    ? appointmentData
+                    : (patientsData.length > 0 ? patientsData : null)))),
       model: (openaiResponse?.data?.model || 'gpt-4o-mini'),
       context: {
         userRole: persona, // backward-compat field name
         resolvedPersona: persona,
         resolvedLanguage: language,
-        authorizedScope,
-        patientId: targetPatientId,
-        sessionId: Date.now(),
+        authorizedScope: role === "patient"
+          ? {
+              mode: patientProfileScope?.isSelf === false ? "family_profile" : "self",
+              profileDisplayName: patientProfileScope?.profileDisplayName || null,
+            }
+          : authorizedScope,
+        ...(role === "patient" ? {} : { patientId: targetPatientId }),
+        patientProfileId: patientProfileScope?.profileId?.toString() || null,
+        profileDisplayName: patientProfileScope?.profileDisplayName || null,
         timestamp: new Date().toISOString(),
         conversationId: savedConversationId,
         voiceMode: asBoolean(requestContext.voiceMode, false),
@@ -1879,7 +2303,8 @@ router.post("/ask", auth, async (req, res) => {
       }
     };
 
-    // If it's a document query, add structured response with preview URLs
+    // Document cards deliberately contain identifiers and display metadata
+    // only. Flutter obtains a signed S3 URL at tap time from /preview-url.
     if (isDocumentRequest && documentData.length > 0) {
       const category = documents[0]?.type || "documents";
       response.type = category.toLowerCase();
@@ -1889,8 +2314,7 @@ router.post("/ask", auth, async (req, res) => {
         name: doc.name,
         date: doc.date,
         type: doc.type,
-        previewUrl: doc.previewUrl,
-        description: doc.description
+        previewAvailable: doc.previewAvailable,
       }));
     }
 
@@ -1970,7 +2394,7 @@ router.get("/documents", auth, async (req, res) => {
     }).sort({ uploadedAt: -1 }).limit(50); // Limit to recent 50 documents
 
     // Format documents with preview URLs
-    const documentData = generatePreviewUrls(formatDocumentsForAI(documents, "all"));
+    const documentData = formatDocumentsForAI(documents);
 
     res.json({
       success: true,
@@ -2000,8 +2424,6 @@ router.get("/test-document/:documentId", auth, async (req, res) => {
       });
     }
 
-    console.log(`🧪 Testing document processing for ID: ${documentId}`);
-    
     const document = await Document.findById(documentId);
     if (!document) {
       return res.status(404).json({
@@ -2017,15 +2439,8 @@ router.get("/test-document/:documentId", auth, async (req, res) => {
       });
     }
 
-    console.log(`📋 Document details:`, {
-      id: document._id,
-      title: document.title,
-      type: document.type,
-      s3Key: document.s3Key,
-      s3Bucket: document.s3Bucket
-    });
-
-    // Test document extraction
+    // This legacy diagnostics route is intentionally patient-safe: no S3,
+    // OCR-engine, worker, stack-trace, or storage metadata is serialized.
     const extractionResult = await documentReader.extractTextFromS3(
       document.s3Key, 
       document.s3Bucket || process.env.AWS_S3_BUCKET_NAME
@@ -2033,22 +2448,20 @@ router.get("/test-document/:documentId", auth, async (req, res) => {
 
     res.json({
       success: true,
-      document: {
-        id: document._id,
-        title: document.title,
-        type: document.type,
-        s3Key: document.s3Key,
-        s3Bucket: document.s3Bucket
+      document: safeDocumentView(document),
+      extraction: {
+        available: extractionResult.success === true,
+        textPreview: extractionResult.success
+          ? String(extractionResult.text || "").slice(0, 800)
+          : "",
       },
-      extraction: extractionResult
     });
 
   } catch (error) {
     console.error("❌ Test document error:", error);
     res.status(500).json({
       success: false,
-      message: `Test failed: ${error.message}`,
-      error: error.stack
+      message: "Document processing is temporarily unavailable.",
     });
   }
 });
@@ -2068,6 +2481,173 @@ router.get("/status", auth, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "AI Assistant status check failed"
+    });
+  }
+});
+
+// Resolve, but never create, the latest active conversation for the selected
+// health profile. MongoDB TTL cleanup is asynchronous, therefore expiry is
+// checked in the query as well as by the database index.
+router.get("/conversations/active", auth, async (req, res) => {
+  const requestedProfileId = asText(req.query.patientProfileId, 64);
+  try {
+    const profileScope = await resolveAuthenticatedPatientProfileScope(
+      req,
+      requestedProfileId || null,
+    );
+    const scope = {
+      userId: req.auth.id,
+      userRole: "patient",
+      patientProfileId: profileScope.profileId,
+      assistantType: "medical",
+    };
+    const now = new Date();
+    await AIChat.updateMany(
+      {
+        userId: String(req.auth.id),
+        userRole: "patient",
+        patientProfileId: profileScope.profileId,
+        assistantType: "medical",
+        status: "active",
+        expiresAt: { $lte: now },
+      },
+      { $set: { status: "expired" } },
+    );
+    const conversation = await resolveActiveConversation(scope);
+    if (!conversation) {
+      return res.json({
+        success: true,
+        conversation: null,
+        conversationId: null,
+        messages: [],
+        patientProfile: {
+          id: profileScope.profileId.toString(),
+          displayName: profileScope.profileDisplayName,
+          timezone: profileScope.profile.timezone || null,
+        },
+      });
+    }
+
+    await writeAuditLog({
+      req,
+      action: "ai_conversation_restored",
+      resourceType: "AI_CONVERSATION",
+      resourceId: conversation._id.toString(),
+      patientProfileId: profileScope.profileId.toString(),
+      metadata: { assistantType: "medical" },
+    });
+    return res.json({
+      success: true,
+      conversation: {
+        id: conversation._id.toString(),
+        status: conversation.status,
+        title: conversation.title || "",
+        startedAt: safeDate(conversation.startedAt),
+        lastActivityAt: safeDate(conversation.lastActivityAt),
+        expiresAt: safeDate(conversation.expiresAt),
+      },
+      conversationId: conversation._id.toString(),
+      messages: (conversation.messages || []).map(safeStoredMessage),
+      patientProfile: {
+        id: profileScope.profileId.toString(),
+        displayName: profileScope.profileDisplayName,
+        timezone: profileScope.profile.timezone || null,
+      },
+    });
+  } catch (error) {
+    await writeAuditLog({
+      req,
+      action: "ai_access_denied",
+      resourceType: "AI_CONVERSATION",
+      patientProfileId: requestedProfileId,
+      statusCode: error.statusCode || 500,
+      metadata: { code: error.code || "AI_CONVERSATION_RESTORE_FAILED" },
+    });
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      code: error.code || "AI_CONVERSATION_RESTORE_FAILED",
+      message: error.statusCode === 403
+        ? "You no longer have access to this family member’s records."
+        : "I could not restore your conversation. Please try again.",
+    });
+  }
+});
+
+// Archive an active chat. A new conversation is deliberately not created
+// until the user sends the first message.
+router.post("/conversations/:conversationId/new", auth, async (req, res) => {
+  const patientProfileId = asText(req.body?.patientProfileId, 64);
+  try {
+    if (!isObjectId(req.params.conversationId)) {
+      return res.status(400).json({ success: false, code: "INVALID_CONVERSATION_ID", message: "Invalid conversation" });
+    }
+    const profileScope = await resolveAuthenticatedPatientProfileScope(req, patientProfileId || null);
+    const conversation = await markConversationInactive({
+      conversationId: req.params.conversationId,
+      scope: {
+        userId: req.auth.id,
+        userRole: "patient",
+        patientProfileId: profileScope.profileId,
+        assistantType: "medical",
+      },
+      status: "archived",
+    });
+    if (!conversation) {
+      return res.status(404).json({ success: false, code: "CONVERSATION_NOT_FOUND", message: "Conversation is no longer active." });
+    }
+    await writeAuditLog({
+      req,
+      action: "ai_conversation_archived",
+      resourceType: "AI_CONVERSATION",
+      resourceId: conversation._id.toString(),
+      patientProfileId: profileScope.profileId.toString(),
+      metadata: { transition: "archived_for_new_chat" },
+    });
+    return res.json({ success: true, status: "archived" });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      code: error.code || "NEW_CONVERSATION_FAILED",
+      message: "I could not start a new conversation. Please try again.",
+    });
+  }
+});
+
+// Clearing a patient conversation is a soft privacy transition. The audit
+// record and retention policy remain intact while the chat is no longer active.
+router.delete("/conversations/:conversationId", auth, async (req, res) => {
+  const patientProfileId = asText(req.query.patientProfileId, 64);
+  try {
+    if (!isObjectId(req.params.conversationId)) {
+      return res.status(400).json({ success: false, code: "INVALID_CONVERSATION_ID", message: "Invalid conversation" });
+    }
+    const profileScope = await resolveAuthenticatedPatientProfileScope(req, patientProfileId || null);
+    const conversation = await markConversationInactive({
+      conversationId: req.params.conversationId,
+      scope: {
+        userId: req.auth.id,
+        userRole: "patient",
+        patientProfileId: profileScope.profileId,
+        assistantType: "medical",
+      },
+      status: "cleared",
+    });
+    if (!conversation) {
+      return res.status(404).json({ success: false, code: "CONVERSATION_NOT_FOUND", message: "Conversation is no longer active." });
+    }
+    await writeAuditLog({
+      req,
+      action: "ai_conversation_cleared",
+      resourceType: "AI_CONVERSATION",
+      resourceId: conversation._id.toString(),
+      patientProfileId: profileScope.profileId.toString(),
+    });
+    return res.json({ success: true, status: "cleared" });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      code: error.code || "CLEAR_CONVERSATION_FAILED",
+      message: "I could not clear this conversation. Please try again.",
     });
   }
 });
@@ -2094,13 +2674,14 @@ router.get("/chat", auth, async (req, res) => {
     };
     const chat = await AIChat.findOne({
       ...filter,
+      status: { $in: ["active", null] },
+      expiresAt: { $gt: new Date() },
       $or: [{ assistantScope: "medical" }, { assistantScope: { $exists: false } }],
     }).sort({ updatedAt: -1 }).lean();
     if (!chat) return res.json({ success: true, messages: [], conversationId: null });
-    await AIChat.updateOne({ _id: chat._id }, { $unset: { expiresAt: 1 } });
     res.json({
       success: true,
-      messages: chat.messages || [],
+      messages: (chat.messages || []).map(safeStoredMessage),
       conversationId: chat._id,
       context: chat.context || null,
     });
@@ -2345,17 +2926,13 @@ router.get('/patient/:patientId/analyze', auth, async (req, res) => {
       try {
         const extraction = await documentReader.extractTextFromS3(doc.s3Key, doc.s3Bucket || bucketNameFallback);
         results.push({
-          id: doc._id,
-          title: doc.title || doc.originalName,
-          type: doc.type || doc.category,
-          uploadedAt: doc.uploadedAt,
+          ...safeDocumentView(doc),
           success: extraction.success,
           textPreview: (extraction.text || '').slice(0, 800),
-          metadata: extraction.metadata || {},
           wordCount: extraction.wordCount || 0
         });
       } catch (e) {
-        results.push({ id: doc._id, title: doc.title, type: doc.type, uploadedAt: doc.uploadedAt, success: false, error: e.message });
+        results.push({ ...safeDocumentView(doc), success: false, error: "Document text is unavailable." });
       }
     }
 

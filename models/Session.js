@@ -17,6 +17,12 @@ const sessionSchema = new mongoose.Schema(
       ref: "User",
       required: true,
     },
+    patientProfileId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PatientProfile",
+      default: null,
+      index: true,
+    },
 
     // Status of the request/session
     status: {
@@ -109,6 +115,7 @@ const sessionSchema = new mongoose.Schema(
 
 // Index for efficient queries
 sessionSchema.index({ patientId: 1, status: 1 });
+sessionSchema.index({ patientProfileId: 1, status: 1, expiresAt: 1 });
 sessionSchema.index({ doctorId: 1, status: 1 });
 sessionSchema.index({ expiresAt: 1 }); // For TTL cleanup
 

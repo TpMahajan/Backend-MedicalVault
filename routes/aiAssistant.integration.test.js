@@ -179,6 +179,10 @@ await jest.unstable_mockModule("../middleware/rateLimit.js", () => ({
   aiLimiter: aiLimiterMock,
 }));
 
+await jest.unstable_mockModule("../middleware/auditLogger.js", () => ({
+  writeAuditLog: jest.fn(async () => undefined),
+}));
+
 await jest.unstable_mockModule("../services/accessControl.js", () => ({
   canDoctorAccessPatient: canDoctorAccessPatientMock,
 }));
@@ -518,6 +522,10 @@ describe("AI assistant /api/ai integration", () => {
     expect(response.status).toBe(200);
     expect(response.body.success).toBe(true);
     expect(response.body.documentMetadata?.documentType).toBe("Report");
+    expect(response.body.documentMetadata).not.toHaveProperty("s3Key");
+    expect(response.body.documentMetadata).not.toHaveProperty("s3Bucket");
+    expect(response.body.blocks).toEqual(expect.any(Array));
+    expect(response.body.status).toBe("completed");
     expect(response.body.context?.authorizedScope?.patientId).toBe("patient-1");
     expect(extractTextFromS3Mock).toHaveBeenCalledWith(
       "docs/cbc-report.pdf",
@@ -584,6 +592,8 @@ describe("AI assistant /api/ai integration", () => {
 
     expect(response.status).toBe(200);
     expect(response.body.documentMetadata?.extractionConfidence?.level).toBe("low");
+    expect(response.body.documentMetadata).not.toHaveProperty("ocrEngine");
+    expect(JSON.stringify(response.body)).not.toContain("docs/rx.jpg");
     expect(response.body.safety?.warnings?.join(" ")).toMatch(
       /extraction confidence is low/i
     );

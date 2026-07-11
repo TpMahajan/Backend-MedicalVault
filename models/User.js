@@ -128,6 +128,32 @@ const UserSchema = new mongoose.Schema(
     // 🔹 Profile Switching fields
     linkedProfiles: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
 
+    // Family Care is additive to legacy linkedProfiles. A User is the login
+    // identity; PatientProfile is the health-data subject.
+    selfPatientProfileId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PatientProfile",
+      default: null,
+      index: true,
+    },
+    entitlements: {
+      familyCare: {
+        enabled: { type: Boolean, default: false },
+        planCode: { type: String, default: "", trim: true, maxlength: 80 },
+        status: {
+          type: String,
+          enum: ["trial", "active", "expired", "suspended"],
+          default: "expired",
+        },
+        trialEndsAt: { type: Date, default: null },
+        subscriptionEndsAt: { type: Date, default: null },
+        limits: {
+          maxManagedProfiles: { type: Number, default: 5, min: 0, max: 50 },
+          maxCaregiversPerProfile: { type: Number, default: 5, min: 0, max: 50 },
+        },
+      },
+    },
+
     // 🔹 Password reset fields
     resetToken: { type: String, default: null },
     resetTokenHash: { type: String, default: null },

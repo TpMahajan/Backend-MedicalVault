@@ -12,6 +12,8 @@ import { Document } from "../models/File.js";
 import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { Session } from "../models/Session.js";
+import { CareRelationship } from "../models/CareRelationship.js";
+import { PatientProfile } from "../models/PatientProfile.js";
 import {
   checkSession,
   checkSessionByEmail,
@@ -65,8 +67,8 @@ const MAX_AI_CATEGORY_CHARS = 350;
 const DEFAULT_CLASSIFIER_TIMEOUT_MS = 2500;
 const DEFAULT_CATEGORY_CLASSIFIER_TIMEOUT_MS = 3000;
 const DEFAULT_VALIDATION_PDF_PAGES = 2;
-const DEFAULT_VALIDATION_TEXT_TIMEOUT_MS = 6000;
-const DEFAULT_VALIDATION_OCR_TIMEOUT_MS = 5000;
+const DEFAULT_VALIDATION_TEXT_TIMEOUT_MS = 15000;
+const DEFAULT_VALIDATION_OCR_TIMEOUT_MS = 20000;
 const VALIDATION_PDF_PAGES = parsePositiveInteger(
   process.env.DOCUMENT_VALIDATION_PDF_PAGES,
   DEFAULT_VALIDATION_PDF_PAGES,
@@ -675,25 +677,33 @@ const extractTextForMedicalValidation = async ({
   }
 
   if (usingS3Storage && s3Key && s3Bucket) {
-    const extracted = await withTimeout(
-      documentReader.extractTextFromS3(s3Key, s3Bucket, {
-        pdfParseParams: { first: VALIDATION_PDF_PAGES },
-        imageOcrOptions: {
-          languages: VALIDATION_OCR_LANGUAGES,
-          timeoutMs: VALIDATION_OCR_TIMEOUT_MS,
-        },
-      }),
-      isImage ? VALIDATION_OCR_TIMEOUT_MS : VALIDATION_TEXT_TIMEOUT_MS,
-      isImage ? "ocr" : "text_extraction",
-    );
-    if (!extracted?.success) {
+    try {
+      const extracted = await withTimeout(
+        documentReader.extractTextFromS3(s3Key, s3Bucket, {
+          pdfParseParams: { first: VALIDATION_PDF_PAGES },
+          imageOcrOptions: {
+            languages: VALIDATION_OCR_LANGUAGES,
+            timeoutMs: VALIDATION_OCR_TIMEOUT_MS,
+          },
+        }),
+        isImage ? VALIDATION_OCR_TIMEOUT_MS : VALIDATION_TEXT_TIMEOUT_MS,
+        isImage ? "ocr" : "text_extraction",
+      );
+      if (!extracted?.success) {
+        return {
+          success: false,
+          text: "",
+          reason: extracted?.error || "s3_extract_failed",
+        };
+      }
+      return { success: true, text: extracted.text || "" };
+    } catch (error) {
       return {
         success: false,
         text: "",
-        reason: extracted?.error || "s3_extract_failed",
+        reason: error.message || "s3_extract_failed",
       };
     }
-    return { success: true, text: extracted.text || "" };
   }
 
   if (!localFilePath || !fs.existsSync(localFilePath)) {
@@ -1119,7 +1129,25 @@ const canAccessDocument = async (req, doc) => {
   const patientId = String(doc.userId || "");
 
   if (privilegedRoles.has(role)) return true;
-  if (role === "patient") return requesterId === patientId;
+  if (role === "patient") {
+    if (requesterId === patientId) return true;
+    // Managed/linked Family Care documents remain isolated by their profile.
+    // A caregiver needs the explicit document-view permission; ownership of
+    // another profile's primary account is not sufficient.
+    if (!doc.patientProfileId) return false;
+    const [profile, relationship] = await Promise.all([
+      PatientProfile.findOne({ _id: doc.patientProfileId, status: "active" })
+        .select("_id")
+        .lean(),
+      CareRelationship.findOne({
+      patientProfileId: doc.patientProfileId,
+      caregiverUserId: requesterId,
+      status: "active",
+      $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }],
+      }).lean(),
+    ]);
+    return !!profile && relationship?.permissions?.documentsView === true;
+  }
   if (role === "doctor") {
     return canDoctorAccessPatient(requesterId, patientId);
   }
@@ -1598,8 +1626,12 @@ router.post(
         }
       }
 
+      const { findSelfPatientProfileId } = await import("../services/familyCareProfileService.js");
+      const patientProfileId = await findSelfPatientProfileId(targetUserId);
       const doc = await Document.create({
         userId: targetUserId,
+        patientProfileId,
+        uploadedByUserId: req.auth?.role === "patient" ? req.auth.id : null,
         doctorId: req.auth?.role === "doctor" ? req.auth.id : undefined,
         title: title || req.file.originalname,
         description: notes || "",
@@ -1728,16 +1760,30 @@ router.post(
         document: doc,
       });
     } catch (err) {
+      console.error("[document-upload] route_handler failed:", err);
       logUploadStage("failed", req, {
         failureStage: "route_handler",
         errorCode: "UPLOAD_FAILED",
+        errorMessage: err?.message || String(err),
       });
+      if (req.file) {
+        const usingS3StorageOnError = req.documentUploadStorage !== "local";
+        await cleanupRejectedUpload({
+          usingS3Storage: usingS3StorageOnError,
+          s3Bucket: req.file.bucket,
+          s3Key: req.file.key,
+          localFilePath: usingS3StorageOnError ? "" : String(req.file.path || ""),
+        }).catch(() => {});
+      }
       res.status(500).json(
         uploadErrorPayload({
           code: "UPLOAD_FAILED",
           message: "Upload failed, please try again",
           extra: {
             processingTimeMs: Date.now() - uploadStartedAt,
+            ...(process.env.NODE_ENV !== "production"
+              ? { debugMessage: err?.message || String(err) }
+              : {}),
           },
         }),
       );
@@ -2061,7 +2107,76 @@ router.get("/grouped/:email", auth, checkSessionByEmail, async (req, res) => {
   }
 });
 
-// ---------------- Preview ----------------
+// ---------------- Mobile signed-preview contract ----------------
+// This endpoint returns only a short-lived S3 URL after object-level access
+// checks. It intentionally never exposes bucket/key values or a backend URL.
+router.get("/:id/preview-url", auth, checkSession, async (req, res) => {
+  try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid document" });
+    }
+    const doc = await Document.findById(req.params.id);
+    if (!doc || doc.status === "archived") {
+      return res.status(404).json({ success: false, message: "This document is no longer available." });
+    }
+    if (!doc.s3Key || !doc.s3Bucket) {
+      return res.status(409).json({ success: false, message: "This document cannot be previewed right now." });
+    }
+    const allowed = await canAccessDocument(req, doc);
+    if (!allowed) {
+      await writeAuditLog({
+        req,
+        action: "ai_access_denied",
+        resourceType: "DOCUMENT",
+        resourceId: doc._id.toString(),
+        patientId: String(doc.userId || ""),
+        patientProfileId: String(doc.patientProfileId || ""),
+        statusCode: 403,
+        metadata: { operation: "document_preview" },
+      });
+      return res.status(403).json({ success: false, message: "You do not have access to this document." });
+    }
+
+    const expiresInSeconds = Math.min(
+      Math.max(Number.parseInt(String(process.env.DOCUMENT_PREVIEW_URL_TTL_SECONDS || "300"), 10) || 300, 60),
+      600,
+    );
+    const previewUrl = await generatePreviewUrl(
+      doc.s3Key,
+      doc.s3Bucket,
+      doc.mimeType || doc.fileType || null,
+      expiresInSeconds,
+      doc.originalName || doc.title || "medical-document",
+    );
+    await writeAuditLog({
+      req,
+      action: "ai_document_preview_requested",
+      resourceType: "DOCUMENT",
+      resourceId: doc._id.toString(),
+      patientId: String(doc.userId || ""),
+      patientProfileId: String(doc.patientProfileId || ""),
+      statusCode: 200,
+      metadata: { mimeType: String(doc.mimeType || doc.fileType || "") },
+    });
+    return res.json({
+      success: true,
+      documentId: doc._id.toString(),
+      previewUrl,
+      mimeType: doc.mimeType || doc.fileType || "application/octet-stream",
+      fileName: String(doc.originalName || doc.title || "Medical document"),
+      expiresInSeconds,
+    });
+  } catch (error) {
+    // Signed URL values and storage details are intentionally not logged.
+    console.error("Document preview URL generation failed:", error?.name || "unknown_error");
+    return res.status(500).json({
+      success: false,
+      message: "I could not prepare that document preview. Please try again.",
+    });
+  }
+});
+
+// ---------------- Legacy preview ----------------
 router.get("/:id/preview", auth, checkSession, async (req, res) => {
   try {
     if (!isValidObjectId(req.params.id)) {

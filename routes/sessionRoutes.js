@@ -11,6 +11,7 @@ import { persistSessionHistory } from "../services/sessionHistoryPersistence.js"
 import { BUCKET_NAME } from "../config/s3.js";
 import { generateSignedUrl } from "../utils/s3Utils.js";
 import { RefreshToken } from "../models/RefreshToken.js";
+import { emitNewDirectMessage } from "../services/chatPresenceRealtime.js";
 
 const router = express.Router();
 const ENABLE_DEBUG_ROUTES =
@@ -256,6 +257,17 @@ const dispatchDirectMessage = async ({
     readByRecipient: false,
     metadata: {
       relationType: relation.relationType || "session",
+    },
+  });
+
+  emitNewDirectMessage({
+    recipientId,
+    message: {
+      _id: directMessage._id,
+      senderId: normalizedSenderId,
+      senderRole: normalizedSenderRole,
+      message: normalizedMessage,
+      createdAt: directMessage.createdAt,
     },
   });
 

@@ -23,6 +23,7 @@ import { Product } from "../models/Product.js";
 import { UIConfig } from "../models/UIConfig.js";
 import { AISettings } from "../models/AISettings.js";
 import { AIUsage } from "../models/AIUsage.js";
+import { FamilyCarePlatformConfig } from "../models/FamilyCarePlatformConfig.js";
 import { Notification } from "../models/Notification.js";
 import { Appointment } from "../models/Appointment.js";
 import { Session } from "../models/Session.js";
@@ -56,6 +57,11 @@ import {
   broadcastPublicConfigEvent,
 } from "../services/publicConfigRealtime.js";
 import { getAISettings, getDateKey, summarizeAIUsage } from "../services/aiGovernance.js";
+import {
+  clearFamilyCareConfigCache,
+  getFamilyCareConfig,
+  normalizeFamilyCareConfigInput,
+} from "../services/familyCareConfigService.js";
 
 const router = express.Router();
 initializeFirebase();
@@ -190,6 +196,12 @@ function toBoolean(value, fallback = false) {
 function toNonNegativeNumber(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function toBoundedInteger(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(Math.trunc(parsed), max));
 }
 
 function normalizeAllowedModels(value) {
@@ -3537,6 +3549,177 @@ router.delete("/products/:id", requireSuperAdminAuth, async (req, res) => {
       success: false,
       message: "Failed to delete product",
       error: error.message,
+    });
+  }
+});
+
+// ---------------- FAMILY CARE CONFIG ----------------
+router.get("/family-care-config", requireSuperAdminAuth, async (req, res) => {
+  try {
+    const config = await getFamilyCareConfig({ fresh: true });
+    return res.json({ success: true, config });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch Family Care configuration",
+      error: error.message,
+    });
+  }
+});
+
+router.put("/family-care-config", requireSuperAdminAuth, async (req, res) => {
+  try {
+    const existing = await getFamilyCareConfig({ fresh: true });
+    const payload = normalizeFamilyCareConfigInput(req.body || {}, existing);
+    const updatedBy = req.superAdmin?.email || req.auth?.email || "superadmin";
+    const config = await FamilyCarePlatformConfig.findOneAndUpdate(
+      { key: "GLOBAL" },
+      { $set: { ...payload, updatedBy }, $setOnInsert: { key: "GLOBAL" } },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).lean();
+    clearFamilyCareConfigCache();
+
+    await Promise.all([
+      writeAuditLog({
+        req,
+        action: "UPDATE_FAMILY_CARE_CONFIG",
+        resourceType: "FAMILY_CARE_CONFIG",
+        resourceId: config?._id?.toString() || "GLOBAL",
+        statusCode: 200,
+        metadata: payload,
+      }),
+      logActivity(req, {
+        action: "UPDATE_FAMILY_CARE_CONFIG",
+        targetType: "FAMILY_CARE_CONFIG",
+        targetId: config?._id?.toString(),
+        details: payload,
+      }),
+    ]);
+
+    return res.json({
+      success: true,
+      message: "Family Care configuration updated",
+      config,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update Family Care configuration",
+      error: error.message,
+    });
+  }
+});
+
+router.get("/family-care-entitlements", requireSuperAdminAuth, async (req, res) => {
+  try {
+    const search = String(req.query.search || "").trim().slice(0, 120);
+    if (search.length < 2) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter at least 2 characters to search patient accounts",
+      });
+    }
+    const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const matcher = new RegExp(escaped, "i");
+    const users = await User.find({
+      role: "PATIENT",
+      $or: [{ email: matcher }, { name: matcher }],
+    })
+      .select("name email status entitlements.familyCare")
+      .sort({ email: 1 })
+      .limit(20)
+      .lean();
+    return res.json({ success: true, users });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to search Family Care entitlements",
+      error: error.message,
+    });
+  }
+});
+
+router.put("/family-care-entitlements/:userId", requireSuperAdminAuth, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.userId)) {
+      return res.status(400).json({ success: false, message: "Invalid patient account" });
+    }
+    const config = await getFamilyCareConfig();
+    const allowedStatuses = ["trial", "active", "expired", "suspended"];
+    const status = String(req.body.status || "expired").trim().toLowerCase();
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({ success: false, message: "Invalid entitlement status" });
+    }
+    const parseDate = (value, field) => {
+      if (value == null || String(value).trim() === "") return null;
+      const parsed = new Date(value);
+      if (Number.isNaN(parsed.getTime())) throw new Error(`${field} is invalid`);
+      return parsed;
+    };
+    const maxManagedProfiles = toBoundedInteger(
+      req.body.limits?.maxManagedProfiles,
+      Number(config?.limits?.maxManagedProfiles ?? 5),
+      0,
+      Number(config?.limits?.maxManagedProfiles ?? 5),
+    );
+    const maxCaregiversPerProfile = toBoundedInteger(
+      req.body.limits?.maxCaregiversPerProfile,
+      Number(config?.limits?.maxCaregiversPerProfile ?? 5),
+      0,
+      Number(config?.limits?.maxCaregiversPerProfile ?? 5),
+    );
+    const entitlement = {
+      enabled: toBoolean(req.body.enabled, false),
+      planCode: String(req.body.planCode || "").trim().slice(0, 80),
+      status,
+      trialEndsAt: parseDate(req.body.trialEndsAt, "Trial end date"),
+      subscriptionEndsAt: parseDate(req.body.subscriptionEndsAt, "Subscription end date"),
+      limits: { maxManagedProfiles, maxCaregiversPerProfile },
+    };
+    const user = await User.findOneAndUpdate(
+      { _id: req.params.userId, role: "PATIENT" },
+      { $set: { "entitlements.familyCare": entitlement } },
+      { new: true, runValidators: true },
+    ).select("name email status entitlements.familyCare").lean();
+    if (!user) {
+      return res.status(404).json({ success: false, message: "Patient account not found" });
+    }
+    await Promise.all([
+      writeAuditLog({
+        req,
+        action: "UPDATE_FAMILY_CARE_ENTITLEMENT",
+        resourceType: "USER_ENTITLEMENT",
+        resourceId: user._id.toString(),
+        statusCode: 200,
+        metadata: {
+          enabled: entitlement.enabled,
+          status: entitlement.status,
+          planCode: entitlement.planCode,
+          limits: entitlement.limits,
+        },
+      }),
+      logActivity(req, {
+        action: "UPDATE_FAMILY_CARE_ENTITLEMENT",
+        targetType: "USER",
+        targetId: user._id.toString(),
+        details: {
+          enabled: entitlement.enabled,
+          status: entitlement.status,
+          limits: entitlement.limits,
+        },
+      }),
+    ]);
+    return res.json({
+      success: true,
+      message: "Family Care entitlement updated",
+      user,
+    });
+  } catch (error) {
+    const validationError = / is invalid$/.test(error.message);
+    return res.status(validationError ? 400 : 500).json({
+      success: false,
+      message: validationError ? error.message : "Failed to update Family Care entitlement",
+      ...(validationError ? {} : { error: error.message }),
     });
   }
 });

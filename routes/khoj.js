@@ -629,6 +629,7 @@ router.post("/assistant/chat", async (req, res) => {
     );
     chat.context = { assistantScope: KHOJ_ASSISTANT_SCOPE };
     chat.lastActivityAt = new Date();
+    chat.expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
     await chat.save();
 
     await writeAuditLog({
@@ -667,6 +668,50 @@ router.post("/assistant/chat", async (req, res) => {
   } catch (error) {
     console.error("KHOJ assistant error:", error);
     return res.status(500).json({ success: false, message: "KHOJ AI is temporarily unavailable" });
+  }
+});
+
+// Load CareSearch AI chat history for current principal (persists for 48h, refreshed on access)
+router.get("/assistant/chat", async (req, res) => {
+  try {
+    const filter = {
+      userId: currentPrincipalId(req),
+      userRole: String(req.auth?.role || "patient").toLowerCase(),
+      assistantScope: KHOJ_ASSISTANT_SCOPE,
+      patientId: null,
+    };
+    const chat = await AIChat.findOne(filter).sort({ updatedAt: -1 }).lean();
+    if (!chat) return res.json({ success: true, messages: [], conversationId: null });
+    await AIChat.updateOne(
+      { _id: chat._id },
+      { $set: { expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000) } }
+    );
+    return res.json({
+      success: true,
+      messages: chat.messages || [],
+      conversationId: chat._id,
+      context: chat.context || null,
+    });
+  } catch (error) {
+    console.error("KHOJ chat load error:", error);
+    return res.status(500).json({ success: false, message: "Failed to load chat" });
+  }
+});
+
+// Clear CareSearch AI chat for current principal ("Start new chat")
+router.delete("/assistant/chat", async (req, res) => {
+  try {
+    const filter = {
+      userId: currentPrincipalId(req),
+      userRole: String(req.auth?.role || "patient").toLowerCase(),
+      assistantScope: KHOJ_ASSISTANT_SCOPE,
+      patientId: null,
+    };
+    await AIChat.deleteMany(filter);
+    return res.json({ success: true, message: "Chat cleared" });
+  } catch (error) {
+    console.error("KHOJ chat clear error:", error);
+    return res.status(500).json({ success: false, message: "Failed to clear chat" });
   }
 });
 

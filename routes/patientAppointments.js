@@ -158,8 +158,13 @@ router.post("/appointments/request", async (req, res) => {
         .json({ success: false, message: "Doctor not found." });
     }
 
+    const { findSelfPatientProfileId } = await import("../services/familyCareProfileService.js");
+    const patientProfileId = await findSelfPatientProfileId(targetPatientId);
     const appointment = new Appointment({
       patientId: targetPatientId,
+      patientProfileId,
+      createdByUserId: currentUserId,
+      managedByCaregiverUserId: isForSelf ? null : currentUserId,
       patientName: patientName || patient.name,
       patientEmail: patientEmail || patient.email || "",
       patientPhone: patientPhone || patient.mobile || "",
@@ -530,4 +535,3 @@ router.get("/appointments/:id/ai-summary", async (req, res) => {
 });
 
 export default router;
-

@@ -50,11 +50,13 @@ import adminInventoryRoutes from "./routes/adminInventory.js"; // admin inventor
 import inventoryRoutes from "./routes/inventory.js"; // public inventory (checkout)
 import storeRoutes from "./routes/store.js"; // store (products/cart/orders)
 import nearbyRoutes from "./routes/nearby.js"; // nearby healthcare services
+import familyCareRoutes from "./routes/familyCare.js"; // premium Family Care
 import { Session } from "./models/Session.js";
 import { checkEmailConfig } from "./utils/emailService.js";
 import patientAppointmentRoutes from "./routes/patientAppointments.js"; // patient appointments (Flutter)
 import { initPublicConfigRealtime } from "./services/publicConfigRealtime.js";
 import { initAuthSessionRealtime } from "./services/authSessionRealtime.js";
+import { initChatPresenceRealtime } from "./services/chatPresenceRealtime.js";
 import { apiLimiter } from "./middleware/rateLimit.js";
 
 const app = express();
@@ -250,6 +252,8 @@ app.use("/api", inventoryRoutes); // inventory/order API
 app.use("/api/inventory", inventoryRoutes); // compatibility mount
 app.use("/api", storeRoutes); // store API
 app.use("/api/nearby", nearbyRoutes); // nearby services API
+// Family Care intentionally has no unversioned mount.
+app.use("/api/v1/family-care", familyCareRoutes);
 
 // Non-breaking versioned API mounts (v1)
 app.use("/api/v1/auth", authRoutes);
@@ -356,6 +360,7 @@ const startServer = async () => {
 
     initPublicConfigRealtime(server);
     initAuthSessionRealtime(server);
+    initChatPresenceRealtime(server);
   } catch (err) {
     console.error("❌ Failed to start server:", err);
     process.exit(1);

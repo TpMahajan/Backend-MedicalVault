@@ -3,6 +3,12 @@ import mongoose from "mongoose";
 const QRCodeSchema = new mongoose.Schema(
   {
     patientId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    patientProfileId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PatientProfile",
+      default: null,
+      index: true,
+    },
     token: { type: String, required: true },
     expiresAt: { type: Date, required: true },
     status: {

@@ -53,6 +53,7 @@ await jest.unstable_mockModule("../middleware/auth.js", () => ({
 }));
 await jest.unstable_mockModule("../middleware/rateLimit.js", () => ({
   lostReportLimiter: (req, res, next) => next(),
+  lostPhotoSearchLimiter: (req, res, next) => next(),
 }));
 await jest.unstable_mockModule("../config/s3.js", () => ({
   default: { config: { credentials: null } },

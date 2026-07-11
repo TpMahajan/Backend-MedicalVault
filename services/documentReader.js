@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { createWorker } from 'tesseract.js';
 import axios from 'axios';
 import s3Client from '../config/s3.js';
@@ -9,6 +10,11 @@ import { pipeline } from 'stream';
 import { promisify } from 'util';
 
 const pipelineAsync = promisify(pipeline);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// eng.traineddata / hin.traineddata are bundled at repo root so OCR worker
+// init never depends on a CDN fetch (which can hang/fail in sandboxed or
+// offline deployments and blow the validation timeout).
+const TESSDATA_DIR = path.resolve(__dirname, '..');
 
 class DocumentReader {
   constructor() {
@@ -278,7 +284,10 @@ class DocumentReader {
     if (!this.ocrWorkerPromises.has(normalizedLanguages)) {
       this.ocrWorkerPromises.set(
         normalizedLanguages,
-        createWorker(normalizedLanguages)
+        createWorker(normalizedLanguages, undefined, {
+          langPath: TESSDATA_DIR,
+          cachePath: TESSDATA_DIR,
+        })
       );
     }
     return this.ocrWorkerPromises.get(normalizedLanguages);

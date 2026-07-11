@@ -15,6 +15,9 @@
     "backup:create": "node ./scripts/backup-db.js",
     "backup:restore": "node ./scripts/restore-db.js",
     "migrate:dedupe-lost-found-matches": "node ./scripts/dedupe-lost-found-matches.js"
+    ,"family-care:backfill": "node ./scripts/family-care/backfill-patient-profiles.js"
+    ,"family-care:verify": "node ./scripts/family-care/verify-backfill.js"
+    ,"family-care:rollback": "node ./scripts/family-care/rollback-backfill.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.540.0",

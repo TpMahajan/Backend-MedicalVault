@@ -33,7 +33,7 @@ const sanitizeMetadata = (value) => {
   }, {});
 };
 
-const buildRecordHash = ({ previousHash, actorId, actorRole, action, resourceType, resourceId, patientId, statusCode, ipAddress, userAgent, requestId, metadata }) =>
+const buildRecordHash = ({ previousHash, actorId, actorRole, action, resourceType, resourceId, patientId, patientProfileId, statusCode, ipAddress, userAgent, requestId, metadata }) =>
   crypto
     .createHash("sha256")
     .update(
@@ -45,6 +45,7 @@ const buildRecordHash = ({ previousHash, actorId, actorRole, action, resourceTyp
         resourceType,
         resourceId,
         patientId,
+        patientProfileId,
         statusCode,
         ipAddress,
         userAgent,
@@ -60,6 +61,7 @@ export const writeAuditLog = async ({
   resourceType,
   resourceId = "",
   patientId = "",
+  patientProfileId = "",
   statusCode = 200,
   metadata = {},
 }) => {
@@ -77,6 +79,7 @@ export const writeAuditLog = async ({
       resourceType: asString(resourceType),
       resourceId: asString(resourceId),
       patientId: asString(patientId),
+      patientProfileId: asString(patientProfileId),
       statusCode: Number(statusCode) || 500,
       ipAddress: asString(req.ip),
       userAgent: asString(req.headers["user-agent"]),
@@ -91,6 +94,7 @@ export const writeAuditLog = async ({
       resourceType: asString(resourceType),
       resourceId: asString(resourceId),
       patientId: asString(patientId),
+      patientProfileId: asString(patientProfileId),
       statusCode: Number(statusCode) || 500,
       ipAddress: asString(req.ip),
       userAgent: asString(req.headers["user-agent"]),

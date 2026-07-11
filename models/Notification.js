@@ -20,6 +20,12 @@ const notificationSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.Mixed,
     default: {}
   },
+  patientProfileId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'PatientProfile',
+    default: null,
+    index: true
+  },
   recipientId: {
     type: mongoose.Schema.Types.ObjectId,
     required: true,

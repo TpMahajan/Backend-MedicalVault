@@ -14,6 +14,7 @@ const auditLogSchema = new mongoose.Schema(
     resourceType: { type: String, required: true, trim: true, maxlength: 120, index: true },
     resourceId: { type: String, default: "", trim: true, maxlength: 120, index: true },
     patientId: { type: String, default: "", index: true },
+    patientProfileId: { type: String, default: "", index: true },
     statusCode: { type: Number, required: true, min: 100, max: 599 },
     ipAddress: { type: String, default: "" },
     userAgent: { type: String, default: "" },
