@@ -43,9 +43,17 @@ export const resolveFamilyCareEntitlementWithConfig = (user, config, {
   const allowed = entitlement?.enabled === true && validStatus && isDateActive(expiry);
   const userManagedLimit = Number(entitlement?.limits?.maxManagedProfiles ?? platformLimits.maxManagedProfiles);
   const userCaregiverLimit = Number(entitlement?.limits?.maxCaregiversPerProfile ?? platformLimits.maxCaregiversPerProfile);
+  const denialCode = (() => {
+    if (allowed) return "";
+    if (entitlement?.status === "suspended") return "FAMILY_CARE_ENTITLEMENT_SUSPENDED";
+    if (entitlement?.status === "expired" || (validStatus && !isDateActive(expiry))) {
+      return "FAMILY_CARE_ENTITLEMENT_EXPIRED";
+    }
+    return "FAMILY_CARE_ENTITLEMENT_REQUIRED";
+  })();
   return {
     allowed,
-    code: allowed ? "" : "FAMILY_CARE_ENTITLEMENT_REQUIRED",
+    code: denialCode,
     source: "user_entitlement",
     status: entitlement?.status || "expired",
     limits: {

@@ -81,6 +81,15 @@ function withVersionQuery(urlValue, version) {
   }
 }
 
+function toPositiveIntOrNull(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || !Number.isInteger(numeric) || numeric <= 0) {
+    return null;
+  }
+  return numeric;
+}
+
 function loadUpdateConfig() {
   if (!fs.existsSync(updateConfigPath)) {
     throw new Error("app-update.json not found");
@@ -99,7 +108,9 @@ function loadUpdateConfig() {
   const minimumSupportedVersion = String(
     parsed.minimumSupportedVersion || "",
   ).trim();
-  const releaseNotes = String(parsed.releaseNotes || "").trim();
+  const releaseNotes = Array.isArray(parsed.releaseNotes)
+    ? parsed.releaseNotes.map((note) => String(note || "").trim()).filter(Boolean).join("\n")
+    : String(parsed.releaseNotes || "").trim();
   const sha256 = String(parsed.sha256 || parsed.checksum || "")
     .trim()
     .toLowerCase();
@@ -108,6 +119,38 @@ function loadUpdateConfig() {
     .toLowerCase();
   const apkUrl = String(parsed.apkUrl || "").trim();
   const apkFileName = String(parsed.apkFileName || "").trim();
+
+  // Additive, optional fields. Older app-update.json files (and older
+  // deployments) without these fields must continue to work exactly as
+  // before \u2014 absence is not an error, only malformed presence is.
+  if (
+    (parsed.latestBuildNumber !== undefined || parsed.latestBuild !== undefined) &&
+    toPositiveIntOrNull(parsed.latestBuildNumber ?? parsed.latestBuild) === null
+  ) {
+    throw new Error("latestBuildNumber must be a positive integer when present");
+  }
+  if (
+    (parsed.minimumSupportedBuildNumber !== undefined || parsed.minimumSupportedBuild !== undefined) &&
+    toPositiveIntOrNull(parsed.minimumSupportedBuildNumber ?? parsed.minimumSupportedBuild) === null
+  ) {
+    throw new Error(
+      "minimumSupportedBuildNumber must be a positive integer when present",
+    );
+  }
+  const latestBuildNumber = toPositiveIntOrNull(parsed.latestBuildNumber ?? parsed.latestBuild);
+  const minimumSupportedBuildNumber = toPositiveIntOrNull(
+    parsed.minimumSupportedBuildNumber ?? parsed.minimumSupportedBuild,
+  );
+  if (
+    latestBuildNumber !== null &&
+    minimumSupportedBuildNumber !== null &&
+    minimumSupportedVersion === latestVersion &&
+    minimumSupportedBuildNumber > latestBuildNumber
+  ) {
+    throw new Error(
+      "minimumSupportedBuildNumber cannot exceed latestBuildNumber when versions are equal",
+    );
+  }
 
   if (!VERSION_REGEX.test(latestVersion)) {
     throw new Error("latestVersion must be a dotted numeric version");
@@ -135,12 +178,16 @@ function loadUpdateConfig() {
 
   return {
     latestVersion,
+    latestBuildNumber,
     minimumSupportedVersion,
+    minimumSupportedBuildNumber,
     releaseNotes,
     sha256,
     checksum: sha256,
     apkUrl,
     apkFileName,
+    mandatory: parsed.mandatory === true,
+    releaseDate: String(parsed.releaseDate || parsed.generatedAt || "").trim(),
   };
 }
 
@@ -175,6 +222,9 @@ function resolveApkFilePath(version, config = null) {
   const candidates = [
     config?.apkFileName && config.latestVersion === version
       ? config.apkFileName
+      : "",
+    config?.latestBuildNumber && config.latestVersion === version
+      ? `${version}+${config.latestBuildNumber}.apk`
       : "",
     `${version}.apk`,
     `healthvault_v${version}.apk`,
@@ -281,26 +331,70 @@ export async function validateAppUpdateConfigOnStartup() {
 router.get("/update", async (req, res) => {
   try {
     const currentVersion = String(req.query.currentVersion || "0.0.0").trim();
+    const currentBuildNumber = toPositiveIntOrNull(req.query.currentBuildNumber);
     const config = loadUpdateConfig();
     const apkValidation = await validateConfiguredApk(config);
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
 
-    const hasUpdate = compareVersions(currentVersion, config.latestVersion) < 0;
-    const forceUpdate =
-      compareVersions(currentVersion, config.minimumSupportedVersion) < 0;
+    if (!apkValidation.ok) {
+      // Do not announce an update if the backing artifact fails integrity
+      // checks — never serve a mismatched or missing APK as "available".
+      res.status(503).json({
+        success: false,
+        code: "UPDATE_ARTIFACT_INVALID",
+        errorCode: "UPDATE_ARTIFACT_INVALID",
+        message: "Update artifact is currently unavailable. Please try again shortly.",
+      });
+      return;
+    }
+
+    const versionCmp = compareVersions(currentVersion, config.latestVersion);
+    let hasUpdate = versionCmp < 0;
+    // Same version, newer build available on the server -> still an update.
+    if (
+      !hasUpdate &&
+      versionCmp === 0 &&
+      currentBuildNumber !== null &&
+      config.latestBuildNumber !== null &&
+      currentBuildNumber < config.latestBuildNumber
+    ) {
+      hasUpdate = true;
+    }
+
+    const minCmp = compareVersions(currentVersion, config.minimumSupportedVersion);
+    let forceUpdate = minCmp < 0;
+    // Equal version but below the minimum supported build number -> forced.
+    if (
+      !forceUpdate &&
+      minCmp === 0 &&
+      currentBuildNumber !== null &&
+      config.minimumSupportedBuildNumber !== null &&
+      currentBuildNumber < config.minimumSupportedBuildNumber
+    ) {
+      forceUpdate = true;
+      hasUpdate = true;
+    }
 
     res.json({
       version: config.latestVersion,
       latestVersion: config.latestVersion,
+      // Additive fields. Older app builds ignore unknown JSON keys, so this
+      // is safe to add without breaking any existing client.
+      latestBuildNumber: config.latestBuildNumber,
+      latestBuild: config.latestBuildNumber,
       minimumSupportedVersion: config.minimumSupportedVersion,
+      minimumSupportedBuildNumber: config.minimumSupportedBuildNumber,
+      minimumSupportedBuild: config.minimumSupportedBuildNumber,
       apkUrl: resolveApkUrl(req, config),
       apkFileName: apkValidation.fileName || config.apkFileName || "",
       apkAvailable: apkValidation.ok,
       releaseNotes: config.releaseNotes,
+      mandatory: config.mandatory,
+      releaseDate: config.releaseDate,
       checksum: config.sha256,
       sha256: config.sha256,
       hasUpdate,
-      forceUpdate,
+      forceUpdate: forceUpdate || (config.mandatory && hasUpdate),
     });
   } catch (error) {
     res.status(500).json({

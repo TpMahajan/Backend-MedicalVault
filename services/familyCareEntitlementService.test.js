@@ -21,7 +21,7 @@ describe("Family Care entitlements", () => {
       subscriptionEndsAt: new Date(Date.now() - 1000),
     } } }, enabledConfig(), { nodeEnv: "production" });
     expect(result.allowed).toBe(false);
-    expect(result.code).toBe("FAMILY_CARE_ENTITLEMENT_REQUIRED");
+    expect(result.code).toBe("FAMILY_CARE_ENTITLEMENT_EXPIRED");
   });
 
   it("allows an unexpired trial and applies platform hard caps", () => {
@@ -39,5 +39,19 @@ describe("Family Care entitlements", () => {
     const config = enabledConfig({ developmentAutoEntitle: true });
     expect(resolveFamilyCareEntitlementWithConfig({}, config, { nodeEnv: "development" }).allowed).toBe(true);
     expect(resolveFamilyCareEntitlementWithConfig({}, config, { nodeEnv: "production" }).allowed).toBe(false);
+  });
+
+  it("returns distinct expired and suspended entitlement codes", () => {
+    const expired = resolveFamilyCareEntitlementWithConfig({ entitlements: { familyCare: {
+      enabled: true,
+      status: "active",
+      subscriptionEndsAt: new Date(Date.now() - 1000),
+    } } }, enabledConfig(), { nodeEnv: "production" });
+    const suspended = resolveFamilyCareEntitlementWithConfig({ entitlements: { familyCare: {
+      enabled: true,
+      status: "suspended",
+    } } }, enabledConfig(), { nodeEnv: "production" });
+    expect(expired.code).toBe("FAMILY_CARE_ENTITLEMENT_EXPIRED");
+    expect(suspended.code).toBe("FAMILY_CARE_ENTITLEMENT_SUSPENDED");
   });
 });

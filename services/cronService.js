@@ -1,5 +1,6 @@
 import cron from 'node-cron';
 import { runAllReminders } from './reminderService.js';
+import { runFamilyCareMedicationScheduler } from "./familyCareNotificationService.js";
 
 /**
  * Initialize cron jobs for reminders
@@ -35,6 +36,17 @@ export const initializeCronJobs = () => {
     scheduled: true,
     timezone: "Asia/Kolkata"
   });
+
+  // Family Care medication schedules are evaluated against per-schedule IANA
+  // timezones. This five-minute UTC tick is only a worker cadence; it never
+  // determines a dose's local wall-clock time.
+  cron.schedule('*/5 * * * *', async () => {
+    try {
+      await runFamilyCareMedicationScheduler();
+    } catch (error) {
+      console.error('Family Care medication scheduler failed:', error.message);
+    }
+  }, { scheduled: true, timezone: 'UTC' });
 
   console.log('✅ Cron jobs initialized successfully');
 };

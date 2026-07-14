@@ -154,6 +154,69 @@ const UserSchema = new mongoose.Schema(
       },
     },
 
+    // These are enforced on the backend before a different account can request
+    // access to this user's healthcare profile. They are intentionally separate
+    // from legacy linkedProfiles and default to fail closed.
+    familyProfileAccessControls: {
+      allowProfileAccessRequests: { type: Boolean, default: false },
+      requestPolicy: {
+        type: String,
+        enum: ["anyone_with_medical_vault_id", "contacts_only", "existing_connections_only", "nobody"],
+        default: "nobody",
+      },
+      requireApprovalForEveryRequest: { type: Boolean, default: true },
+      defaultRequestedPermissions: {
+        profileRead: { type: Boolean, default: true },
+        profileEdit: { type: Boolean, default: false },
+        documentsView: { type: Boolean, default: false },
+        documentsUpload: { type: Boolean, default: false },
+        appointmentsView: { type: Boolean, default: false },
+        appointmentsManage: { type: Boolean, default: false },
+        medicationsView: { type: Boolean, default: false },
+        medicationsManage: { type: Boolean, default: false },
+        dosesConfirm: { type: Boolean, default: false },
+        emergencyView: { type: Boolean, default: false },
+        caregiverNotificationsReceive: { type: Boolean, default: false },
+        profileContextSwitch: { type: Boolean, default: true },
+        caregiversManage: { type: Boolean, default: false },
+      },
+    },
+    familyCareNotificationPreferences: {
+      enabled: { type: Boolean, default: true },
+      medicineDue: { type: Boolean, default: true },
+      repeatReminder: { type: Boolean, default: true },
+      medicineMissed: { type: Boolean, default: true },
+      caregiverMissedDoseAlert: { type: Boolean, default: true },
+      takenConfirmation: { type: Boolean, default: false },
+      skippedConfirmation: { type: Boolean, default: false },
+      refillReminder: { type: Boolean, default: true },
+      lowStockReminder: { type: Boolean, default: true },
+      quietHours: {
+        enabled: { type: Boolean, default: false },
+        start: { type: String, default: "22:00" },
+        end: { type: String, default: "07:00" },
+        timezone: { type: String, default: "Asia/Kolkata" },
+      },
+      profileOverrides: [{
+        patientProfileId: { type: mongoose.Schema.Types.ObjectId, ref: "PatientProfile", required: true },
+        enabled: { type: Boolean, default: true },
+        medicineDue: { type: Boolean, default: true },
+        repeatReminder: { type: Boolean, default: true },
+        medicineMissed: { type: Boolean, default: true },
+        caregiverMissedDoseAlert: { type: Boolean, default: true },
+        takenConfirmation: { type: Boolean, default: false },
+        skippedConfirmation: { type: Boolean, default: false },
+        refillReminder: { type: Boolean, default: true },
+        lowStockReminder: { type: Boolean, default: true },
+        quietHours: {
+          enabled: { type: Boolean, default: false },
+          start: { type: String, default: "22:00" },
+          end: { type: String, default: "07:00" },
+          timezone: { type: String, default: "Asia/Kolkata" },
+        },
+      }],
+    },
+
     // 🔹 Password reset fields
     resetToken: { type: String, default: null },
     resetTokenHash: { type: String, default: null },

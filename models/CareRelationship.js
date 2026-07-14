@@ -8,6 +8,7 @@ export const CARE_PERMISSION_KEYS = Object.freeze([
   "emergencyView", "emergencyManage",
   "vaccinationView", "vaccinationManage",
   "insuranceView", "insuranceManage", "insightsView", "caregiverManagement",
+  "caregiversManage", "caregiverNotificationsReceive", "profileContextSwitch",
 ]);
 
 const permissionsDefinition = Object.fromEntries(

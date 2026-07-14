@@ -46,6 +46,14 @@ const patientProfileSchema = new mongoose.Schema(
       },
       emergencyNotes: { type: String, default: "", trim: true, maxlength: 1000 },
     },
+    emergencyContact: {
+      name: { type: String, default: "", trim: true, maxlength: 120 },
+      relationship: { type: String, default: "", trim: true, maxlength: 60 },
+      // 32 characters is the plaintext limit enforced by the Family Care
+      // controller. AES-GCM storage expands that value, so this schema limit
+      // must accommodate the encrypted envelope rather than reject it.
+      phone: { type: String, default: "", trim: true, maxlength: 256, set: encryptField, get: decryptField },
+    },
     identifiers: {
       abhaIdEncrypted: { type: String, default: "", set: encryptField, get: decryptField },
       externalPatientIds: [
@@ -67,7 +75,7 @@ const patientProfileSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["active", "archived", "deceased"],
+      enum: ["pending", "active", "archived", "deceased", "creation_failed"],
       default: "active",
       index: true,
     },

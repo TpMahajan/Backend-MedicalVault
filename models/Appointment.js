@@ -52,6 +52,7 @@ const appointmentSchema = new mongoose.Schema({
     enum: ["consultation", "follow-up", "emergency", "routine", "specialist"],
     default: "consultation",
   },
+  mode: { type: String, enum: ["in-person", "online"], default: "in-person" },
 
   // Doctor reference
   doctorId: {
@@ -64,11 +65,13 @@ const appointmentSchema = new mongoose.Schema({
     required: [true, "Doctor name is required"],
     trim: true,
   },
+  doctorSpecialization: { type: String, trim: true, default: "" },
+  hospitalClinicName: { type: String, trim: true, default: "" },
 
   // Appointment status
   status: {
     type: String,
-    enum: ["scheduled", "confirmed", "completed", "cancelled", "rescheduled", "no-show"],
+    enum: ["pending", "scheduled", "confirmed", "completed", "cancelled", "rescheduled", "no-show"],
     default: "scheduled",
   },
 

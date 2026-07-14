@@ -7,15 +7,16 @@ const actorKey = (req) => {
   return crypto.createHash("sha256").update(actor).digest("hex");
 };
 
-export const familyCareInvitationLimiter = async (req, res, next) => {
+const familyCareRateLimiter = ({ kind, defaultMax, defaultWindowMinutes, errorCode, message }) => async (req, res, next) => {
   try {
     const config = await getFamilyCareConfig();
-    const windowMinutes = Math.max(1, Number(config?.invitations?.windowMinutes || 60));
-    const maxPerWindow = Math.max(1, Number(config?.invitations?.maxPerWindow || 10));
+    const limits = kind === "search" ? config?.userSearch : config?.invitations;
+    const windowMinutes = Math.max(1, Number(limits?.windowMinutes || defaultWindowMinutes));
+    const maxPerWindow = Math.max(1, Number(limits?.maxPerWindow || defaultMax));
     const windowMs = windowMinutes * 60 * 1000;
     const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
     const expiresAt = new Date(windowStart + windowMs);
-    const key = `care-invite:${actorKey(req)}:${windowStart}`;
+    const key = `care-${kind}:${actorKey(req)}:${windowStart}`;
 
     let bucket;
     try {
@@ -40,8 +41,8 @@ export const familyCareInvitationLimiter = async (req, res, next) => {
     if (count > maxPerWindow) {
       return res.status(429).json({
         success: false,
-        code: "FAMILY_CARE_INVITE_RATE_LIMITED",
-        message: "Too many caregiver invitations. Please try again later.",
+        code: errorCode,
+        message,
       });
     }
     return next();
@@ -54,3 +55,19 @@ export const familyCareInvitationLimiter = async (req, res, next) => {
     });
   }
 };
+
+export const familyCareInvitationLimiter = familyCareRateLimiter({
+  kind: "invite",
+  defaultMax: 10,
+  defaultWindowMinutes: 60,
+  errorCode: "FAMILY_CARE_INVITE_RATE_LIMITED",
+  message: "Too many caregiver invitations. Please try again later.",
+});
+
+export const familyCareUserSearchLimiter = familyCareRateLimiter({
+  kind: "search",
+  defaultMax: 20,
+  defaultWindowMinutes: 60,
+  errorCode: "FAMILY_CARE_SEARCH_RATE_LIMITED",
+  message: "Too many account searches. Please try again later.",
+});

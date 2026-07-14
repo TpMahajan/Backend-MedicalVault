@@ -4,6 +4,7 @@ import { DoctorUser } from '../models/DoctorUser.js';
 import { Notification } from '../models/Notification.js';
 import { sendNotification } from '../utils/notifications.js';
 import { broadcastNotification } from '../controllers/notificationController.js';
+import { runFamilyCareMedicationScheduler } from "./familyCareNotificationService.js";
 
 /**
  * Send appointment reminders
@@ -236,6 +237,9 @@ export const runAllReminders = async () => {
   
   await sendAppointmentReminders();
   await sendMedicationReminders();
+  // Legacy User.medications remain supported above. New Family Care medication
+  // reminders use canonical dose events and profile-aware recipients.
+  await runFamilyCareMedicationScheduler();
   // Uncomment the line below if you want to send system notifications
   // await sendSystemNotifications();
   

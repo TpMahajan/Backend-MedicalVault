@@ -12,12 +12,17 @@
     "security:audit": "npm audit --omit=dev",
     "security:check": "node --check index.js && npm run security:audit",
     "app-update:metadata": "node ./scripts/update-app-apk-metadata.js",
+    "app-update:prepare": "node ./scripts/release-app-update.mjs prepare",
+    "app-update:verify-local": "node ./scripts/release-app-update.mjs verify-local",
+    "app-update:verify-remote": "node ./scripts/release-app-update.mjs verify-remote",
+    "app-update:release": "node ./scripts/release-app-update.mjs release",
     "backup:create": "node ./scripts/backup-db.js",
     "backup:restore": "node ./scripts/restore-db.js",
     "migrate:dedupe-lost-found-matches": "node ./scripts/dedupe-lost-found-matches.js"
     ,"family-care:backfill": "node ./scripts/family-care/backfill-patient-profiles.js"
     ,"family-care:verify": "node ./scripts/family-care/verify-backfill.js"
     ,"family-care:rollback": "node ./scripts/family-care/rollback-backfill.js"
+    ,"family-care:enable-test-entitlement": "node ./scripts/family-care/enable-test-entitlement.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.540.0",

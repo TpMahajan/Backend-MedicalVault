@@ -2,9 +2,11 @@ import crypto from "crypto";
 import mongoose from "mongoose";
 import { PatientProfile } from "../models/PatientProfile.js";
 import { CareRelationship } from "../models/CareRelationship.js";
+import { FamilyCareIdempotencyKey } from "../models/FamilyCareIdempotencyKey.js";
 import { CareInvitation } from "../models/CareInvitation.js";
 import { Appointment } from "../models/Appointment.js";
 import { Document } from "../models/File.js";
+import { MedicationDoseEvent } from "../models/MedicationDoseEvent.js";
 import { writeAuditLog } from "../middleware/auditLogger.js";
 import { ensureSelfPatientProfile } from "../services/familyCareProfileService.js";
 import { permissionsForRole, sanitizePermissions } from "../services/familyCarePermissions.js";
@@ -17,6 +19,10 @@ const hashPhone = (phone) => crypto
   .createHmac("sha256", process.env.DATA_ENCRYPTION_KEY || process.env.JWT_SECRET)
   .update(asText(phone, 32).replace(/\s+/g, ""))
   .digest("hex");
+const FAMILY_PROFILE_CREATE_ENDPOINT = "POST:/api/v1/family-care/profiles";
+const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+const GENDERS = new Set(["female", "male", "non_binary", "other", "prefer_not_to_say"]);
+const BLOOD_GROUPS = new Set(["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]);
 
 const isValidTimezone = (timezone) => {
   try {
@@ -29,13 +35,62 @@ const isValidTimezone = (timezone) => {
 
 const parseDate = (value) => {
   if (value === undefined || value === null || value === "") return null;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? undefined : date;
+  const raw = asText(value, 16);
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (!match) return undefined;
+  const [, year, month, day] = match;
+  const date = new Date(`${raw}T00:00:00.000Z`);
+  if (Number.isNaN(date.getTime())
+    || date.getUTCFullYear() !== Number(year)
+    || date.getUTCMonth() + 1 !== Number(month)
+    || date.getUTCDate() !== Number(day)) return undefined;
+  return date;
 };
 
 const stringList = (value, maxItems = 30, maxLength = 500) => Array.isArray(value)
   ? value.slice(0, maxItems).map((item) => asText(item, maxLength)).filter(Boolean)
   : [];
+
+const mapObject = (value) => value && typeof value === "object" && !Array.isArray(value)
+  ? value
+  : {};
+
+const dateOnly = (value) => {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
+};
+
+const asPlain = (value) => value && typeof value.toObject === "function"
+  ? value.toObject({ getters: true })
+  : value || {};
+
+const stableJson = (value) => {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+};
+
+const profileFingerprint = (patch, relationship) => crypto
+  .createHash("sha256")
+  .update(stableJson({
+    ...patch,
+    dateOfBirth: patch.dateOfBirth instanceof Date ? patch.dateOfBirth.toISOString() : patch.dateOfBirth,
+    relationship,
+  }))
+  .digest("hex");
+
+const idempotencyKeyFromRequest = (req) => asText(req.get("Idempotency-Key"), 128);
+const validIdempotencyKey = (value) => /^[A-Za-z0-9._:-]{8,128}$/.test(value);
+
+const sendError = (res, status, code, message, fields = {}) => res.status(status).json({
+  success: false,
+  code,
+  message,
+  error: { code, message, fields },
+});
 
 const profilePatch = (body, { create = false } = {}) => {
   const patch = {};
@@ -56,29 +111,155 @@ const profilePatch = (body, { create = false } = {}) => {
       lifestyleNotes: stringList(body.medicalSummary.lifestyleNotes),
     };
   }
+  if (body.emergencyContact && typeof body.emergencyContact === "object") {
+    const contact = mapObject(body.emergencyContact);
+    patch.emergencyContact = {
+      name: asText(contact.name, 120),
+      relationship: asText(contact.relationship, 60),
+      phone: asText(contact.phone, 32),
+    };
+  }
   return patch;
 };
 
-const validateProfilePatch = (patch) => {
-  if (!patch.displayName) return "Display name is required";
-  if (Object.hasOwn(patch, "dateOfBirth") && patch.dateOfBirth === undefined) return "Invalid date of birth";
-  if (patch.dateOfBirth && patch.dateOfBirth > new Date()) return "Date of birth cannot be in the future";
-  if (patch.timezone && !isValidTimezone(patch.timezone)) return "Invalid timezone";
-  if (patch.height !== undefined && patch.height !== null && (!Number.isFinite(patch.height) || patch.height < 0 || patch.height > 300)) return "Invalid height";
-  if (patch.weight !== undefined && patch.weight !== null && (!Number.isFinite(patch.weight) || patch.weight < 0 || patch.weight > 1000)) return "Invalid weight";
-  return "";
+const validateProfilePatch = (patch, { create = false, relationship = "" } = {}) => {
+  const fields = {};
+  if (!patch.displayName) fields.displayName = "Full name is required.";
+  if (create && !relationship) fields.relationship = "Relationship is required.";
+  if (create && !patch.dateOfBirth) fields.dateOfBirth = "Date of birth is required.";
+  if (Object.hasOwn(patch, "dateOfBirth") && patch.dateOfBirth === undefined) fields.dateOfBirth = "Enter a valid date of birth.";
+  if (patch.dateOfBirth && patch.dateOfBirth > new Date()) fields.dateOfBirth = "Date of birth cannot be in the future.";
+  if (patch.timezone && !isValidTimezone(patch.timezone)) fields.timezone = "Choose a valid IANA timezone.";
+  if (patch.gender && !GENDERS.has(patch.gender)) fields.gender = "Choose a supported gender value.";
+  if (patch.bloodGroup && !BLOOD_GROUPS.has(patch.bloodGroup)) fields.bloodGroup = "Choose a supported blood group.";
+  if (patch.preferredLanguage && !/^[a-z]{2}(?:-[A-Z]{2})?$/.test(patch.preferredLanguage)) fields.preferredLanguage = "Use a language tag such as en or en-IN.";
+  if (patch.height !== undefined && patch.height !== null && (!Number.isFinite(patch.height) || patch.height < 0 || patch.height > 300)) fields.height = "Enter a valid height.";
+  if (patch.weight !== undefined && patch.weight !== null && (!Number.isFinite(patch.weight) || patch.weight < 0 || patch.weight > 1000)) fields.weight = "Enter a valid weight.";
+  if (patch.emergencyContact?.phone && !/^[+0-9()\-\s]{6,32}$/.test(patch.emergencyContact.phone)) fields.emergencyContact = "Enter a valid emergency contact phone number.";
+  return fields;
 };
 
 const relationshipView = (relationship) => ({
-  id: relationship._id,
-  patientProfileId: relationship.patientProfileId?._id || relationship.patientProfileId,
-  caregiver: relationship.caregiverUserId,
+  id: String(relationship._id),
+  patientProfileId: String(relationship.patientProfileId?._id || relationship.patientProfileId || ""),
   relationship: relationship.relationship,
   role: relationship.role,
-  permissions: relationship.permissions,
+  permissions: mapObject(relationship.permissions),
   status: relationship.status,
-  acceptedAt: relationship.acceptedAt,
-  expiresAt: relationship.expiresAt,
+  acceptedAt: relationship.acceptedAt || null,
+  expiresAt: relationship.expiresAt || null,
+});
+
+const profileView = (profile, relationship) => {
+  const source = asPlain(profile);
+  const summary = mapObject(source.medicalSummary);
+  const emergencyContact = mapObject(source.emergencyContact);
+  return {
+    id: String(source._id || source.id || ""),
+    displayName: asText(source.displayName, 120),
+    relationship: relationship?.relationship || null,
+    profileType: source.profileType,
+    dateOfBirth: dateOnly(source.dateOfBirth),
+    gender: source.gender || null,
+    bloodGroup: source.bloodGroup || null,
+    height: source.height ?? null,
+    weight: source.weight ?? null,
+    timezone: source.timezone || "Asia/Kolkata",
+    preferredLanguage: source.preferredLanguage || "en",
+    profilePhotoKey: source.profilePhotoKey || null,
+    status: source.status,
+    medicalSummary: {
+      allergies: stringList(summary.allergies, 30, 240),
+      conditions: stringList(summary.conditions, 30, 240),
+      currentConcerns: stringList(summary.currentConcerns),
+      lifestyleNotes: stringList(summary.lifestyleNotes),
+    },
+    emergencyContact: {
+      name: asText(emergencyContact.name, 120),
+      relationship: asText(emergencyContact.relationship, 60),
+      phone: asText(emergencyContact.phone, 32),
+    },
+    role: relationship?.role || null,
+    permissions: mapObject(relationship?.permissions),
+  };
+};
+
+const profileResponse = (profile, relationship) => ({
+  profile: profileView(profile, relationship),
+  relationship: relationshipView(relationship),
+});
+
+const isTransactionUnsupported = (error) => error?.code === 20 || /transaction numbers are only allowed|transactions are not supported|replica set member or mongos/i.test(String(error?.message || ""));
+
+const completeIdempotency = async (record, profile, relationship, { session } = {}) => {
+  const update = {
+    $set: {
+      status: "completed",
+      patientProfileId: profile._id,
+      careRelationshipId: relationship._id,
+      failureCode: "",
+    },
+  };
+  await FamilyCareIdempotencyKey.updateOne({ _id: record._id }, update, session ? { session } : undefined);
+};
+
+const findIdempotentReplay = async (record) => {
+  if (!record?.patientProfileId) return null;
+  const [profile, relationship] = await Promise.all([
+    PatientProfile.findById(record.patientProfileId),
+    record.careRelationshipId
+      ? CareRelationship.findById(record.careRelationshipId)
+      : CareRelationship.findOne({ patientProfileId: record.patientProfileId, caregiverUserId: record.actorUserId, role: "owner" }),
+  ]);
+  if (!profile || !relationship) return null;
+  if (profile.status === "pending" && relationship.status === "active") {
+    profile.status = "active";
+    await profile.save();
+  }
+  if (profile.status !== "active" || relationship.status !== "active") return null;
+  if (record.status !== "completed") await completeIdempotency(record, profile, relationship);
+  return { profile, relationship };
+};
+
+const claimIdempotencyKey = async ({ actorUserId, key, fingerprint }) => {
+  const attributes = { actorUserId, endpoint: FAMILY_PROFILE_CREATE_ENDPOINT, key };
+  try {
+    const record = await FamilyCareIdempotencyKey.create({
+      ...attributes,
+      requestFingerprint: fingerprint,
+      status: "in_progress",
+      expiresAt: new Date(Date.now() + IDEMPOTENCY_TTL_MS),
+    });
+    return { record };
+  } catch (error) {
+    if (error?.code !== 11000) throw error;
+    const existing = await FamilyCareIdempotencyKey.findOne(attributes);
+    if (!existing) throw error;
+    if (existing.requestFingerprint !== fingerprint) return { error: "conflict" };
+    const replay = await findIdempotentReplay(existing);
+    if (replay) return { replay };
+    return { error: existing.status === "failed" ? "failed" : "in_progress" };
+  }
+};
+
+const createProfilePayload = ({ patch, actorId, relationship }) => ({
+  ...patch,
+  primaryOwnerUserId: actorId,
+  profileType: "managed",
+  consent: { status: "not_required", capturedAt: new Date(), capturedBy: actorId, version: "1.0" },
+  createdBy: actorId,
+  updatedBy: actorId,
+  status: "active",
+});
+
+const relationshipPayload = ({ profileId, actorId, relationship }) => ({
+  patientProfileId: profileId,
+  caregiverUserId: actorId,
+  relationship,
+  role: "owner",
+  permissions: permissionsForRole("owner"),
+  status: "active",
+  acceptedAt: new Date(),
 });
 
 export const listProfiles = async (req, res) => {
@@ -91,87 +272,190 @@ export const listProfiles = async (req, res) => {
     }).populate("patientProfileId");
     const profiles = relationships
       .filter((entry) => entry.patientProfileId?.status === "active")
-      .map((entry) => ({ profile: entry.patientProfileId, relationship: relationshipView(entry) }));
-    return res.json({ success: true, data: { profiles, entitlement: req.familyCareEntitlement } });
+      .map((entry) => profileResponse(entry.patientProfileId, entry));
+    return res.json({ success: true, data: { profiles } });
   } catch (error) {
     console.error("Family Care list profiles failed:", error.message);
-    return res.status(500).json({ success: false, message: "Unable to load Family Care profiles" });
+    return sendError(res, 500, "FAMILY_CARE_LIST_FAILED", "Unable to load Family Care profiles");
   }
 };
 
 export const createProfile = async (req, res) => {
+  let idempotencyRecord;
   try {
     const patch = profilePatch(req.body || {}, { create: true });
-    const validationError = validateProfilePatch(patch);
-    if (validationError) return res.status(400).json({ success: false, message: validationError });
+    const relationship = asText(req.body?.relationship, 60);
+    const validationFields = validateProfilePatch(patch, { create: true, relationship });
+    if (Object.keys(validationFields).length) {
+      return sendError(res, 400, "VALIDATION_ERROR", "Please correct the highlighted fields.", validationFields);
+    }
+    const idempotencyKey = idempotencyKeyFromRequest(req);
+    if (!validIdempotencyKey(idempotencyKey)) {
+      return sendError(res, 400, "IDEMPOTENCY_KEY_REQUIRED", "A valid Idempotency-Key is required to add a family member.", {
+        idempotencyKey: "Use an opaque key between 8 and 128 characters.",
+      });
+    }
+    const fingerprint = profileFingerprint(patch, relationship);
+    const idempotencyClaim = await claimIdempotencyKey({
+      actorUserId: req.auth.id,
+      key: idempotencyKey,
+      fingerprint,
+    });
+    if (idempotencyClaim.replay) {
+      return res.status(201).json({
+        success: true,
+        message: "Family member added",
+        data: profileResponse(idempotencyClaim.replay.profile, idempotencyClaim.replay.relationship),
+      });
+    }
+    if (idempotencyClaim.error === "conflict") {
+      return sendError(res, 409, "IDEMPOTENCY_KEY_CONFLICT", "This Idempotency-Key was already used for a different request.");
+    }
+    if (idempotencyClaim.error === "failed") {
+      return sendError(res, 409, "IDEMPOTENCY_REQUEST_FAILED", "The previous request with this key did not complete. Retry with a new Idempotency-Key.");
+    }
+    if (idempotencyClaim.error === "in_progress") {
+      return sendError(res, 409, "IDEMPOTENCY_REQUEST_IN_PROGRESS", "This request is still being processed. Please retry shortly with the same Idempotency-Key.");
+    }
+    idempotencyRecord = idempotencyClaim.record;
     const maxProfiles = Math.max(0, req.familyCareEntitlement.limits.maxManagedProfiles);
     const existing = await PatientProfile.countDocuments({ primaryOwnerUserId: req.auth.id, profileType: "managed", status: "active" });
     if (existing >= maxProfiles) {
-      return res.status(403).json({ success: false, code: "MANAGED_PROFILE_LIMIT_REACHED", message: "Your Family Care profile limit has been reached" });
+      idempotencyRecord.status = "failed";
+      idempotencyRecord.failureCode = "MANAGED_PROFILE_LIMIT_REACHED";
+      await idempotencyRecord.save();
+      return sendError(res, 403, "MANAGED_PROFILE_LIMIT_REACHED", "Your Family Care profile limit has been reached");
     }
 
-    const session = await mongoose.startSession();
+    const payload = createProfilePayload({ patch, actorId: req.auth.id, relationship });
     let profile;
+    let ownerRelationship;
+    let transactionUnsupported = false;
+    let session;
     try {
+      session = await mongoose.startSession();
       await session.withTransaction(async () => {
-        [profile] = await PatientProfile.create([{
-          ...patch,
-          primaryOwnerUserId: req.auth.id,
-          profileType: "managed",
-          consent: { status: "not_required", capturedAt: new Date(), capturedBy: req.auth.id, version: asText(req.body?.consentVersion, 40) || "1.0" },
-          createdBy: req.auth.id,
-          updatedBy: req.auth.id,
-        }], { session });
-        await CareRelationship.create([{
+        [profile] = await PatientProfile.create([payload], { session });
+        [ownerRelationship] = await CareRelationship.create([
+          relationshipPayload({ profileId: profile._id, actorId: req.auth.id, relationship }),
+        ], { session });
+        await completeIdempotency(idempotencyRecord, profile, ownerRelationship, { session });
+      });
+    } catch (error) {
+      if (!isTransactionUnsupported(error)) throw error;
+      transactionUnsupported = true;
+    } finally {
+      if (session) await session.endSession();
+    }
+
+    if (transactionUnsupported) {
+      profile = await PatientProfile.create({ ...payload, status: "pending" });
+      await FamilyCareIdempotencyKey.updateOne(
+        { _id: idempotencyRecord._id },
+        { $set: { patientProfileId: profile._id } },
+      );
+      try {
+        ownerRelationship = await CareRelationship.create(
+          relationshipPayload({ profileId: profile._id, actorId: req.auth.id, relationship }),
+        );
+        profile.status = "active";
+        await profile.save();
+        await completeIdempotency(idempotencyRecord, profile, ownerRelationship);
+      } catch (relationshipError) {
+        const recoveredRelationship = await CareRelationship.findOne({
           patientProfileId: profile._id,
           caregiverUserId: req.auth.id,
-          relationship: asText(req.body?.relationship, 60) || "guardian",
           role: "owner",
-          permissions: permissionsForRole("owner"),
           status: "active",
-          acceptedAt: new Date(),
-        }], { session });
-      });
-    } finally {
-      await session.endSession();
+        });
+        if (recoveredRelationship) {
+          ownerRelationship = recoveredRelationship;
+          profile.status = "active";
+          await profile.save();
+          await completeIdempotency(idempotencyRecord, profile, ownerRelationship);
+        } else {
+          let deletedPendingProfile = false;
+          try {
+            const cleanup = await PatientProfile.deleteOne({ _id: profile._id, status: "pending" });
+            deletedPendingProfile = Boolean(cleanup?.deletedCount);
+          } catch (_) {
+            // Preserve a non-active record for follow-up if cleanup itself is unavailable.
+          }
+          if (!deletedPendingProfile) {
+            profile.status = "creation_failed";
+            await profile.save().catch(() => undefined);
+          }
+          idempotencyRecord.status = "failed";
+          idempotencyRecord.failureCode = "FAMILY_CARE_RELATIONSHIP_CREATE_FAILED";
+          await idempotencyRecord.save();
+          throw relationshipError;
+        }
+      }
     }
     await writeAuditLog({ req, action: "family_profile_created", resourceType: "PatientProfile", resourceId: profile._id, patientProfileId: profile._id, statusCode: 201 });
-    return res.status(201).json({ success: true, message: "Family member added", data: { profile } });
+    return res.status(201).json({
+      success: true,
+      message: "Family member added",
+      data: profileResponse(profile, ownerRelationship),
+    });
   } catch (error) {
     console.error("Family Care create profile failed:", error.message);
-    return res.status(500).json({ success: false, message: "Unable to create patient profile" });
+    if (idempotencyRecord && idempotencyRecord.status === "in_progress") {
+      idempotencyRecord.status = "failed";
+      idempotencyRecord.failureCode = "FAMILY_CARE_CREATE_FAILED";
+      await idempotencyRecord.save().catch(() => {});
+    }
+    return sendError(res, 500, "FAMILY_CARE_CREATE_FAILED", "Unable to create patient profile");
   }
 };
 
 export const getProfile = async (req, res) => {
   await writeAuditLog({ req, action: "family_profile_viewed", resourceType: "PatientProfile", resourceId: req.patientProfile._id, patientProfileId: req.patientProfile._id });
-  return res.json({ success: true, data: { profile: req.patientProfile, relationship: relationshipView(req.careRelationship) } });
+  return res.json({ success: true, data: profileResponse(req.patientProfile, req.careRelationship) });
 };
 
 export const updateProfile = async (req, res) => {
   try {
     const patch = profilePatch(req.body || {});
-    if (!Object.keys(patch).length) return res.status(400).json({ success: false, message: "No supported profile fields supplied" });
-    const validationError = validateProfilePatch({ displayName: patch.displayName || req.patientProfile.displayName, ...patch });
-    if (validationError) return res.status(400).json({ success: false, message: validationError });
+    const hasRelationshipUpdate = req.body?.relationship !== undefined;
+    if (!Object.keys(patch).length && !hasRelationshipUpdate) {
+      return sendError(res, 400, "VALIDATION_ERROR", "No supported profile fields supplied.");
+    }
+    const validationFields = validateProfilePatch({ ...asPlain(req.patientProfile), ...patch }, {
+      relationship: hasRelationshipUpdate ? asText(req.body.relationship, 60) : req.careRelationship.relationship,
+    });
+    if (Object.keys(validationFields).length) {
+      return sendError(res, 400, "VALIDATION_ERROR", "Please correct the highlighted fields.", validationFields);
+    }
+    if (hasRelationshipUpdate && req.careRelationship.role !== "owner") {
+      return sendError(res, 403, "PROFILE_OWNER_REQUIRED", "Only the profile owner can change the relationship label.");
+    }
     Object.assign(req.patientProfile, patch, { updatedBy: req.auth.id });
     await req.patientProfile.save();
+    if (hasRelationshipUpdate) {
+      req.careRelationship.relationship = asText(req.body.relationship, 60);
+      await req.careRelationship.save();
+    }
     await writeAuditLog({ req, action: "family_profile_updated", resourceType: "PatientProfile", resourceId: req.patientProfile._id, patientProfileId: req.patientProfile._id });
-    return res.json({ success: true, message: "Profile updated", data: { profile: req.patientProfile } });
+    return res.json({ success: true, message: "Profile updated", data: profileResponse(req.patientProfile, req.careRelationship) });
   } catch (error) {
     console.error("Family Care update profile failed:", error.message);
-    return res.status(500).json({ success: false, message: "Unable to update patient profile" });
+    return sendError(res, 500, "FAMILY_CARE_UPDATE_FAILED", "Unable to update patient profile");
   }
 };
 
 export const archiveProfile = async (req, res) => {
-  if (req.patientProfile.profileType === "self") return res.status(409).json({ success: false, code: "SELF_PROFILE_ARCHIVE_FORBIDDEN", message: "Your self profile cannot be archived" });
+  if (req.patientProfile.profileType === "self") return sendError(res, 409, "SELF_PROFILE_ARCHIVE_FORBIDDEN", "Your self profile cannot be archived");
+  if (req.patientProfile.status === "archived") {
+    return res.json({ success: true, message: "Profile already archived", data: { profile: profileView(req.patientProfile, req.careRelationship) } });
+  }
+  if (req.patientProfile.status !== "active") return sendError(res, 409, "PROFILE_NOT_ACTIVE", "Only active profiles can be archived.");
   req.patientProfile.status = "archived";
   req.patientProfile.updatedBy = req.auth.id;
   await req.patientProfile.save();
   await CareRelationship.updateMany({ patientProfileId: req.patientProfile._id, status: { $ne: "revoked" } }, { $set: { status: "revoked", revokedAt: new Date() } });
   await writeAuditLog({ req, action: "family_profile_archived", resourceType: "PatientProfile", resourceId: req.patientProfile._id, patientProfileId: req.patientProfile._id });
-  return res.json({ success: true, message: "Profile archived" });
+  return res.json({ success: true, message: "Profile archived", data: { profile: profileView(req.patientProfile, req.careRelationship) } });
 };
 
 export const listCaregivers = async (req, res) => {
@@ -288,9 +572,10 @@ export const dashboard = async (req, res) => {
     const requestedDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || "")) ? String(req.query.date) : new Date().toISOString().slice(0, 10);
     const start = new Date(`${requestedDate}T00:00:00.000Z`);
     const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
-    const [appointments, documents] = await Promise.all([
+    const [appointments, documents, doseEvents] = await Promise.all([
       Appointment.find({ $or: [{ patientProfileId: { $in: profileIds } }, { patientProfileId: null, patientId: { $in: identityIds } }], appointmentDate: { $gte: start }, status: { $in: ["scheduled", "confirmed", "rescheduled"] } }).sort({ appointmentDate: 1 }).lean(),
       Document.find({ $or: [{ patientProfileId: { $in: profileIds } }, { patientProfileId: null, userId: { $in: identityIds } }] }).sort({ uploadedAt: -1 }).limit(Math.max(profileIds.length * 5, 5)).lean(),
+      MedicationDoseEvent.find({ patientProfileId: { $in: profileIds }, originalLocalDate: requestedDate }).lean(),
     ]);
     const entries = active.map((entry) => {
       const profile = entry.patientProfileId;
@@ -299,16 +584,34 @@ export const dashboard = async (req, res) => {
       const owns = (item) => String(item.patientProfileId || "") === id || (!item.patientProfileId && legacyId && String(item.patientId || item.userId || "") === legacyId);
       const profileAppointments = appointments.filter(owns);
       const today = profileAppointments.filter((item) => item.appointmentDate >= start && item.appointmentDate < end);
+      const profileDoses = doseEvents.filter((item) => String(item.patientProfileId) === id);
+      const nextDose = profileDoses
+        .filter((item) => ["pending", "due", "snoozed"].includes(item.status))
+        .sort((left, right) => new Date(left.scheduledAt) - new Date(right.scheduledAt))[0] || null;
+      const medicationStatus = {
+        state: profileDoses.some((item) => item.status === "missed") ? "attention" : (nextDose ? "scheduled" : "no_data"),
+        scheduled: profileDoses.length,
+        taken: profileDoses.filter((item) => item.status === "taken").length,
+        missed: profileDoses.filter((item) => item.status === "missed").length,
+        nextDose: nextDose ? {
+          id: String(nextDose._id),
+          scheduledAt: nextDose.scheduledAt,
+          status: nextDose.status,
+        } : null,
+      };
       return {
-        profile,
+        profile: profileView(profile, entry),
         permissions: entry.permissions,
-        medicationStatus: { state: "no_data", scheduled: 0, taken: 0, missed: 0, nextDose: null },
+        medicationStatus,
         appointments: { today, upcoming: profileAppointments.filter((item) => item.appointmentDate >= end).slice(0, 5) },
         alerts: [], vaccinationsDue: [], insuranceExpiring: [],
         recentDocuments: entry.permissions.documentsView ? documents.filter(owns).slice(0, 5) : [],
       };
     });
-    return res.json({ success: true, data: { date: requestedDate, timezone: asText(req.query.timezone, 80) || "Asia/Kolkata", profiles: entries, familyAlerts: [], summary: { profiles: entries.length, appointmentsToday: entries.reduce((sum, item) => sum + item.appointments.today.length, 0), medicationState: "no_data" } } });
+    const summaryMedicationState = entries.some((item) => item.medicationStatus.state === "attention")
+      ? "attention"
+      : entries.some((item) => item.medicationStatus.state === "scheduled") ? "scheduled" : "no_data";
+    return res.json({ success: true, data: { date: requestedDate, timezone: asText(req.query.timezone, 80) || "Asia/Kolkata", profiles: entries, familyAlerts: [], summary: { profiles: entries.length, appointmentsToday: entries.reduce((sum, item) => sum + item.appointments.today.length, 0), medicationState: summaryMedicationState } } });
   } catch (error) {
     console.error("Family Care dashboard failed:", error.message);
     return res.status(500).json({ success: false, message: "Unable to load Family Care dashboard" });

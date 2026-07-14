@@ -280,6 +280,19 @@ app.use("/api/v1", inventoryRoutes);
 app.use("/api/v1", storeRoutes);
 app.use("/api/v1/nearby", nearbyRoutes);
 
+// Keep API failures on the HTTP contract.  In particular, do not let a
+// controller that calls `next(error)` drop a mobile client's connection
+// before its response headers are written.
+app.use((error, _req, res, _next) => {
+  console.error("Unhandled API request error:", error?.message || error);
+  if (res.headersSent) return;
+  res.status(error?.statusCode || error?.status || 500).json({
+    success: false,
+    code: error?.code || "INTERNAL_SERVER_ERROR",
+    message: "The request could not be completed. Please try again.",
+  });
+});
+
 // -------------------- Health Check --------------------
 app.get("/health", (req, res) =>
   res.json({

@@ -18,6 +18,10 @@ import { User } from '../models/User.js';
 import { checkSession } from '../middleware/checkSession.js';
 import { checkRole, requireOwnerOrRoles } from '../middleware/rbac.js';
 import { auditTrail } from '../middleware/auditLogger.js';
+import {
+  getFamilyProfileAccessControls,
+  updateFamilyProfileAccessControls,
+} from "../controllers/familyProfileAccessControlsController.js";
 
 const router = express.Router();
 
@@ -32,6 +36,11 @@ router.put('/fcm-token', auth, fcmLimiter, fcmTokenValidation, updateFCMToken);
 
 // @route   PUT /api/users/location  (opt-in last known location for nearby alerts)
 router.put('/location', auth, updateUserLocation);
+
+// Access-request controls are available even before a user has a Family Care
+// entitlement, so every patient can keep the default fail-closed policy.
+router.get('/family-profile-access-controls', auth, getFamilyProfileAccessControls);
+router.patch('/family-profile-access-controls', auth, updateFamilyProfileAccessControls);
 
 // @route   GET /api/users/:id/medical-card
 router.get(

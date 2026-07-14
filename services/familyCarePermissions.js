@@ -7,6 +7,7 @@ export const ROLE_PERMISSIONS = Object.freeze({
   primaryCaregiver: Object.freeze({
     ...all(true),
     caregiverManagement: false,
+    caregiversManage: false,
   }),
   secondaryCaregiver: Object.freeze({
     ...all(false),
@@ -23,6 +24,7 @@ export const ROLE_PERMISSIONS = Object.freeze({
     vaccinationView: true,
     insuranceView: true,
     insightsView: true,
+    profileContextSwitch: true,
   }),
   viewer: Object.freeze({
     ...all(false),
@@ -34,6 +36,7 @@ export const ROLE_PERMISSIONS = Object.freeze({
     vaccinationView: true,
     insuranceView: true,
     insightsView: true,
+    profileContextSwitch: true,
   }),
   emergencyContact: Object.freeze({
     ...all(false),
@@ -50,3 +53,17 @@ export const sanitizePermissions = (input = {}, role = "viewer") => {
 };
 
 export const permissionsForRole = (role) => ({ ...(ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.viewer) });
+
+// Permissions are always the intersection of the role ceiling, the requested
+// set, and (when supplied) the actor's currently granted permissions. This
+// prevents a caregiver from delegating access they do not possess.
+export const restrictPermissionsToActor = (input = {}, role = "viewer", actorPermissions = null) => {
+  const rolePermissions = sanitizePermissions(input, role);
+  if (!actorPermissions) return rolePermissions;
+  return Object.fromEntries(
+    CARE_PERMISSION_KEYS.map((key) => [
+      key,
+      rolePermissions[key] === true && actorPermissions[key] === true,
+    ]),
+  );
+};
