@@ -29,6 +29,12 @@ const directMessageSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       required: true,
     },
+    clientMessageId: {
+      type: String,
+      required: true,
+      trim: true,
+      maxlength: 128,
+    },
     recipientRole: {
       type: String,
       enum: ["doctor", "patient"],
@@ -71,6 +77,14 @@ directMessageSchema.index({
   readByRecipient: 1,
   createdAt: -1,
 });
+// Idempotency: a retried send from the same sender with the same
+// client-generated ID must resolve to the original message, never a
+// duplicate row. Scoped by conversation (doctorId+patientId) rather than a
+// separate conversationId since none exists on this flat model.
+directMessageSchema.index(
+  { doctorId: 1, patientId: 1, senderId: 1, clientMessageId: 1 },
+  { unique: true, name: "uniq_conversation_sender_clientMessageId" }
+);
 
 export const DirectMessage = mongoose.model(
   "DirectMessage",

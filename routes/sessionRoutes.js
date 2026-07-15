@@ -12,6 +12,7 @@ import { BUCKET_NAME } from "../config/s3.js";
 import { generateSignedUrl } from "../utils/s3Utils.js";
 import { RefreshToken } from "../models/RefreshToken.js";
 import { emitNewDirectMessage } from "../services/chatPresenceRealtime.js";
+import { resolveDoctorPatientLink } from "../services/doctorPatientLink.js";
 
 const router = express.Router();
 const ENABLE_DEBUG_ROUTES =
@@ -109,55 +110,6 @@ const buildDoctorSummary = async (doctor) => {
   };
 };
 
-const resolveDoctorPatientLink = async ({ doctorId, patientId }) => {
-  if (!isValidObjectId(doctorId) || !isValidObjectId(patientId)) {
-    return {
-      linkedSession: null,
-      linkedAppointment: null,
-      relationType: "",
-      relationId: "",
-    };
-  }
-
-  const normalizedDoctorId = asText(doctorId);
-  const normalizedPatientId = asText(patientId);
-  const patientIdVariants = [normalizedPatientId];
-
-  const linkedSession = await Session.findOne({
-    doctorId: normalizedDoctorId,
-    patientId: normalizedPatientId,
-    status: { $in: ["pending", "accepted", "ended", "declined"] },
-  })
-    .sort({ createdAt: -1 })
-    .select("_id status createdAt")
-    .lean();
-
-  const linkedAppointment = linkedSession
-    ? null
-    : await Appointment.findOne({
-        doctorId: normalizedDoctorId,
-        patientId: { $in: patientIdVariants },
-      })
-        .sort({ appointmentDate: -1, createdAt: -1 })
-        .select("_id appointmentDate createdAt")
-        .lean();
-
-  return {
-    linkedSession,
-    linkedAppointment,
-    relationType: linkedSession
-      ? "session"
-      : linkedAppointment
-      ? "appointment"
-      : "",
-    relationId: linkedSession
-      ? linkedSession._id.toString()
-      : linkedAppointment
-      ? linkedAppointment._id.toString()
-      : "",
-  };
-};
-
 const sendDirectMessageToRecipient = async ({
   recipientRole,
   recipientId,
@@ -166,11 +118,23 @@ const sendDirectMessageToRecipient = async ({
   payload,
 }) => {
   if (recipientRole === "doctor") {
-    await sendNotificationToDoctor(recipientId, title, body, payload);
-    return;
+    return sendNotificationToDoctor(recipientId, title, body, payload);
   }
-  await sendNotification(recipientId, title, body, payload);
+  return sendNotification(recipientId, title, body, payload);
 };
+
+const toChatMessagePayload = (directMessage, { doctorId, patientId, sessionId }) => ({
+  id: directMessage._id.toString(),
+  doctorId,
+  patientId,
+  sessionId: sessionId || (directMessage.sessionId ? directMessage.sessionId.toString() : ""),
+  clientMessageId: directMessage.clientMessageId,
+  senderRole: directMessage.senderRole,
+  senderId: directMessage.senderId.toString(),
+  message: directMessage.message,
+  createdAt: directMessage.createdAt,
+  readByRecipient: directMessage.readByRecipient,
+});
 
 const dispatchDirectMessage = async ({
   senderRole,
@@ -180,12 +144,19 @@ const dispatchDirectMessage = async ({
   sessionId,
   senderName,
   counterpartName,
+  clientMessageId,
 }) => {
   const normalizedSenderRole = asText(senderRole).toLowerCase();
   const normalizedSenderId = asText(senderId);
   const normalizedCounterpartId = asText(counterpartId);
   const normalizedMessage = asText(message);
   const normalizedSessionId = asText(sessionId);
+  // Fall back to a server-generated ID only for callers that predate the
+  // clientMessageId contract (e.g. not-yet-updated app builds); retries from
+  // such callers cannot be deduplicated since no stable client ID exists.
+  const normalizedClientMessageId =
+    asText(clientMessageId) ||
+    `server_${new mongoose.Types.ObjectId().toString()}`;
 
   if (!["doctor", "patient"].includes(normalizedSenderRole)) {
     return {
@@ -243,22 +214,69 @@ const dispatchDirectMessage = async ({
     relation.relationId ||
     "";
 
-  const directMessage = await DirectMessage.create({
-    doctorId: asObjectId(doctorId),
-    patientId: asObjectId(patientId),
-    ...(isValidObjectId(resolvedSessionId)
-      ? { sessionId: asObjectId(resolvedSessionId) }
-      : {}),
-    senderRole: normalizedSenderRole,
-    senderId: asObjectId(normalizedSenderId),
-    recipientRole,
-    recipientId: asObjectId(recipientId),
-    message: normalizedMessage,
-    readByRecipient: false,
-    metadata: {
+  let directMessage;
+  let isRetryOfExisting = false;
+  try {
+    directMessage = await DirectMessage.create({
+      doctorId: asObjectId(doctorId),
+      patientId: asObjectId(patientId),
+      ...(isValidObjectId(resolvedSessionId)
+        ? { sessionId: asObjectId(resolvedSessionId) }
+        : {}),
+      senderRole: normalizedSenderRole,
+      senderId: asObjectId(normalizedSenderId),
+      clientMessageId: normalizedClientMessageId,
+      recipientRole,
+      recipientId: asObjectId(recipientId),
+      message: normalizedMessage,
+      readByRecipient: false,
+      metadata: {
+        relationType: relation.relationType || "session",
+      },
+    });
+  } catch (error) {
+    // Duplicate key on {doctorId, patientId, senderId, clientMessageId}:
+    // this is a retried send (network timeout, client re-submit, etc.) of a
+    // message that was already persisted. Return the original message
+    // instead of creating a duplicate or erroring — retry must be a no-op.
+    if (error?.code === 11000) {
+      const existing = await DirectMessage.findOne({
+        doctorId: asObjectId(doctorId),
+        patientId: asObjectId(patientId),
+        senderId: asObjectId(normalizedSenderId),
+        clientMessageId: normalizedClientMessageId,
+      });
+      if (!existing) throw error;
+      directMessage = existing;
+      isRetryOfExisting = true;
+    } else {
+      throw error;
+    }
+  }
+
+  if (isRetryOfExisting) {
+    // Already persisted and already notified/emitted on the original
+    // attempt — re-emitting here would duplicate the socket push and FCM
+    // notification. Just hand back the existing message so the client can
+    // reconcile its optimistic entry.
+    return {
+      success: true,
+      status: 200,
       relationType: relation.relationType || "session",
-    },
-  });
+      relationId: relation.relationId,
+      chatMessage: toChatMessagePayload(directMessage, {
+        doctorId,
+        patientId,
+        sessionId: resolvedSessionId,
+      }),
+      notificationId: null,
+      counterpartName: resolveParticipantName(
+        { name: counterpartName },
+        normalizedSenderRole === "doctor" ? "Patient" : "Doctor"
+      ),
+      deduped: true,
+    };
+  }
 
   emitNewDirectMessage({
     recipientId,
@@ -267,6 +285,7 @@ const dispatchDirectMessage = async ({
       senderId: normalizedSenderId,
       senderRole: normalizedSenderRole,
       message: normalizedMessage,
+      clientMessageId: normalizedClientMessageId,
       createdAt: directMessage.createdAt,
     },
   });
@@ -312,13 +331,22 @@ const dispatchDirectMessage = async ({
     senderRole: normalizedSenderRole,
   });
 
-  await sendDirectMessageToRecipient({
+  const pushDelivered = await sendDirectMessageToRecipient({
     recipientRole,
     recipientId,
     title: notificationTitle,
     body: normalizedMessage,
     payload: notificationPayload,
   });
+  if (!pushDelivered) {
+    // Not fatal to the send (the message and in-app Notification/SSE
+    // broadcast below already succeeded) but worth a distinct, greppable
+    // log line tied to the exact message — sendNotification/
+    // sendNotificationToDoctor already logged the underlying reason.
+    console.warn(
+      `⚠️ [DIRECT_MESSAGE] Push not delivered for message ${directMessage._id.toString()} (recipient ${recipientRole} ${recipientId})`
+    );
+  }
 
   await broadcastNotification(notification);
 
@@ -327,19 +355,15 @@ const dispatchDirectMessage = async ({
     status: 200,
     relationType: relation.relationType || "session",
     relationId: relation.relationId,
-    chatMessage: {
-      id: directMessage._id.toString(),
+    chatMessage: toChatMessagePayload(directMessage, {
       doctorId,
       patientId,
       sessionId: resolvedSessionId,
-      senderRole: normalizedSenderRole,
-      senderId: normalizedSenderId,
-      message: normalizedMessage,
-      createdAt: directMessage.createdAt,
-      readByRecipient: directMessage.readByRecipient,
-    },
+    }),
     notificationId: notification._id.toString(),
     counterpartName: finalCounterpartName,
+    deduped: false,
+    pushDelivered,
   };
 };
 
@@ -940,6 +964,7 @@ router.get("/chat/messages/:counterpartId", async (req, res) => {
       doctorId: asText(entry.doctorId),
       patientId: asText(entry.patientId),
       sessionId: asText(entry.sessionId),
+      clientMessageId: asText(entry.clientMessageId),
       senderRole: asText(entry.senderRole).toLowerCase(),
       senderId: asText(entry.senderId),
       recipientRole: asText(entry.recipientRole).toLowerCase(),
@@ -993,6 +1018,7 @@ router.post("/chat/send", async (req, res) => {
     );
     const text = asText(req.body.message);
     const sessionId = asText(req.body.sessionId);
+    const clientMessageId = asText(req.body.clientMessageId);
 
     const senderProfile =
       role === "doctor"
@@ -1018,6 +1044,7 @@ router.post("/chat/send", async (req, res) => {
       counterpartId,
       message: text,
       sessionId,
+      clientMessageId,
       senderName: resolveParticipantName(senderProfile, role),
       counterpartName: resolveParticipantName(
         counterpartProfile,
@@ -1039,6 +1066,7 @@ router.post("/chat/send", async (req, res) => {
       relationId: dispatch.relationId,
       notificationId: dispatch.notificationId,
       chatMessage: dispatch.chatMessage,
+      deduped: dispatch.deduped === true,
     });
   } catch (error) {
     console.error("Send direct chat message error:", error);
@@ -1065,6 +1093,7 @@ router.post("/chat-doctor", async (req, res) => {
     const doctorName = asText(req.body.doctorName);
     const text = asText(req.body.message);
     const sessionId = asText(req.body.sessionId);
+    const clientMessageId = asText(req.body.clientMessageId);
 
     const dispatch = await dispatchDirectMessage({
       senderRole: "patient",
@@ -1072,6 +1101,7 @@ router.post("/chat-doctor", async (req, res) => {
       counterpartId: doctorId,
       message: text,
       sessionId,
+      clientMessageId,
       senderName: resolveParticipantName(req.user, "Patient"),
       counterpartName: doctorName || "Doctor",
     });
@@ -1088,6 +1118,7 @@ router.post("/chat-doctor", async (req, res) => {
       message: `Message sent to Dr. ${dispatch.counterpartName}`,
       notificationId: dispatch.notificationId,
       chatMessage: dispatch.chatMessage,
+      deduped: dispatch.deduped === true,
     });
   } catch (error) {
     console.error("Chat doctor error:", error);

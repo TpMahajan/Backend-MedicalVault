@@ -9,6 +9,27 @@ if (!firebaseInitialized) {
   console.warn('⚠️ Firebase not initialized - push notifications will be disabled');
 }
 
+// FCM error codes that mean the token itself is permanently dead (app
+// uninstalled, token rotated/invalidated, etc) rather than a transient
+// failure. Any other error (network blip, quota) is left alone so a
+// working token is never cleared on a temporary hiccup.
+const STALE_TOKEN_ERROR_CODES = new Set([
+  "messaging/registration-token-not-registered",
+  "messaging/invalid-registration-token",
+  "messaging/invalid-argument",
+]);
+
+const clearStaleFcmToken = async (Model, id, currentToken) => {
+  try {
+    await Model.updateOne(
+      { _id: id, fcmToken: currentToken },
+      { $set: { fcmToken: null } }
+    );
+  } catch (error) {
+    console.error(`⚠️ Failed to clear stale FCM token for ${Model.modelName} ${id}:`, error.message);
+  }
+};
+
 /**
  * Send notification to a user by their ID
  * @param {string} userId - The user ID to send notification to
@@ -18,21 +39,22 @@ if (!firebaseInitialized) {
  * @returns {Promise<boolean>} - Success status
  */
 async function sendNotification(userId, title, body, data = {}) {
+  const notificationType = data?.type || "notification";
   try {
     // Check if Firebase is initialized
     if (!firebaseInitialized) {
-      console.log(`⚠️ Firebase not initialized - skipping notification to user ${userId}`);
+      console.log(`⚠️ [${notificationType}] Firebase not initialized - skipping notification to user ${userId}`);
       return false;
     }
 
     // Find the user and get their FCM token
     const user = await User.findById(userId);
     if (!user || !user.fcmToken) {
-      console.log(`⚠️ User ${userId} not found or no FCM token available`);
+      console.log(`⚠️ [${notificationType}] User ${userId} not found or no FCM token registered - push cannot be delivered`);
       return false;
     }
 
-    console.log(`📱 Sending notification to user: ${user.name || user.email}`);
+    console.log(`📱 [${notificationType}] Sending notification to user: ${user.name || user.email} (${userId})`);
 
     // Send the push notification
     const result = await sendPushNotification(
@@ -42,14 +64,18 @@ async function sendNotification(userId, title, body, data = {}) {
     );
 
     if (result.success) {
-      console.log(`✅ Notification sent successfully to: ${user.email || user._id}`);
+      console.log(`✅ [${notificationType}] Notification sent successfully to: ${user.email || user._id}`);
       return true;
-    } else {
-      console.error(`❌ Notification failed for user ${userId}:`, result.error);
-      return false;
     }
+
+    console.error(`❌ [${notificationType}] Notification failed for user ${userId} (${result.code || "unknown error"}):`, result.error);
+    if (STALE_TOKEN_ERROR_CODES.has(result.code)) {
+      console.warn(`🧹 [${notificationType}] Clearing stale FCM token for user ${userId} (${result.code})`);
+      await clearStaleFcmToken(User, userId, user.fcmToken);
+    }
+    return false;
   } catch (error) {
-    console.error(`❌ Error sending notification to user ${userId}:`, error.message);
+    console.error(`❌ [${notificationType}] Error sending notification to user ${userId}:`, error.message);
     return false;
   }
 }
@@ -63,21 +89,22 @@ async function sendNotification(userId, title, body, data = {}) {
  * @returns {Promise<boolean>} - Success status
  */
 async function sendNotificationToDoctor(doctorId, title, body, data = {}) {
+  const notificationType = data?.type || "notification";
   try {
     // Check if Firebase is initialized
     if (!firebaseInitialized) {
-      console.log(`⚠️ Firebase not initialized - skipping notification to doctor ${doctorId}`);
+      console.log(`⚠️ [${notificationType}] Firebase not initialized - skipping notification to doctor ${doctorId}`);
       return false;
     }
 
     // Find the doctor and get their FCM token
     const doctor = await DoctorUser.findById(doctorId);
     if (!doctor || !doctor.fcmToken) {
-      console.log(`⚠️ Doctor ${doctorId} not found or no FCM token available`);
+      console.log(`⚠️ [${notificationType}] Doctor ${doctorId} not found or no FCM token registered - push cannot be delivered`);
       return false;
     }
 
-    console.log(`📱 Sending notification to doctor: ${doctor.name || doctor.email}`);
+    console.log(`📱 [${notificationType}] Sending notification to doctor: ${doctor.name || doctor.email} (${doctorId})`);
 
     // Send the push notification
     const result = await sendPushNotification(
@@ -87,14 +114,18 @@ async function sendNotificationToDoctor(doctorId, title, body, data = {}) {
     );
 
     if (result.success) {
-      console.log(`✅ Notification sent successfully to doctor: ${doctor.email || doctor._id}`);
+      console.log(`✅ [${notificationType}] Notification sent successfully to doctor: ${doctor.email || doctor._id}`);
       return true;
-    } else {
-      console.error(`❌ Notification failed for doctor ${doctorId}:`, result.error);
-      return false;
     }
+
+    console.error(`❌ [${notificationType}] Notification failed for doctor ${doctorId} (${result.code || "unknown error"}):`, result.error);
+    if (STALE_TOKEN_ERROR_CODES.has(result.code)) {
+      console.warn(`🧹 [${notificationType}] Clearing stale FCM token for doctor ${doctorId} (${result.code})`);
+      await clearStaleFcmToken(DoctorUser, doctorId, doctor.fcmToken);
+    }
+    return false;
   } catch (error) {
-    console.error(`❌ Error sending notification to doctor ${doctorId}:`, error.message);
+    console.error(`❌ [${notificationType}] Error sending notification to doctor ${doctorId}:`, error.message);
     return false;
   }
 }

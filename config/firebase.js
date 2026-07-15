@@ -108,8 +108,12 @@ const sendPushNotification = async (token, notification, data = {}) => {
     console.log('✅ Push notification sent:', response);
     return { success: true, messageId: response };
   } catch (error) {
-    console.error('❌ Push notification failed:', error.message);
-    return { success: false, error: error.message };
+    // error.code carries the FCM-specific reason (e.g.
+    // "messaging/registration-token-not-registered" for a stale/uninstalled
+    // token) — callers use this to decide whether to clear the token so a
+    // dead token doesn't silently swallow every future notification.
+    console.error('❌ Push notification failed:', error.code || '(no code)', error.message);
+    return { success: false, error: error.message, code: error.code || null };
   }
 };
 
