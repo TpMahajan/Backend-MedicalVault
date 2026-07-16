@@ -324,9 +324,14 @@ function buildFixtureRepo(
     fs.writeFileSync(path.join(apkOutDir, "app-release.apk"), apkContent);
   }
 
-  // Copy the real canonical script into the fixture so its own __dirname
-  // resolution (repo-relative) works against the fixture tree.
+  // Copy the real canonical script (and its firebase-distribution.mjs
+  // dependency) into the fixture so its own __dirname resolution
+  // (repo-relative) works against the fixture tree.
   fs.copyFileSync(scriptPath, path.join(backendRoot, "scripts", "release-app-update.mjs"));
+  fs.copyFileSync(
+    path.join(__dirname, "firebase-distribution.mjs"),
+    path.join(backendRoot, "scripts", "firebase-distribution.mjs"),
+  );
 
   return { flutterRoot, backendRoot, apkContent };
 }
@@ -603,6 +608,87 @@ describe("release-app-update.mjs prepare (subprocess, disposable fixture repo)",
     } finally {
       fs.rmSync(outsideDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("release-app-update.mjs release/firebase command wiring (subprocess, disposable fixture repo)", () => {
+  it("release without --firebase states Firebase distribution was skipped and does not invoke it", () => {
+    const { backendRoot } = buildFixtureRepo(tmpRoot, { useRealApk: true });
+    const result = runCli(backendRoot, ["release", "--skip-build"]);
+    // No --deploy-render => exit code 2 ("release-pending"), not a failure.
+    expect(result.status).toBe(2);
+    expect(result.stdout).toMatch(/Firebase App Distribution skipped/);
+
+    const reportsDir = path.join(backendRoot, "release-reports", "app-update");
+    const reportFiles = fs.readdirSync(reportsDir);
+    expect(reportFiles.length).toBe(1);
+    const report = JSON.parse(
+      fs.readFileSync(path.join(reportsDir, reportFiles[0]), "utf8"),
+    );
+    expect(report.firebaseDistribution).toEqual({ status: "skipped" });
+  });
+
+  it("release --skip-firebase explicitly states Firebase distribution was skipped", () => {
+    const { backendRoot } = buildFixtureRepo(tmpRoot, { useRealApk: true });
+    const result = runCli(backendRoot, ["release", "--skip-build", "--skip-firebase"]);
+    expect(result.status).toBe(2);
+    expect(result.stdout).toMatch(/Firebase App Distribution explicitly skipped/);
+  });
+
+  it("rejects passing both --firebase and --skip-firebase", () => {
+    const { backendRoot } = buildFixtureRepo(tmpRoot, { useRealApk: true });
+    const result = runCli(backendRoot, [
+      "release",
+      "--skip-build",
+      "--firebase",
+      "--skip-firebase",
+    ]);
+    expect(result.status).not.toBe(0);
+  });
+
+  it("release --firebase fails clearly when Firebase configuration is missing (never invokes a real CLI)", () => {
+    const { backendRoot } = buildFixtureRepo(tmpRoot, { useRealApk: true });
+    const result = runCli(backendRoot, ["release", "--skip-build", "--firebase"], {
+      env: {
+        FIREBASE_ANDROID_APP_ID: "",
+        FIREBASE_DISTRIBUTION_GROUPS: "",
+        FIREBASE_TOKEN: "",
+        GOOGLE_APPLICATION_CREDENTIALS: "",
+      },
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/FIREBASE_CONFIG_INCOMPLETE|FIREBASE_ANDROID_APP_ID/);
+
+    // No release report should exist / be marked successful when Firebase
+    // configuration blocks the upload before it starts.
+    const reportsDir = path.join(backendRoot, "release-reports", "app-update");
+    expect(fs.existsSync(reportsDir)).toBe(false);
+  });
+
+  it("firebase command fails clearly when prepare has not been run yet", () => {
+    const { backendRoot } = buildFixtureRepo(tmpRoot, { useRealApk: true });
+    const result = runCli(backendRoot, ["firebase"], {
+      env: { FIREBASE_ANDROID_APP_ID: "1:123:android:abc", FIREBASE_DISTRIBUTION_GROUPS: "qa" },
+    });
+    expect(result.status).not.toBe(0);
+  });
+
+  it("firebase --dry-run never uploads even with full configuration and a prepared release", () => {
+    const { backendRoot } = buildFixtureRepo(tmpRoot, { useRealApk: true });
+    const prepareResult = runCli(backendRoot, ["prepare"]);
+    expect(prepareResult.status).toBe(0);
+
+    const credsPath = path.join(backendRoot, "fake-creds.json");
+    fs.writeFileSync(credsPath, "{}");
+    const result = runCli(backendRoot, ["firebase", "--dry-run"], {
+      env: {
+        FIREBASE_ANDROID_APP_ID: "1:1234567890:android:abcdef1234567890",
+        FIREBASE_DISTRIBUTION_GROUPS: "qa-team",
+        GOOGLE_APPLICATION_CREDENTIALS: credsPath,
+      },
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toMatch(/dry-run/);
   });
 });
 

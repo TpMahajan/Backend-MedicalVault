@@ -69,6 +69,9 @@ export const buildUserResponse = async (doc) => {
     currentSessionId: plain.currentSessionId ?? "",
     currentDeviceId: plain.currentDeviceId ?? "",
     lastActiveAt: plain.lastActiveAt ?? null,
+    dashboardPreferences: {
+      showTopDoctors: plain.dashboardPreferences?.showTopDoctors !== false,
+    },
   };
 
   if (plain.profilePicture) {

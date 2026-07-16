@@ -33,10 +33,11 @@ import fs from "fs";
 import fsp from "fs/promises";
 import os from "os";
 import path from "path";
-import { execFileSync } from "child_process";
+import { execFileSync, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import http from "http";
 import https from "https";
+import { distributeToFirebase, FirebaseDistributionError } from "./firebase-distribution.mjs";
 
 // ---------------------------------------------------------------------------
 // Path resolution (repository-relative, never CWD-relative)
@@ -131,7 +132,14 @@ function parseArgs(argv) {
       continue;
     }
     const key = token.slice(2);
-    const boolFlags = new Set(["deploy-render", "skip-build", "dry-run"]);
+    const boolFlags = new Set([
+      "deploy-render",
+      "skip-build",
+      "dry-run",
+      "firebase",
+      "skip-firebase",
+      "force-firebase-reupload",
+    ]);
     if (boolFlags.has(key)) {
       args[key] = true;
       continue;
@@ -538,10 +546,67 @@ async function resolveReleaseNotes(args) {
   return null; // caller decides whether to preserve existing notes
 }
 
+// ---------------------------------------------------------------------------
+// build command (invokes `flutter build apk --release`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs `flutter build apk --release` in DEFAULT_FLUTTER_ROOT. This is the
+ * only place in the release pipeline that invokes the Flutter toolchain;
+ * `prepare` continues to only verify/copy an already-built APK, so `prepare`
+ * (and therefore all its existing fixture-based tests) is unaffected by
+ * whether a real Flutter SDK is available on the machine running the tests.
+ */
+async function cmdBuild(args) {
+  const dryRun = Boolean(args["dry-run"]);
+  if (dryRun) {
+    log(`[build] --dry-run: would run "flutter build apk --release" in ${DEFAULT_FLUTTER_ROOT}`);
+    return { ok: true, dryRun: true, skipped: false };
+  }
+
+  if (!fs.existsSync(DEFAULT_FLUTTER_ROOT)) {
+    throw new ReleaseToolError(
+      `Flutter project not found at ${DEFAULT_FLUTTER_ROOT}`,
+      { code: "FLUTTER_ROOT_NOT_FOUND" },
+    );
+  }
+
+  log(`[build] Running "flutter build apk --release" in ${DEFAULT_FLUTTER_ROOT}...`);
+  const flutterBin = process.platform === "win32" ? "flutter.bat" : "flutter";
+  const result = spawnSyncFlutterBuild(flutterBin, DEFAULT_FLUTTER_ROOT);
+
+  if (result.error) {
+    throw new ReleaseToolError(
+      `Failed to invoke Flutter (${flutterBin}): ${result.error.message}. ` +
+        `Ensure the Flutter SDK is installed and on PATH, or pass --skip-build ` +
+        `to use an already-built APK.`,
+      { code: "FLUTTER_BUILD_SPAWN_FAILED" },
+    );
+  }
+  if (result.status !== 0) {
+    throw new ReleaseToolError(
+      `"flutter build apk --release" exited with code ${result.status}.`,
+      { code: "FLUTTER_BUILD_FAILED" },
+    );
+  }
+
+  log("[build] Flutter release APK build succeeded.");
+  return { ok: true, dryRun: false, skipped: false };
+}
+
+function spawnSyncFlutterBuild(flutterBin, cwd) {
+  return spawnSync(flutterBin, ["build", "apk", "--release"], {
+    cwd,
+    stdio: "inherit",
+  });
+}
+
 async function cmdPrepare(args) {
   const dryRun = Boolean(args["dry-run"]);
-  const skipBuild = Boolean(args["skip-build"]); // reserved: this tool never invokes `flutter build`
-  void skipBuild;
+  // `prepare` never invokes `flutter build` itself - it only verifies/copies
+  // an already-built APK. --skip-build is accepted here as a no-op so the
+  // same args object can be passed through from `release` without filtering.
+  void args["skip-build"];
 
   const pubspecPath = DEFAULT_PUBSPEC_PATH;
   const { versionName: pubspecVersionName, buildNumber: pubspecBuildNumber } =
@@ -1233,10 +1298,104 @@ async function triggerRenderDeployAndPoll({ remoteBaseUrl, expectedVersion, expe
 }
 
 // ---------------------------------------------------------------------------
-// release command (prepare + optional guarded deploy + optional verify-remote)
+// firebase command (upload the canonical, already-prepared APK)
+// ---------------------------------------------------------------------------
+
+/**
+ * Uploads the canonical APK described by the current app-update.json to
+ * Firebase App Distribution. Requires `prepare` to have already run (or to
+ * have run earlier in the same `release --firebase` invocation) so the
+ * canonical, verified, checksummed APK exists on disk. Never builds or
+ * re-verifies the APK itself - that is release-app-update.mjs's job via
+ * `prepare`.
+ */
+async function cmdFirebase(args, preparedOverride = null) {
+  const dryRun = Boolean(args["dry-run"]);
+  const prepared = preparedOverride || (() => {
+    const config = loadMetadataRaw(DEFAULT_METADATA_PATH);
+    validateMetadataShape(config, DEFAULT_METADATA_PATH);
+    if (!config.apkFileName) {
+      throw new ReleaseToolError(
+        "app-update.json has no apkFileName. Run `prepare` first.",
+        { code: "FIREBASE_NO_PREPARED_RELEASE" },
+      );
+    }
+    return {
+      versionName: config.latestVersion,
+      buildNumber: config.latestBuildNumber,
+      apkFileName: config.apkFileName,
+      sha256: config.sha256,
+      releaseNotes: config.releaseNotes,
+    };
+  })();
+
+  const apkPath = path.join(DEFAULT_APK_DIR, prepared.apkFileName);
+  if (!fs.existsSync(apkPath)) {
+    throw new ReleaseToolError(
+      `Canonical APK not found at ${apkPath}. Run \`prepare\` first; ` +
+        `\`firebase\`/\`release --firebase\` never uploads a different build artifact.`,
+      { code: "FIREBASE_CANONICAL_APK_MISSING" },
+    );
+  }
+
+  // Re-verify the manifest of the exact file being uploaded (belt-and-braces:
+  // `prepare` already verified the source APK, but this asserts the canonical
+  // copy on disk - the one actually uploaded - is a genuine, non-debuggable
+  // release build matching the declared version/build before it ever leaves
+  // this machine).
+  const manifestResult = await verifyApkManifest({
+    apkPath,
+    expectedVersionName: prepared.versionName,
+    expectedBuildNumber: prepared.buildNumber,
+    dryRun,
+  });
+
+  const now = new Date();
+  const gitCommit = safeGitCommit(BACKEND_ROOT);
+
+  const result = await distributeToFirebase({
+    apkPath,
+    packageName: manifestResult.packageName || readAndroidApplicationId(ANDROID_BUILD_GRADLE_PATH),
+    versionName: prepared.versionName,
+    buildNumber: prepared.buildNumber,
+    sha256: prepared.sha256,
+    releaseNotes: args["release-notes"]
+      ? String(args["release-notes"]).replace(/\\n/g, "\n")
+      : prepared.releaseNotes,
+    gitCommit,
+    releasedAtIst: formatIst(now),
+    buildType: "release",
+    releaseReportsDir: DEFAULT_RELEASE_REPORTS_DIR,
+    groupsOverride: args["firebase-groups"],
+    testersOverride: args["firebase-testers"],
+    forceReupload: Boolean(args["force-firebase-reupload"]),
+    dryRun,
+  });
+
+  log("");
+  log("=== firebase distribute: result ===");
+  log(`APK                 : ${apkPath}`);
+  log(`Status              : ${result.status}`);
+  log(`Groups              : ${result.groups || "(none)"}`);
+  log(`Testers             : ${result.testers || "(none)"}`);
+  if (result.firebaseConsoleUri) log(`Console release     : ${result.firebaseConsoleUri}`);
+  if (result.testerUri) log(`Tester release link : ${result.testerUri}`);
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// release command (prepare + optional Firebase distribution + optional
+// guarded Render deploy + optional verify-remote)
 // ---------------------------------------------------------------------------
 
 async function cmdRelease(args) {
+  if (!args["skip-build"] && !args["dry-run"]) {
+    await cmdBuild(args);
+  } else if (args["skip-build"]) {
+    log("[release] --skip-build passed: using an already-built APK.");
+  }
+
   const prepared = await cmdPrepare(args);
   const remoteBaseUrl = args["remote-base-url"]
     ? String(args["remote-base-url"]).trim().replace(/\/+$/, "")
@@ -1244,9 +1403,30 @@ async function cmdRelease(args) {
 
   const report = {
     prepared,
+    firebase: null,
     deploy: null,
     remoteVerification: null,
   };
+
+  const wantsFirebase = Boolean(args.firebase) && !args["skip-firebase"];
+  if (args.firebase && args["skip-firebase"]) {
+    throw new ReleaseToolError(
+      "--firebase and --skip-firebase cannot both be passed.",
+      { code: "FIREBASE_FLAGS_CONFLICT" },
+    );
+  }
+
+  if (wantsFirebase) {
+    const firebaseResult = await cmdFirebase(args, prepared);
+    report.firebase = firebaseResult;
+  } else {
+    log("");
+    log(
+      args["skip-firebase"]
+        ? "Firebase App Distribution explicitly skipped (--skip-firebase)."
+        : "Firebase App Distribution skipped (pass --firebase to upload this release to testers).",
+    );
+  }
 
   if (!args["deploy-render"]) {
     log("");
@@ -1312,6 +1492,17 @@ async function writeReleaseReport(args, report, status) {
     sourceApkPath: report.prepared.sourceApkPath,
     releaseNotes: report.prepared.releaseNotes,
     localVerification: null,
+    firebaseDistribution: report.firebase
+      ? {
+          status: report.firebase.status,
+          androidAppId: report.firebase.androidAppId,
+          groups: report.firebase.groups || null,
+          testers: report.firebase.testers || null,
+          firebaseConsoleUri: report.firebase.firebaseConsoleUri,
+          testerUri: report.firebase.testerUri,
+          uploadedAtIst: report.firebase.status === "uploaded" ? formatIst(now) : null,
+        }
+      : { status: "skipped" },
     deploymentTrigger: report.deploy
       ? { triggered: true, attempts: report.deploy.attempts }
       : { triggered: false, reason: "not requested or not authorized this run" },
@@ -1356,7 +1547,7 @@ async function main() {
 
   if (!command) {
     console.error(
-      "Usage: release-app-update.mjs <prepare|verify-local|verify-remote|release> [options]",
+      "Usage: release-app-update.mjs <build|prepare|firebase|verify-local|verify-remote|release> [options]",
     );
     process.exitCode = 1;
     return;
@@ -1364,8 +1555,14 @@ async function main() {
 
   try {
     switch (command) {
+      case "build":
+        await cmdBuild(args);
+        break;
       case "prepare":
         await cmdPrepare(args);
+        break;
+      case "firebase":
+        await cmdFirebase(args);
         break;
       case "verify-local":
         await cmdVerifyLocal(args);
@@ -1383,7 +1580,7 @@ async function main() {
         process.exitCode = 1;
     }
   } catch (error) {
-    if (error instanceof ReleaseToolError) {
+    if (error instanceof ReleaseToolError || error instanceof FirebaseDistributionError) {
       console.error(`\n[ERROR] ${error.code}: ${error.message}`);
     } else {
       console.error(`\n[ERROR] Unexpected failure: ${error.message}`);
@@ -1429,7 +1626,9 @@ export {
   inspectApkManifest,
   findAndroidSdkTool,
   verifyApkManifest,
+  cmdBuild,
   cmdPrepare,
+  cmdFirebase,
   cmdVerifyLocal,
   cmdVerifyRemote,
   cmdRelease,
@@ -1445,4 +1644,5 @@ export {
   DEFAULT_FLUTTER_APK_PATH,
   DEFAULT_APK_DIR,
   DEFAULT_METADATA_PATH,
+  DEFAULT_RELEASE_REPORTS_DIR,
 };

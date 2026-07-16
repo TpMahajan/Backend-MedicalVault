@@ -182,6 +182,7 @@ export const listConnectionInvitations = async (req, res) => {
 };
 
 export const acceptConnectionInvitation = async (req, res) => {
+ try {
   const invitation = await CareInvitation.findOne({ _id: req.params.invitationId, kind: "connection" });
   if (!invitation || String(invitation.invitedUserId) !== String(req.auth.id)) return res.status(404).json({ success: false, code: "INVITATION_NOT_FOUND", message: "Connection request not found." });
   if (invitation.status === "accepted") {
@@ -204,6 +205,19 @@ export const acceptConnectionInvitation = async (req, res) => {
   await invitation.save();
   await writeAuditLog({ req, action: "family_connection_accepted", resourceType: "CareInvitation", resourceId: invitation._id, patientProfileId: invitation.patientProfileId });
   return res.json({ success: true, data: { connection: relationshipView(relationship) } });
+ } catch (error) {
+  // Duplicate relationship writes can happen during concurrent taps. The
+  // canonical compound relationship index makes this safe and retryable.
+  if (error?.code === 11000) {
+    console.warn(`[family-care] accept conflict user=${String(req.auth?.id || "unknown")} code=11000`);
+    const invitation = await CareInvitation.findOne({ _id: req.params.invitationId, kind: "connection" });
+    const relationship = invitation && await CareRelationship.findOne({ patientProfileId: invitation.patientProfileId, caregiverUserId: invitation.invitedByUserId });
+    if (invitation?.status === "accepted" && relationship) return res.json({ success: true, data: { connection: relationshipView(relationship), replayed: true } });
+    return res.status(409).json({ success: false, code: "CONNECTION_CONFLICT", message: "This connection was updated concurrently. Please refresh and try again." });
+  }
+  console.error(`[family-care] accept failed route=acceptConnectionInvitation user=${String(req.auth?.id || "unknown")} code=${error?.code || "unknown"}`);
+  return res.status(500).json({ success: false, code: "FAMILY_CARE_ACCEPT_FAILED", message: "Unable to accept this request right now." });
+ }
 };
 
 export const declineConnectionInvitation = async (req, res) => {

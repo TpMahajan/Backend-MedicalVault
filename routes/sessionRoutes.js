@@ -6,6 +6,7 @@ import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { Appointment } from "../models/Appointment.js";
 import { DirectMessage } from "../models/DirectMessage.js";
+import { ChatThreadHiddenState } from "../models/ChatThreadHiddenState.js";
 import { sendNotification, sendNotificationToDoctor } from "../utils/notifications.js";
 import { persistSessionHistory } from "../services/sessionHistoryPersistence.js";
 import { BUCKET_NAME } from "../config/s3.js";
@@ -44,7 +45,7 @@ const resolveParticipantName = (participant, fallback) => {
   return "User";
 };
 
-const resolveDoctorAvatarUrl = async (doctor) => {
+const resolveParticipantAvatarUrl = async (doctor) => {
   const raw =
     asText(
       doctor?.profilePictureUrl ||
@@ -87,7 +88,7 @@ const buildDoctorSummary = async (doctor) => {
     };
   }
 
-  const avatarUrl = await resolveDoctorAvatarUrl(doctor);
+  const avatarUrl = await resolveParticipantAvatarUrl(doctor);
   const specialization = resolveDoctorSpecialization(doctor);
   const rawAvatar =
     asText(doctor.profilePicture || doctor.profilePictureUrl || doctor.avatar) ||
@@ -116,11 +117,26 @@ const sendDirectMessageToRecipient = async ({
   title,
   body,
   payload,
+  image,
 }) => {
   if (recipientRole === "doctor") {
-    return sendNotificationToDoctor(recipientId, title, body, payload);
+    return sendNotificationToDoctor(recipientId, title, body, payload, { image });
   }
-  return sendNotification(recipientId, title, body, payload);
+  return sendNotification(recipientId, title, body, payload, { image });
+};
+
+// Returns the requesting principal's own "delete for me" watermark
+// (a DirectMessage _id) for this thread, or null if they've never hidden it.
+// Messages with an _id at or before this watermark are hidden from them.
+const getHiddenWatermark = async ({ doctorId, patientId, role }) => {
+  const state = await ChatThreadHiddenState.findOne({
+    doctorId: asObjectId(doctorId),
+    patientId: asObjectId(patientId),
+    hiddenForRole: role,
+  })
+    .select("hiddenBeforeMessageId")
+    .lean();
+  return state?.hiddenBeforeMessageId || null;
 };
 
 const toChatMessagePayload = (directMessage, { doctorId, patientId, sessionId }) => ({
@@ -304,6 +320,19 @@ const dispatchDirectMessage = async ({
     normalizedSenderRole === "doctor" ? "Patient" : "Doctor"
   );
 
+  // Resolved fresh per send (not cached) so a signed S3 URL is never stale -
+  // the OS fetches a push notification's image shortly after delivery, so a
+  // short-lived signed URL generated at send time is safe.
+  const senderProfileForAvatar =
+    normalizedSenderRole === "doctor"
+      ? await DoctorUser.findById(normalizedSenderId)
+          .select("profilePicture profilePictureUrl avatar avatarUrl")
+          .lean()
+      : await User.findById(normalizedSenderId)
+          .select("profilePicture profilePictureUrl avatar avatarUrl")
+          .lean();
+  const senderAvatarUrl = await resolveParticipantAvatarUrl(senderProfileForAvatar);
+
   const notificationTitle = `New message from ${finalSenderName}`;
   const notificationPayload = {
     type: "DIRECT_MESSAGE",
@@ -315,8 +344,10 @@ const dispatchDirectMessage = async ({
     senderRole: normalizedSenderRole,
     senderId: normalizedSenderId,
     senderName: finalSenderName,
+    senderAvatar: senderAvatarUrl || "",
     counterpartId: normalizedSenderId,
     counterpartRole: normalizedSenderRole,
+    counterpartAvatar: senderAvatarUrl || "",
     recipientRole,
   };
 
@@ -337,6 +368,7 @@ const dispatchDirectMessage = async ({
     title: notificationTitle,
     body: normalizedMessage,
     payload: notificationPayload,
+    image: senderAvatarUrl || undefined,
   });
   if (!pushDelivered) {
     // Not fatal to the send (the message and in-app Notification/SSE
@@ -833,6 +865,7 @@ router.get("/chat/threads", async (req, res) => {
           lastMessage: { $first: "$message" },
           lastSenderRole: { $first: "$senderRole" },
           lastAt: { $first: "$createdAt" },
+          lastMessageId: { $first: "$_id" },
           unreadCount: {
             $sum: {
               $cond: [
@@ -854,7 +887,36 @@ router.get("/chat/threads", async (req, res) => {
       { $limit: 200 },
     ]);
 
-    const counterpartIds = threadsRaw
+    // "Delete for me" watermarks for this principal, keyed by counterpart -
+    // a thread whose last message _id is at or before its own watermark has
+    // had no activity since the delete and is fully hidden from this
+    // principal's thread list; any later message makes the thread reappear.
+    // ObjectIds compare correctly as hex strings (they encode a
+    // monotonically increasing timestamp+counter), so this is exact and
+    // race-free, unlike comparing wall-clock createdAt values.
+    const hiddenStates = await ChatThreadHiddenState.find({
+      [isDoctor ? "doctorId" : "patientId"]: authObjectId,
+      hiddenForRole: role,
+    })
+      .select(isDoctor ? "patientId hiddenBeforeMessageId" : "doctorId hiddenBeforeMessageId")
+      .lean();
+    const hiddenWatermarkByCounterpart = new Map(
+      hiddenStates.map((entry) => [
+        asText(isDoctor ? entry.patientId : entry.doctorId),
+        entry.hiddenBeforeMessageId,
+      ])
+    );
+
+    const visibleThreadsRaw = threadsRaw.filter((thread) => {
+      const counterpartId = asText(thread?._id);
+      const watermark = hiddenWatermarkByCounterpart.get(counterpartId);
+      if (!watermark) return true;
+      const lastMessageId = asText(thread?.lastMessageId);
+      if (!lastMessageId) return false;
+      return lastMessageId > asText(watermark);
+    });
+
+    const counterpartIds = visibleThreadsRaw
       .map((thread) => asText(thread?._id))
       .filter(Boolean)
       .filter((id) => isValidObjectId(id));
@@ -872,12 +934,12 @@ router.get("/chat/threads", async (req, res) => {
     );
 
     const threads = await Promise.all(
-      threadsRaw.map(async (thread) => {
+      visibleThreadsRaw.map(async (thread) => {
         const counterpartId = asText(thread?._id);
         const counterpart = counterpartById.get(counterpartId) || {};
         const counterpartAvatar = isDoctor
           ? asText(counterpart?.profilePicture)
-          : await resolveDoctorAvatarUrl(counterpart);
+          : await resolveParticipantAvatarUrl(counterpart);
 
         return {
           counterpartId,
@@ -951,9 +1013,12 @@ router.get("/chat/messages/:counterpartId", async (req, res) => {
       });
     }
 
+    const hiddenBeforeMessageId = await getHiddenWatermark({ doctorId, patientId, role });
+
     const docs = await DirectMessage.find({
       doctorId: asObjectId(doctorId),
       patientId: asObjectId(patientId),
+      ...(hiddenBeforeMessageId ? { _id: { $gt: hiddenBeforeMessageId } } : {}),
     })
       .sort({ createdAt: -1 })
       .limit(limit)
@@ -1003,6 +1068,102 @@ router.get("/chat/messages/:counterpartId", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to fetch chat messages",
+      error: error.message,
+    });
+  }
+});
+
+// ---------------- Delete Direct Chat Thread ----------------
+// DELETE /api/sessions/chat/threads/:counterpartId
+// body: { mode: "me" | "everyone" }
+router.delete("/chat/threads/:counterpartId", async (req, res) => {
+  try {
+    const role = asText(req.auth?.role).toLowerCase();
+    const authId = asText(req.auth?.id);
+    const counterpartId = asText(req.params.counterpartId);
+    const mode = asText(req.body?.mode).toLowerCase() || "me";
+
+    if (!["doctor", "patient"].includes(role)) {
+      return res.status(403).json({
+        success: false,
+        message: "Only doctors and patients can delete chat threads.",
+      });
+    }
+    if (!isValidObjectId(authId) || !isValidObjectId(counterpartId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid chat participant identifier.",
+      });
+    }
+    if (!["me", "everyone"].includes(mode)) {
+      return res.status(400).json({
+        success: false,
+        message: 'mode must be "me" or "everyone".',
+      });
+    }
+
+    const doctorId = role === "doctor" ? authId : counterpartId;
+    const patientId = role === "doctor" ? counterpartId : authId;
+
+    const relation = await resolveDoctorPatientLink({ doctorId, patientId });
+    if (!relation.linkedSession && !relation.linkedAppointment) {
+      return res.status(403).json({
+        success: false,
+        message: "You can only delete chats for linked doctor-patient pairs.",
+      });
+    }
+
+    if (mode === "everyone") {
+      // Removes the shared conversation for both participants permanently -
+      // unlike "delete for me", this cannot be undone by a new message.
+      const result = await DirectMessage.deleteMany({
+        doctorId: asObjectId(doctorId),
+        patientId: asObjectId(patientId),
+      });
+      await ChatThreadHiddenState.deleteMany({
+        doctorId: asObjectId(doctorId),
+        patientId: asObjectId(patientId),
+      });
+      return res.json({
+        success: true,
+        mode: "everyone",
+        deletedCount: result.deletedCount || 0,
+        message: "Chat deleted for everyone",
+      });
+    }
+
+    // "me": record a watermark rather than touching the shared rows, so the
+    // other participant's view of the conversation is completely unaffected.
+    // The watermark is the most recent existing message's _id, not a
+    // wall-clock timestamp - ObjectIds are monotonically increasing and
+    // unique, so this can never race with a message created "at the same
+    // time" as the delete the way a Date.now() comparison could.
+    const latestMessage = await DirectMessage.findOne({
+      doctorId: asObjectId(doctorId),
+      patientId: asObjectId(patientId),
+    })
+      .sort({ _id: -1 })
+      .select("_id")
+      .lean();
+    await ChatThreadHiddenState.findOneAndUpdate(
+      {
+        doctorId: asObjectId(doctorId),
+        patientId: asObjectId(patientId),
+        hiddenForRole: role,
+      },
+      { $set: { hiddenBeforeMessageId: latestMessage?._id || null } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    return res.json({
+      success: true,
+      mode: "me",
+      message: "Chat deleted",
+    });
+  } catch (error) {
+    console.error("Delete chat thread error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to delete chat thread",
       error: error.message,
     });
   }

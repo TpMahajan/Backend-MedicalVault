@@ -33,7 +33,10 @@ import { InventoryOrder } from "../models/InventoryOrder.js";
 import { SuperAdminActivityLog } from "../models/SuperAdminActivityLog.js";
 import { AdvertisementClickLog } from "../models/AdvertisementClickLog.js";
 import { clearPublicConfigCache } from "./publicConfig.js";
-import { initializeFirebase, sendPushNotification } from "../config/firebase.js";
+import { initializeFirebase } from "../config/firebase.js";
+import * as firebaseConfig from "../config/firebase.js";
+import { deliverNotifications } from "../services/notificationDeliveryService.js";
+import { DeviceToken } from "../models/DeviceToken.js";
 import s3Client, { BUCKET_NAME } from "../config/s3.js";
 import { generateSignedUrl } from "../utils/s3Utils.js";
 import {
@@ -2184,73 +2187,12 @@ router.post(
         .slice(2, 8)}`;
       const recipientDocs = await fetchAudienceRecipients(audience);
 
-      const notificationsPayload = recipientDocs.map((recipient) => ({
-        title: title || "System Notification",
-        body: message,
-        type: "system",
-        data: {
-          type: "SUPERADMIN_NOTIFICATION",
-          broadcastId,
-          audience,
-          platform,
-          priority: normalizedPriority,
-          deepLink,
-          createdAt: now.toISOString(),
-        },
-        recipientId: recipient.id,
-        recipientRole: recipient.role,
-        senderId: req.superAdmin.email,
-        senderRole: "admin",
-      }));
-
-      const createdNotifications = notificationsPayload.length
-        ? await Notification.insertMany(notificationsPayload)
-        : [];
-
-      if (createdNotifications.length > 0) {
-        const { broadcastNotification } = await import(
-          "../controllers/notificationController.js"
-        );
-        await Promise.all(
-          createdNotifications.map((notification) =>
-            broadcastNotification(notification)
-          )
-        );
-      }
-
-      const pushRecipients = recipientDocs.filter(
-        (recipient) => recipient.fcmToken && recipient.fcmToken.trim() !== ""
-      );
-      let pushSuccess = 0;
-      let pushFailed = 0;
-      await Promise.all(
-        pushRecipients.map(async (recipient) => {
-          try {
-            const result = await sendPushNotification(
-              recipient.fcmToken,
-              {
-                title: title || "System Notification",
-                body: message,
-              },
-              {
-                type: "SUPERADMIN_NOTIFICATION",
-                broadcastId,
-                audience,
-                platform,
-                priority: normalizedPriority,
-                deepLink,
-              }
-            );
-            if (result?.success) {
-              pushSuccess += 1;
-            } else {
-              pushFailed += 1;
-            }
-          } catch {
-            pushFailed += 1;
-          }
-        })
-      );
+      const { result: delivery } = await deliverNotifications({
+        recipients: recipientDocs.map((recipient) => ({ userId: recipient.id, role: recipient.role })),
+        title: title || "System Notification", body: message, type: "system",
+        senderId: req.superAdmin.email, senderRole: "admin",
+        data: { type: "SUPERADMIN_NOTIFICATION", broadcastId, audience, platform, priority: normalizedPriority, route: deepLink, deepLink, createdAt: now.toISOString(), idempotencyKey: broadcastId },
+      });
 
       await logActivity(req, {
         action: "BROADCAST_NOTIFICATION",
@@ -2265,9 +2207,14 @@ router.post(
         },
       });
 
-      return res.status(201).json({
-        success: true,
-        message: "Notification sent successfully",
+      const pushCompletelyFailed = delivery.pushAttempted > 0 && delivery.pushSucceeded === 0;
+      const partial = delivery.notificationsCreated !== delivery.recipientsSelected || delivery.pushFailed > 0;
+      return res.status(partial ? 207 : 201).json({
+        success: delivery.notificationsCreated > 0 || delivery.recipientsSelected === 0,
+        partial,
+        message: pushCompletelyFailed
+          ? `In-app notifications created for ${delivery.notificationsCreated} recipients. Push delivered to 0 of ${delivery.pushAttempted} registered devices; ${delivery.pushFailed} failed.`
+          : partial ? "Notification broadcast completed with partial delivery" : "Notification broadcast delivered",
         notification: {
           id: broadcastId,
           title: title || "System Notification",
@@ -2280,10 +2227,8 @@ router.post(
         },
         stats: {
           recipients: recipientDocs.length,
-          notificationsCreated: createdNotifications.length,
-          pushEligible: pushRecipients.length,
-          pushSuccess,
-          pushFailed,
+          ...delivery,
+          pushEligible: delivery.pushAttempted,
         },
       });
     } catch (error) {
@@ -2295,6 +2240,17 @@ router.post(
     }
   }
 );
+
+// Safe operational diagnostic: deliberately contains counts and booleans only.
+router.get("/notifications/health", requireSuperAdminAuth, async (_req, res) => {
+  const [byPlatform, usersWithTokens, totalNotifications] = await Promise.all([
+    DeviceToken.aggregate([{ $match: { enabled: true } }, { $group: { _id: "$platform", count: { $sum: 1 } } }]),
+    DeviceToken.distinct("userId", { enabled: true }),
+    Notification.estimatedDocumentCount(),
+  ]);
+  const tokenPlatforms = Object.fromEntries(byPlatform.map((row) => [row._id, row.count]));
+  res.json({ success: true, data: { firebase: firebaseConfig.firebaseHealth?.() || { initialized: false, projectId: null }, activeTokens: Object.values(tokenPlatforms).reduce((sum, value) => sum + value, 0), tokensByPlatform: tokenPlatforms, usersWithTokens: usersWithTokens.length, databaseNotificationPersistence: totalNotifications >= 0 } });
+});
 
 // ---------------- USER MANAGEMENT ----------------
 router.get("/users", requireSuperAdminAuth, async (req, res) => {
@@ -3676,6 +3632,19 @@ router.put("/family-care-entitlements/:userId", requireSuperAdminAuth, async (re
       subscriptionEndsAt: parseDate(req.body.subscriptionEndsAt, "Subscription end date"),
       limits: { maxManagedProfiles, maxCaregiversPerProfile },
     };
+    // A "trial"/"active" status with enabled=false can never actually grant
+    // access (see familyCareEntitlementService.resolveFamilyCareEntitlementWithConfig)
+    // and almost always means the admin forgot to also tick "Premium access
+    // enabled" - reject it here instead of silently saving a no-op grant.
+    if (!entitlement.enabled && (status === "trial" || status === "active")) {
+      return res.status(400).json({
+        success: false,
+        message:
+          `Status "${status}" requires "enabled" to be true, or this grant will not ` +
+          `actually unlock access. Check "Premium access enabled" or set status to ` +
+          `"expired"/"suspended".`,
+      });
+    }
     const user = await User.findOneAndUpdate(
       { _id: req.params.userId, role: "PATIENT" },
       { $set: { "entitlements.familyCare": entitlement } },

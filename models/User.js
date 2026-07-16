@@ -125,6 +125,11 @@ const UserSchema = new mongoose.Schema(
     allowMultipleSessions: { type: Boolean, default: false },
     profilePicture: { type: String, default: null },
 
+    // 🔹 Dashboard display preferences (per-account, synced across devices)
+    dashboardPreferences: {
+      showTopDoctors: { type: Boolean, default: true },
+    },
+
     // 🔹 Profile Switching fields
     linkedProfiles: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
 

@@ -3,6 +3,8 @@ import { User } from "../models/User.js";
 import { DoctorUser } from "../models/DoctorUser.js";
 import { Notification } from "../models/Notification.js";
 import mongoose from "mongoose";
+import { DeviceToken } from "../models/DeviceToken.js";
+import { deliverNotifications } from "../services/notificationDeliveryService.js";
 
 // Store active SSE connections
 const activeConnections = new Map();
@@ -27,7 +29,7 @@ const buildNotificationScopeFilter = ({ userId, userRole }) => {
 // @access  Private
 export const saveFCMToken = async (req, res) => {
   try {
-    const { fcmToken, userId, role } = req.body;
+    const { fcmToken, platform = "unknown", deviceId } = req.body;
 
     if (!fcmToken) {
       return res.status(400).json({
@@ -36,9 +38,10 @@ export const saveFCMToken = async (req, res) => {
       });
     }
 
-    // Determine which model to use based on role or userId
-    let targetId = userId || req.auth.id;
-    let isDoctor = role === 'doctor' || req.auth.role === 'doctor';
+    // A token can only be registered for the authenticated account. This also
+    // detaches it from a previous account after account switching.
+    const targetId = req.auth.id;
+    const isDoctor = normalizeRole(req.auth.role) === 'doctor';
 
     let user;
     if (isDoctor) {
@@ -62,6 +65,11 @@ export const saveFCMToken = async (req, res) => {
       });
     }
 
+    await DeviceToken.findOneAndUpdate(
+      { token: fcmToken },
+      { $set: { userId: targetId, role: normalizeRole(req.auth.role), platform: ["android", "ios", "web"].includes(String(platform).toLowerCase()) ? String(platform).toLowerCase() : "unknown", deviceId: String(deviceId || "").slice(0, 160) || null, enabled: true, lastSeenAt: new Date() } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
     res.json({
       success: true,
       message: 'FCM token saved successfully',
@@ -329,8 +337,8 @@ export const sendNotification = async (req, res) => {
       });
     }
 
-    // Find user and get FCM token
-    const user = await User.findById(userId).select('fcmToken name');
+    // Find user; in-app persistence does not depend on a registered device.
+    const user = await User.findById(userId).select('name');
 
     if (!user) {
       return res.status(404).json({
@@ -339,50 +347,9 @@ export const sendNotification = async (req, res) => {
       });
     }
 
-    if (!user.fcmToken) {
-      return res.status(400).json({
-        success: false,
-        message: 'User has no FCM token registered'
-      });
-    }
-
-    // Create notification record
-    const notification = new Notification({
-      title,
-      body,
-      type,
-      data,
-      recipientId: userId,
-      recipientRole: 'patient',
-      senderId: req.auth.id,
-      senderRole: req.auth.role
-    });
-
-    await notification.save();
-
-    // Send push notification
-    const result = await sendPushNotification(user.fcmToken, { title, body }, data);
-
-    // Broadcast to SSE connections
-    await broadcastNotification(notification);
-
-    if (result.success) {
-      res.json({
-        success: true,
-        message: 'Notification sent successfully',
-        data: {
-          messageId: result.messageId,
-          recipient: user.name,
-          notificationId: notification._id
-        }
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        message: 'Failed to send notification',
-        error: result.error
-      });
-    }
+    const { result, notifications } = await deliverNotifications({ recipients: [{ userId, role: 'patient' }], title, body, type, data, senderId: req.auth.id, senderRole: req.auth.role });
+    const partial = result.pushFailed > 0;
+    res.status(partial ? 207 : 200).json({ success: result.notificationsCreated === 1, partial, message: partial ? 'In-app notification created; push delivery failed.' : 'Notification delivered', data: { recipient: user.name, notificationId: notifications[0]?._id, delivery: result } });
   } catch (error) {
     console.error('Send notification error:', error);
     res.status(500).json({
@@ -561,6 +528,7 @@ export const getNotificationStream = async (req, res) => {
 
     const connectionId = `${userId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     activeConnections.set(connectionId, { res, userId, userRole });
+    console.info(`[notification-realtime] connected user=${String(userId)} role=${normalizeRole(userRole)}`);
 
     res.write(
       `data: ${JSON.stringify({
@@ -573,6 +541,7 @@ export const getNotificationStream = async (req, res) => {
     req.on("close", () => {
       activeConnections.delete(connectionId);
       clearInterval(heartbeat);
+      console.info(`[notification-realtime] disconnected user=${String(userId)}`);
     });
 
     const heartbeat = setInterval(() => {
@@ -608,18 +577,16 @@ export const getNotificationStream = async (req, res) => {
 // Helper function to broadcast notification to connected clients
 export const broadcastNotification = async (notification) => {
   try {
-    const { recipientId, recipientRole } = notification;
+    const recipientId = String(notification.recipientId);
 
     // Find all active connections for this user
     const userConnections = Array.from(activeConnections.entries())
       .filter(([id, conn]) =>
-        conn.userId === recipientId ||
-        (recipientRole && conn.userRole === recipientRole)
+        String(conn.userId) === recipientId
       );
 
     if (userConnections.length === 0) {
-      console.log(`ðŸ“¡ No active connections for user ${recipientId}`);
-      return;
+      return { delivered: 0, unavailable: true };
     }
 
     // Send notification to all user's connections
@@ -637,16 +604,18 @@ export const broadcastNotification = async (notification) => {
       timestamp: new Date().toISOString()
     };
 
+    let delivered = 0;
     userConnections.forEach(([connectionId, conn]) => {
       try {
         if (!conn.res.destroyed) {
           conn.res.write(`data: ${JSON.stringify(notificationData)}\n\n`);
-          console.log(`ðŸ“¡ Notification sent to connection ${connectionId}`);
+          delivered += 1;
+          console.info(`[notification-realtime] delivered connection=${connectionId}`);
         } else {
           activeConnections.delete(connectionId);
         }
       } catch (error) {
-        console.error(`âŒ Error sending to connection ${connectionId}:`, error);
+        console.error(`[notification-realtime] write failed connection=${connectionId}:`, error.message);
         activeConnections.delete(connectionId);
       }
     });
@@ -655,7 +624,7 @@ export const broadcastNotification = async (notification) => {
     const unreadCount = await Notification.countDocuments({
       $or: [
         { recipientId },
-        { recipientRole }
+        { recipientId }
       ],
       read: false
     });
@@ -672,12 +641,14 @@ export const broadcastNotification = async (notification) => {
           conn.res.write(`data: ${JSON.stringify(unreadCountData)}\n\n`);
         }
       } catch (error) {
-        console.error(`âŒ Error sending unread count to connection ${connectionId}:`, error);
+        console.error(`[notification-realtime] unread write failed connection=${connectionId}:`, error.message);
         activeConnections.delete(connectionId);
       }
     });
+    return { delivered, unavailable: false };
 
   } catch (error) {
-    console.error('âŒ Error broadcasting notification:', error);
+    console.error('[notification-realtime] broadcast failed:', error.message);
+    return { delivered: 0, unavailable: true };
   }
 };

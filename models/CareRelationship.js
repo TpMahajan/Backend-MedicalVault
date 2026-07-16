@@ -46,12 +46,19 @@ const careRelationshipSchema = new mongoose.Schema(
     acceptedAt: { type: Date, default: null },
     revokedAt: { type: Date, default: null },
     expiresAt: { type: Date, default: null },
-    migrationKey: { type: String, default: null, unique: true, sparse: true },
+    // Only legacy/backfill rows have a migration key. Normal relationships
+    // must leave this absent; an unconditional unique index treats null as a
+    // real duplicate value.
+    migrationKey: { type: String, trim: true, default: undefined },
   },
   { timestamps: true },
 );
 
 careRelationshipSchema.index({ patientProfileId: 1, caregiverUserId: 1 }, { unique: true });
+careRelationshipSchema.index(
+  { migrationKey: 1 },
+  { unique: true, partialFilterExpression: { migrationKey: { $type: "string" } }, name: "migrationKey_unique_when_present" },
+);
 careRelationshipSchema.index({ caregiverUserId: 1, status: 1 });
 careRelationshipSchema.index({ patientProfileId: 1, status: 1 });
 

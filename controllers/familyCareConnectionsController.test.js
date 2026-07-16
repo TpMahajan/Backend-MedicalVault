@@ -129,4 +129,74 @@ describe("existing-account Family Care connections", () => {
       expect.objectContaining({ upsert: true }),
     );
   });
+
+  it("recovers from a concurrent duplicate-key conflict (E11000) instead of crashing", async () => {
+    // Regression test for the exact production bug: a stale unique index on
+    // CareRelationship.migrationKey caused the upsert below to throw E11000
+    // on any relationship after the first, and this route previously had no
+    // try/catch at all, so the accept/decline UI saw a raw 500 with no JSON
+    // body (surfacing as FamilyCareApiException in the Flutter app) and
+    // appeared to silently "do nothing".
+    const invitation = {
+      _id: ids.invitation,
+      kind: "connection",
+      invitedUserId: ids.target,
+      invitedByUserId: ids.requester,
+      patientProfileId: ids.profile,
+      intendedRelationship: "daughter",
+      intendedRole: "secondaryCaregiver",
+      intendedPermissions: { profileRead: true, profileContextSwitch: true },
+      status: "pending",
+      expiresAt: new Date(Date.now() + 3600000),
+      save: jest.fn(async function save() { return this; }),
+    };
+    invitationFindOne.mockResolvedValue(invitation);
+    const duplicateKeyError = Object.assign(new Error("E11000 duplicate key error"), { code: 11000 });
+    relationshipFindOneAndUpdate.mockRejectedValue(duplicateKeyError);
+
+    const res = response();
+    await acceptConnectionInvitation({ auth: { id: ids.target }, user: {}, params: { invitationId: ids.invitation } }, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.success).toBe(false);
+    expect(res.body.code).toBe("CONNECTION_CONFLICT");
+  });
+
+  it("replays a successful result when a concurrent tap already accepted the same invitation", async () => {
+    const acceptedInvitation = {
+      _id: ids.invitation,
+      kind: "connection",
+      invitedUserId: ids.target,
+      invitedByUserId: ids.requester,
+      patientProfileId: ids.profile,
+      intendedRelationship: "daughter",
+      intendedRole: "secondaryCaregiver",
+      intendedPermissions: { profileRead: true, profileContextSwitch: true },
+      status: "pending",
+      expiresAt: new Date(Date.now() + 3600000),
+      save: jest.fn(async function save() { this.status = "accepted"; return this; }),
+    };
+    invitationFindOne.mockResolvedValueOnce(acceptedInvitation);
+    const duplicateKeyError = Object.assign(new Error("E11000 duplicate key error"), { code: 11000 });
+    relationshipFindOneAndUpdate.mockRejectedValue(duplicateKeyError);
+    // Second lookup inside the catch block sees the invitation as already
+    // accepted by the concurrent request that "won" the race.
+    invitationFindOne.mockResolvedValueOnce({ ...acceptedInvitation, status: "accepted" });
+    relationshipFindOne.mockResolvedValueOnce({
+      _id: ids.relationship,
+      patientProfileId: ids.profile,
+      caregiverUserId: ids.requester,
+      relationship: "daughter",
+      role: "secondaryCaregiver",
+      permissions: { profileRead: true },
+      status: "active",
+    });
+
+    const res = response();
+    await acceptConnectionInvitation({ auth: { id: ids.target }, user: {}, params: { invitationId: ids.invitation } }, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.replayed).toBe(true);
+  });
 });

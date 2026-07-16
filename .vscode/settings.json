@@ -1,0 +1,9 @@
+{
+  "dart.analysisExcludedFolders": ["node_modules"],
+  "files.watcherExclude": {
+    "**/node_modules/**": true
+  },
+  "search.exclude": {
+    "**/node_modules": true
+  }
+}

@@ -96,13 +96,21 @@ const appointmentFindOneMock = jest.fn(() => ({
 
 const userFindByIdMock = jest.fn(() => ({
   select: () => ({
-    lean: async () => ({ name: "Test Patient", email: "patient@example.com" }),
+    lean: async () => ({
+      name: "Test Patient",
+      email: "patient@example.com",
+      profilePicture: "https://cdn.example.com/patient-avatar.jpg",
+    }),
   }),
 }));
 
 const doctorFindByIdMock = jest.fn(() => ({
   select: () => ({
-    lean: async () => ({ name: "Test Doctor", email: "doctor@example.com" }),
+    lean: async () => ({
+      name: "Test Doctor",
+      email: "doctor@example.com",
+      profilePicture: "https://cdn.example.com/doctor-avatar.jpg",
+    }),
   }),
 }));
 
@@ -319,5 +327,35 @@ describe("POST /api/sessions/chat/send — clientMessageId idempotency", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.chatMessage.clientMessageId).toMatch(/^server_/);
+  });
+
+  it("resolves the sender's avatar and forwards it as the push notification image (WhatsApp-style)", async () => {
+    withAuth({ role: "patient", id: PATIENT_ID });
+
+    await request(app).post("/api/sessions/chat/send").send({
+      counterpartId: DOCTOR_ID,
+      message: "Hello doctor",
+      clientMessageId: "client-msg-avatar",
+    });
+
+    expect(sendNotificationToDoctorMock).toHaveBeenCalledTimes(1);
+    const [, , , payload, options] = sendNotificationToDoctorMock.mock.calls[0];
+    expect(payload.senderAvatar).toBe("https://cdn.example.com/patient-avatar.jpg");
+    expect(options).toEqual({ image: "https://cdn.example.com/patient-avatar.jpg" });
+  });
+
+  it("resolves the doctor's avatar when the doctor is the sender", async () => {
+    withAuth({ role: "doctor", id: DOCTOR_ID });
+
+    await request(app).post("/api/sessions/chat/send").send({
+      counterpartId: PATIENT_ID,
+      message: "Hello patient",
+      clientMessageId: "client-msg-avatar-doctor",
+    });
+
+    expect(sendNotificationMock).toHaveBeenCalledTimes(1);
+    const [, , , payload, options] = sendNotificationMock.mock.calls[0];
+    expect(payload.senderAvatar).toBe("https://cdn.example.com/doctor-avatar.jpg");
+    expect(options).toEqual({ image: "https://cdn.example.com/doctor-avatar.jpg" });
   });
 });

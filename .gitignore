@@ -90,6 +90,13 @@ jspm_packages/
 uploads/
 !uploads/.gitkeep
 
+# Firebase / Google Cloud service-account credentials (never commit these)
+*serviceAccount*.json
+*service-account*.json
+firebase-adminsdk-*.json
+google-credentials*.json
+.firebase/
+
 # OS generated files
 .DS_Store
 .DS_Store?

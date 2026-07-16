@@ -1,120 +1,90 @@
-import admin from 'firebase-admin';
-import dotenv from 'dotenv';
+import { cert, getApps, initializeApp } from "firebase-admin/app";
+import { getMessaging } from "firebase-admin/messaging";
+import dotenv from "dotenv";
 
 dotenv.config();
 
-let firebaseApp;
+let firebaseApp = null;
+let initializationError = null;
 
-const initializeFirebase = () => {
-  try {
-    if (!firebaseApp) {
-      // Check if required Firebase environment variables are present
-      const requiredEnvVars = [
-        'FIREBASE_PROJECT_ID',
-        'FIREBASE_PRIVATE_KEY',
-        'FIREBASE_CLIENT_EMAIL'
-      ];
+const normalizePrivateKey = (value) => String(value || "").replace(/\\n/g, "\n").trim();
 
-      const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
-      
-      if (missingVars.length > 0) {
-        console.warn('⚠️ Firebase environment variables missing:', missingVars.join(', '));
-        console.warn('⚠️ Push notifications will be disabled. Please set Firebase environment variables to enable notifications.');
-        return null;
+function serviceAccountFromEnvironment() {
+  const encoded = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
+  if (encoded) {
+    try {
+      const account = JSON.parse(encoded);
+      if (account.project_id && account.client_email && account.private_key) {
+        return { ...account, private_key: normalizePrivateKey(account.private_key) };
       }
-
-      const serviceAccount = {
-        type: 'service_account',
-        project_id: process.env.FIREBASE_PROJECT_ID,
-        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID || '',
-        private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-        client_email: process.env.FIREBASE_CLIENT_EMAIL,
-        client_id: process.env.FIREBASE_CLIENT_ID || '',
-        auth_uri: process.env.FIREBASE_AUTH_URI || 'https://accounts.google.com/o/oauth2/auth',
-        token_uri: process.env.FIREBASE_TOKEN_URI || 'https://oauth2.googleapis.com/token',
-        auth_provider_x509_cert_url: process.env.FIREBASE_AUTH_PROVIDER_X509_CERT_URL || 'https://www.googleapis.com/oauth2/v1/certs',
-        client_x509_cert_url: process.env.FIREBASE_CLIENT_X509_CERT_URL || '',
-      };
-
-      // Validate that all required fields are present and not empty
-      if (!serviceAccount.project_id || !serviceAccount.private_key || !serviceAccount.client_email) {
-        throw new Error('Missing required Firebase service account fields');
-      }
-
-      firebaseApp = admin.initializeApp({
-        credential: admin.cert(serviceAccount),
-        projectId: process.env.FIREBASE_PROJECT_ID,
-      });
-
-      console.log('✅ Firebase Admin SDK initialized successfully');
+    } catch {
+      throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON");
     }
+    throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON is missing required service-account fields");
+  }
+
+  const account = {
+    project_id: String(process.env.FIREBASE_PROJECT_ID || "").trim(),
+    client_email: String(process.env.FIREBASE_CLIENT_EMAIL || "").trim(),
+    private_key: normalizePrivateKey(process.env.FIREBASE_PRIVATE_KEY),
+  };
+  if (!account.project_id || !account.client_email || !account.private_key) {
+    const missing = [
+      !account.project_id && "FIREBASE_PROJECT_ID",
+      !account.client_email && "FIREBASE_CLIENT_EMAIL",
+      !account.private_key && "FIREBASE_PRIVATE_KEY",
+    ].filter(Boolean);
+    throw new Error(`Firebase credentials missing: ${missing.join(", ")}`);
+  }
+  return account;
+}
+
+export function initializeFirebase() {
+  if (firebaseApp) return firebaseApp;
+  try {
+    const account = serviceAccountFromEnvironment();
+    firebaseApp = getApps()[0] || initializeApp({ credential: cert(account), projectId: account.project_id });
+    initializationError = null;
+    console.info(`[fcm] initialized project=${account.project_id}`);
     return firebaseApp;
   } catch (error) {
-    console.error('❌ Firebase initialization failed:', error.message);
-    console.warn('⚠️ Push notifications will be disabled');
+    initializationError = error;
+    // Credentials are deployment configuration. Never print the account or key.
+    console.error(`[fcm] initialization unavailable: ${error.message}`);
     return null;
   }
-};
+}
 
-const sendPushNotification = async (token, notification, data = {}) => {
+export function getFirebaseMessaging() {
+  const app = initializeFirebase();
+  if (!app) throw initializationError || new Error("Firebase Admin is not configured");
+  return getMessaging(app);
+}
+
+export function firebaseHealth() {
+  const app = firebaseApp || getApps()[0];
+  return { initialized: Boolean(app), projectId: app?.options?.projectId || null, error: initializationError?.message || null };
+}
+
+const stringData = (data) => Object.fromEntries(
+  Object.entries(data || {}).flatMap(([key, value]) => value == null ? [] : [[key, typeof value === "string" ? value : JSON.stringify(value)]])
+);
+
+export async function sendPushNotification(token, notification, data = {}) {
   try {
-    if (!firebaseApp) {
-      throw new Error('Firebase not initialized');
-    }
-
-    // Convert all data values to strings (FCM requirement)
-    const stringData = {};
-    for (const [key, value] of Object.entries(data)) {
-      if (value !== null && value !== undefined) {
-        stringData[key] = typeof value === 'string' ? value : JSON.stringify(value);
-      }
-    }
-
-    // Optional image (big-picture on Android, attachment on iOS). Safe to omit.
-    const imageUrl =
-      typeof notification.image === 'string' && /^https?:\/\//i.test(notification.image)
-        ? notification.image
-        : undefined;
-
-    const message = {
+    if (!String(token || "").trim()) return { success: false, code: "messaging/invalid-registration-token", error: "Missing registration token" };
+    const imageUrl = /^https?:\/\//i.test(String(notification?.image || "")) ? notification.image : undefined;
+    const messageId = await getFirebaseMessaging().send({
       token,
-      notification: {
-        title: notification.title,
-        body: notification.body,
-        ...(imageUrl ? { imageUrl } : {}),
-      },
-      data: stringData,
-      android: {
-        priority: 'high',
-        notification: {
-          sound: 'default',
-          priority: 'high',
-          ...(imageUrl ? { imageUrl } : {}),
-        },
-      },
-      apns: {
-        payload: {
-          aps: {
-            sound: 'default',
-            badge: 1,
-            ...(imageUrl ? { 'mutable-content': 1 } : {}),
-          },
-        },
-        ...(imageUrl ? { fcmOptions: { imageUrl } } : {}),
-      },
-    };
-
-    const response = await admin.messaging().send(message);
-    console.log('✅ Push notification sent:', response);
-    return { success: true, messageId: response };
+      notification: { title: String(notification?.title || "Notification"), body: String(notification?.body || ""), ...(imageUrl ? { imageUrl } : {}) },
+      data: stringData(data),
+      android: { priority: "high", notification: { channelId: "medical_vault_high", sound: "default", ...(imageUrl ? { imageUrl } : {}) } },
+      apns: { payload: { aps: { sound: "default" } }, ...(imageUrl ? { fcmOptions: { imageUrl } } : {}) },
+    });
+    console.info("[fcm] send status=success");
+    return { success: true, messageId };
   } catch (error) {
-    // error.code carries the FCM-specific reason (e.g.
-    // "messaging/registration-token-not-registered" for a stale/uninstalled
-    // token) — callers use this to decide whether to clear the token so a
-    // dead token doesn't silently swallow every future notification.
-    console.error('❌ Push notification failed:', error.code || '(no code)', error.message);
-    return { success: false, error: error.message, code: error.code || null };
+    console.warn(`[fcm] send status=failed code=${error?.code || "unknown"}`);
+    return { success: false, error: error?.message || "FCM send failed", code: error?.code || null };
   }
-};
-
-export { initializeFirebase, sendPushNotification };
+}

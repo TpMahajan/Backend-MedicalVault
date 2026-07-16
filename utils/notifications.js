@@ -36,9 +36,11 @@ const clearStaleFcmToken = async (Model, id, currentToken) => {
  * @param {string} title - Notification title
  * @param {string} body - Notification body
  * @param {object} data - Additional data payload (optional)
+ * @param {object} options - Additional options (optional)
+ * @param {string} [options.image] - Sender avatar/image URL for the push notification
  * @returns {Promise<boolean>} - Success status
  */
-async function sendNotification(userId, title, body, data = {}) {
+async function sendNotification(userId, title, body, data = {}, options = {}) {
   const notificationType = data?.type || "notification";
   try {
     // Check if Firebase is initialized
@@ -59,7 +61,7 @@ async function sendNotification(userId, title, body, data = {}) {
     // Send the push notification
     const result = await sendPushNotification(
       user.fcmToken,
-      { title, body },
+      { title, body, image: options?.image },
       data
     );
 
@@ -86,9 +88,11 @@ async function sendNotification(userId, title, body, data = {}) {
  * @param {string} title - Notification title
  * @param {string} body - Notification body
  * @param {object} data - Additional data payload (optional)
+ * @param {object} options - Additional options (optional)
+ * @param {string} [options.image] - Sender avatar/image URL for the push notification
  * @returns {Promise<boolean>} - Success status
  */
-async function sendNotificationToDoctor(doctorId, title, body, data = {}) {
+async function sendNotificationToDoctor(doctorId, title, body, data = {}, options = {}) {
   const notificationType = data?.type || "notification";
   try {
     // Check if Firebase is initialized
@@ -109,7 +113,7 @@ async function sendNotificationToDoctor(doctorId, title, body, data = {}) {
     // Send the push notification
     const result = await sendPushNotification(
       doctor.fcmToken,
-      { title, body },
+      { title, body, image: options?.image },
       data
     );
 

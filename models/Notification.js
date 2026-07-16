@@ -13,7 +13,7 @@ const notificationSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['general', 'appointment', 'session', 'document', 'qr_scan', 'system', 'reminder', 'lost_person_alert', 'family_care_medication', 'family_care_connection'],
+    enum: ['general', 'appointment', 'session', 'document', 'chat', 'caregiver', 'emergency', 'qr_scan', 'system', 'reminder', 'lost_person_alert', 'family_care_medication', 'family_care_connection'],
     default: 'general'
   },
   data: {
@@ -33,7 +33,7 @@ const notificationSchema = new mongoose.Schema({
   },
   recipientRole: {
     type: String,
-    enum: ['patient', 'doctor', 'admin'],
+    enum: ['patient', 'doctor', 'admin', 'superadmin'],
     required: true
   },
   senderId: {
@@ -69,6 +69,7 @@ const notificationSchema = new mongoose.Schema({
 notificationSchema.index({ recipientId: 1, read: 1, createdAt: -1 });
 notificationSchema.index({ recipientRole: 1, read: 1, createdAt: -1 });
 notificationSchema.index({ type: 1, createdAt: -1 });
+notificationSchema.index({ "data.idempotencyKey": 1, recipientId: 1 }, { sparse: true });
 
 // Virtual for time ago
 notificationSchema.virtual('timeAgo').get(function() {

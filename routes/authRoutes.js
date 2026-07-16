@@ -1184,6 +1184,89 @@ const updateSessionPolicyHandler = async (req, res) => {
 router.put("/session/policy", auth, updateSessionPolicyHandler);
 router.patch("/session/policy", auth, updateSessionPolicyHandler);
 
+// ---------------- Dashboard Display Preferences ----------------
+// GET /api/auth/dashboard-preferences
+router.get("/dashboard-preferences", auth, async (req, res) => {
+  try {
+    const principalId = asText(req.auth?.id);
+    const role = lower(req.auth?.role);
+
+    if (!principalId || role !== patientRole) {
+      return res.json({
+        success: true,
+        dashboardPreferences: { showTopDoctors: true },
+        readOnly: true,
+      });
+    }
+
+    const user = await User.findById(principalId)
+      .select("dashboardPreferences")
+      .lean();
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.json({
+      success: true,
+      dashboardPreferences: {
+        showTopDoctors: user.dashboardPreferences?.showTopDoctors !== false,
+      },
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch dashboard preferences" });
+  }
+});
+
+// PUT/PATCH /api/auth/dashboard-preferences
+const updateDashboardPreferencesHandler = async (req, res) => {
+  try {
+    const principalId = asText(req.auth?.id);
+    const role = lower(req.auth?.role);
+
+    if (role !== patientRole || !principalId) {
+      return res.status(403).json({
+        success: false,
+        message: "Patient access required",
+      });
+    }
+
+    if (req.body?.showTopDoctors === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: "showTopDoctors is required",
+      });
+    }
+    const showTopDoctors = req.body.showTopDoctors === true;
+
+    const result = await User.findByIdAndUpdate(
+      principalId,
+      { $set: { "dashboardPreferences.showTopDoctors": showTopDoctors } },
+      { new: true, projection: "dashboardPreferences" },
+    ).lean();
+
+    if (!result) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.json({
+      success: true,
+      dashboardPreferences: {
+        showTopDoctors: result.dashboardPreferences?.showTopDoctors !== false,
+      },
+      message: "Dashboard preferences updated",
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to update dashboard preferences" });
+  }
+};
+
+router.put("/dashboard-preferences", auth, updateDashboardPreferencesHandler);
+router.patch("/dashboard-preferences", auth, updateDashboardPreferencesHandler);
+
 // POST /api/auth/session/heartbeat
 router.post("/session/heartbeat", auth, async (req, res) => {
   try {
