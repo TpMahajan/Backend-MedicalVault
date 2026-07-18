@@ -150,6 +150,17 @@ const relationshipView = (relationship) => ({
   expiresAt: relationship.expiresAt || null,
 });
 
+const invitationView = (invitation) => ({
+  id: String(invitation._id),
+  patientProfileId: String(invitation.patientProfileId?._id || invitation.patientProfileId || ""),
+  intendedRelationship: invitation.intendedRelationship,
+  intendedRole: invitation.intendedRole,
+  status: invitation.status,
+  acceptedAt: invitation.acceptedAt || null,
+  revokedAt: invitation.revokedAt || null,
+  expiresAt: invitation.expiresAt || null,
+});
+
 const profileView = (profile, relationship) => {
   const source = asPlain(profile);
   const summary = mapObject(source.medicalSummary);
@@ -505,33 +516,93 @@ export const listInvitations = async (req, res) => {
 
 const respondToInvitation = async (req, res, accept) => {
   const token = asText(req.body?.token, 200);
-  if (!token) return res.status(400).json({ success: false, message: "Invitation token is required" });
+  if (!token) return res.status(400).json({ success: false, code: "INVITATION_TOKEN_REQUIRED", message: "Invitation token is required" });
+
   const invitation = await CareInvitation.findById(req.params.invitationId).select("+tokenHash");
-  if (!invitation || invitation.status !== "pending") return res.status(404).json({ success: false, message: "Invitation not found" });
+  if (!invitation) {
+    return res.status(404).json({ success: false, code: "INVITATION_NOT_FOUND", message: "This invitation could not be found." });
+  }
+
+  // Idempotent replay: a double-tap, a retried request after a dropped
+  // response, or a stale client re-submitting must not surface as an error
+  // once the invitation has already been resolved.
+  if (invitation.status === "accepted") {
+    if (!accept) {
+      return res.status(409).json({ success: false, code: "INVITATION_ALREADY_ACCEPTED", message: "This invitation has already been accepted." });
+    }
+    const relationship = await CareRelationship.findOne({ patientProfileId: invitation.patientProfileId, caregiverUserId: req.auth.id });
+    return res.json({
+      success: true,
+      message: "Caregiver access already accepted",
+      data: { request: invitationView(invitation), relationship: relationship ? relationshipView(relationship) : null, replayed: true },
+    });
+  }
+  if (invitation.status === "declined") {
+    return res.status(409).json({ success: false, code: "INVITATION_ALREADY_DECLINED", message: "This invitation has already been declined." });
+  }
+  if (invitation.status !== "pending") {
+    return res.status(409).json({ success: false, code: "INVITATION_NOT_PENDING", message: "This invitation can no longer be actioned." });
+  }
   if (invitation.expiresAt <= new Date()) {
     invitation.status = "expired";
     await invitation.save();
-    return res.status(410).json({ success: false, code: "INVITATION_EXPIRED", message: "Invitation has expired" });
+    return res.status(410).json({ success: false, code: "INVITATION_EXPIRED", message: "This invitation has expired." });
   }
+
   const suppliedHash = Buffer.from(hashToken(token));
   const storedHash = Buffer.from(invitation.tokenHash);
-  if (suppliedHash.length !== storedHash.length || !crypto.timingSafeEqual(suppliedHash, storedHash)) return res.status(403).json({ success: false, message: "Invalid invitation token" });
-  if (invitation.invitedEmail && invitation.invitedEmail !== normalizeEmail(req.user.email)) return res.status(403).json({ success: false, message: "This invitation was issued to another account" });
+  if (suppliedHash.length !== storedHash.length || !crypto.timingSafeEqual(suppliedHash, storedHash)) {
+    return res.status(403).json({ success: false, code: "INVITATION_TOKEN_INVALID", message: "This invitation token is invalid." });
+  }
+  if (invitation.invitedEmail && invitation.invitedEmail !== normalizeEmail(req.user.email)) {
+    return res.status(403).json({ success: false, code: "INVITATION_NOT_AUTHORIZED", message: "This invitation was issued to another account." });
+  }
+
   if (!accept) {
     invitation.status = "declined";
     await invitation.save();
-    return res.json({ success: true, message: "Invitation declined" });
+    await writeAuditLog({ req, action: "caregiver_declined", resourceType: "CareInvitation", resourceId: invitation._id, patientProfileId: invitation.patientProfileId });
+    return res.json({ success: true, message: "Invitation declined", data: { request: invitationView(invitation) } });
   }
-  await CareRelationship.findOneAndUpdate(
-    { patientProfileId: invitation.patientProfileId, caregiverUserId: req.auth.id },
-    { $set: { relationship: invitation.intendedRelationship, role: invitation.intendedRole, permissions: invitation.intendedPermissions, status: "active", invitationId: invitation._id, invitedBy: invitation.invitedByUserId, acceptedAt: new Date(), revokedAt: null } },
-    { upsert: true, new: true, setDefaultsOnInsert: true },
-  );
-  invitation.status = "accepted";
-  invitation.acceptedAt = new Date();
-  await invitation.save();
-  await writeAuditLog({ req, action: "caregiver_accepted", resourceType: "CareInvitation", resourceId: invitation._id, patientProfileId: invitation.patientProfileId });
-  return res.json({ success: true, message: "Caregiver access accepted" });
+
+  try {
+    const relationship = await CareRelationship.findOneAndUpdate(
+      { patientProfileId: invitation.patientProfileId, caregiverUserId: req.auth.id },
+      { $set: { relationship: invitation.intendedRelationship, role: invitation.intendedRole, permissions: invitation.intendedPermissions, status: "active", invitationId: invitation._id, invitedBy: invitation.invitedByUserId, acceptedAt: new Date(), revokedAt: null } },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+    invitation.status = "accepted";
+    invitation.acceptedAt = new Date();
+    await invitation.save();
+    await writeAuditLog({ req, action: "caregiver_accepted", resourceType: "CareInvitation", resourceId: invitation._id, patientProfileId: invitation.patientProfileId });
+    return res.json({
+      success: true,
+      message: "Caregiver access accepted",
+      data: { request: invitationView(invitation), relationship: relationshipView(relationship) },
+    });
+  } catch (error) {
+    // A concurrent accept (double-tap, two tabs, retried request) can race
+    // this upsert under the compound unique index. That is expected and
+    // safe to resolve by replaying the now-committed state rather than
+    // surfacing a raw duplicate-key error to the client.
+    if (error?.code === 11000) {
+      console.warn(`[family-care] caregiver accept conflict user=${String(req.auth?.id || "unknown")} code=11000`);
+      const [refreshedInvitation, relationship] = await Promise.all([
+        CareInvitation.findById(invitation._id),
+        CareRelationship.findOne({ patientProfileId: invitation.patientProfileId, caregiverUserId: req.auth.id }),
+      ]);
+      if (relationship?.status === "active") {
+        return res.json({
+          success: true,
+          message: "Caregiver access already accepted",
+          data: { request: invitationView(refreshedInvitation || invitation), relationship: relationshipView(relationship), replayed: true },
+        });
+      }
+      return res.status(409).json({ success: false, code: "CAREGIVER_ACCEPT_CONFLICT", message: "This request was updated concurrently. Please refresh and try again." });
+    }
+    console.error(`[family-care] caregiver accept failed user=${String(req.auth?.id || "unknown")} code=${error?.code || "unknown"}`);
+    return res.status(500).json({ success: false, code: "FAMILY_CARE_ACCEPT_FAILED", message: "Unable to accept this request right now. Please try again." });
+  }
 };
 
 export const acceptInvitation = (req, res) => respondToInvitation(req, res, true);

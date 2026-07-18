@@ -5,23 +5,55 @@ import { Notification } from "../models/Notification.js";
 import mongoose from "mongoose";
 import { DeviceToken } from "../models/DeviceToken.js";
 import { deliverNotifications } from "../services/notificationDeliveryService.js";
+import { writeAuditLog } from "../middleware/auditLogger.js";
 
 // Store active SSE connections
 const activeConnections = new Map();
 
 const normalizeRole = (value) => String(value || "").trim().toLowerCase();
 
-const buildNotificationScopeFilter = ({ userId, userRole }) => {
-  const role = normalizeRole(userRole);
-  const roleAllowed = ["patient", "doctor", "admin"].includes(role);
-  const objectIdAllowed = mongoose.Types.ObjectId.isValid(userId);
+// A notification belongs to exactly one recipient. `recipientRole` exists for
+// reporting/aggregation (see superAdmin dashboard stats), not as an
+// alternative access scope: matching on it via $or would let every patient
+// see, mark-read and bulk-delete every other patient's notifications (same
+// for doctors/admins). recipientId is required on every document, so this is
+// the only condition that safely scopes access to the authenticated user.
+const buildNotificationScopeFilter = ({ userId }) => {
+  if (!mongoose.Types.ObjectId.isValid(userId)) return null;
+  return { recipientId: userId };
+};
 
-  const conditions = [];
-  if (objectIdAllowed) conditions.push({ recipientId: userId });
-  if (roleAllowed) conditions.push({ recipientRole: role });
+// Encodes/decodes an opaque pagination cursor from the last item's
+// (createdAt, _id) pair. Both fields are part of the compound sort, so the
+// cursor uniquely identifies a position in the list even when several
+// notifications share the same createdAt millisecond.
+const encodeCursor = (notification) => {
+  const createdAt = notification?.createdAt instanceof Date
+    ? notification.createdAt.toISOString()
+    : new Date(notification.createdAt).toISOString();
+  const payload = JSON.stringify({ t: createdAt, id: String(notification._id) });
+  return Buffer.from(payload, "utf8").toString("base64url");
+};
 
-  if (conditions.length === 0) return null;
-  return { $or: conditions };
+const decodeCursor = (cursor) => {
+  if (!cursor || typeof cursor !== "string") return null;
+  try {
+    const payload = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    const createdAt = new Date(payload?.t);
+    if (Number.isNaN(createdAt.getTime()) || !mongoose.Types.ObjectId.isValid(payload?.id)) return null;
+    return { createdAt, id: payload.id };
+  } catch {
+    return null;
+  }
+};
+
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 50;
+
+const clampLimit = (value) => {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_LIMIT;
+  return Math.min(parsed, MAX_LIMIT);
 };
 
 // @desc    Save FCM token for user or doctor
@@ -88,64 +120,118 @@ export const saveFCMToken = async (req, res) => {
   }
 };
 
-// @desc    Get notifications for current user
-// @route   GET /api/notifications
+// @desc    Get notifications for current user (cursor-paginated)
+// @route   GET /api/notifications?limit=20&cursor=<cursor>
 // @access  Private
+//
+// Cursor mode (recommended, used by current clients): pass `cursor` from the
+// previous response's `data.nextCursor`. Sort order is createdAt desc with
+// _id desc as a stable tiebreaker, so concurrent inserts during pagination
+// never cause a duplicate or skipped record.
+//
+// Legacy offset mode (kept only for older clients that still send `page`
+// without a `cursor`): behaves exactly as before via skip/limit. New clients
+// should prefer cursor mode since offset pagination can duplicate or skip
+// rows when notifications are created or deleted between page fetches.
 export const getNotifications = async (req, res) => {
   try {
-    const { page = 1, limit = 20, unreadOnly = false } = req.query;
+    const { page, cursor, unreadOnly = false } = req.query;
+    const limit = clampLimit(req.query.limit);
     const userId = req.auth.id;
-    const userRole = req.auth.role;
 
-    const scopeFilter = buildNotificationScopeFilter({ userId, userRole });
+    const scopeFilter = buildNotificationScopeFilter({ userId });
     if (!scopeFilter) {
       return res.json({
         success: true,
         data: {
           notifications: [],
-          pagination: {
-            current: parseInt(page),
-            pages: 0,
-            total: 0
-          },
+          items: [],
+          nextCursor: null,
+          hasMore: false,
+          pagination: { current: 1, pages: 0, total: 0 },
           unreadCount: 0
         }
       });
     }
 
-    // Build query
     const query = { ...scopeFilter };
+    if (unreadOnly === 'true') query.read = false;
 
-    if (unreadOnly === 'true') {
-      query.read = false;
+    const useCursor = cursor !== undefined || page === undefined;
+
+    let notifications;
+    let unreadCount;
+    if (useCursor) {
+      const decoded = decodeCursor(cursor);
+      const cursorQuery = { ...query };
+      if (decoded) {
+        // Strictly-after the cursor position under (createdAt desc, _id desc):
+        // either an older createdAt, or the same createdAt with a smaller _id.
+        cursorQuery.$or = [
+          { createdAt: { $lt: decoded.createdAt } },
+          { createdAt: decoded.createdAt, _id: { $lt: decoded.id } }
+        ];
+      } else if (cursor) {
+        // A cursor was supplied but could not be decoded (tampered, malformed,
+        // or from an incompatible client version). Fail safe to an empty page
+        // rather than silently ignoring it and returning from the start,
+        // which would look like duplicate notifications to the caller.
+        return res.json({
+          success: true,
+          data: { notifications: [], items: [], nextCursor: null, hasMore: false, unreadCount: 0 }
+        });
+      }
+
+      const [rows, unread] = await Promise.all([
+        Notification.find(cursorQuery)
+          .sort({ createdAt: -1, _id: -1 })
+          .limit(limit + 1)
+          .select('-__v'),
+        Notification.countDocuments({ ...query, read: false })
+      ]);
+      unreadCount = unread;
+      const hasMore = rows.length > limit;
+      notifications = hasMore ? rows.slice(0, limit) : rows;
+      const nextCursor = hasMore ? encodeCursor(notifications[notifications.length - 1]) : null;
+
+      return res.json({
+        success: true,
+        data: {
+          // `notifications` is kept for older clients already parsing this
+          // field; `items` matches the documented cursor contract.
+          notifications,
+          items: notifications,
+          nextCursor,
+          hasMore,
+          unreadCount
+        }
+      });
     }
 
-    // Get notifications with pagination
-    const notifications = await Notification.find(query)
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .select('-__v');
-
-    // Get total count
-    const total = await Notification.countDocuments(query);
-
-    // Get unread count
-    const unreadCount = await Notification.countDocuments({
-      ...query,
-      read: false
-    });
+    // Legacy offset path.
+    const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+    const [notificationsPage, total, unread] = await Promise.all([
+      Notification.find(query)
+        .sort({ createdAt: -1, _id: -1 })
+        .limit(limit)
+        .skip((pageNum - 1) * limit)
+        .select('-__v'),
+      Notification.countDocuments(query),
+      Notification.countDocuments({ ...query, read: false })
+    ]);
 
     res.json({
       success: true,
       data: {
-        notifications,
+        notifications: notificationsPage,
+        items: notificationsPage,
         pagination: {
-          current: parseInt(page),
+          current: pageNum,
           pages: Math.ceil(total / limit),
           total
         },
-        unreadCount
+        hasMore: pageNum * limit < total,
+        unreadCount: unread
       }
     });
   } catch (error) {
@@ -289,16 +375,14 @@ export const deleteNotification = async (req, res) => {
   }
 };
 
-// @desc    Delete all notifications for current user
+// @desc    Permanently clear the authenticated user's notification history
+//          (not a mark-as-read operation)
 // @route   DELETE /api/notifications
 // @access  Private
 export const deleteAllNotifications = async (req, res) => {
   try {
     const userId = req.auth.id;
-    const scopeFilter = buildNotificationScopeFilter({
-      userId,
-      userRole: req.auth.role
-    });
+    const scopeFilter = buildNotificationScopeFilter({ userId });
     if (!scopeFilter) {
       return res.status(403).json({
         success: false,
@@ -306,13 +390,27 @@ export const deleteAllNotifications = async (req, res) => {
       });
     }
 
-    await Notification.deleteMany({
-      ...scopeFilter
+    // Idempotent by construction: deleteMany on an already-empty scope simply
+    // matches zero documents and reports deletedCount: 0, so a retried or
+    // duplicated "Clear all" request is always safe to repeat.
+    const result = await Notification.deleteMany({ ...scopeFilter });
+
+    // Audit the action (who/when/how many) without any notification content
+    // (titles/bodies are never included in metadata).
+    await writeAuditLog({
+      req,
+      action: 'notifications_cleared_all',
+      resourceType: 'Notification',
+      statusCode: 200,
+      metadata: { deletedCount: result.deletedCount }
     });
+
+    broadcastNotificationsCleared(userId);
 
     res.json({
       success: true,
-      message: 'All notifications cleared successfully'
+      message: 'All notifications cleared successfully',
+      data: { deletedCount: result.deletedCount, unreadCount: 0 }
     });
   } catch (error) {
     console.error('Delete all notifications error:', error);
@@ -651,4 +749,38 @@ export const broadcastNotification = async (notification) => {
     console.error('[notification-realtime] broadcast failed:', error.message);
     return { delivered: 0, unavailable: true };
   }
+};
+
+// Notifies every live connection for a user that their notification history
+// was cleared, so an open notification page (this device or another) can
+// drop its in-memory list to empty immediately instead of waiting for the
+// next manual refresh. Carries no notification content, only the new state.
+const broadcastNotificationsCleared = (userId) => {
+  const recipientId = String(userId);
+  const userConnections = Array.from(activeConnections.entries()).filter(
+    ([, conn]) => String(conn.userId) === recipientId
+  );
+  if (userConnections.length === 0) return { delivered: 0 };
+
+  const payload = {
+    type: 'notifications_cleared',
+    unreadCount: 0,
+    timestamp: new Date().toISOString()
+  };
+
+  let delivered = 0;
+  userConnections.forEach(([connectionId, conn]) => {
+    try {
+      if (!conn.res.destroyed) {
+        conn.res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        delivered += 1;
+      } else {
+        activeConnections.delete(connectionId);
+      }
+    } catch (error) {
+      console.error(`[notification-realtime] cleared-broadcast write failed connection=${connectionId}:`, error.message);
+      activeConnections.delete(connectionId);
+    }
+  });
+  return { delivered };
 };

@@ -37,6 +37,7 @@ import { execFileSync, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import http from "http";
 import https from "https";
+import dotenv from "dotenv";
 import { distributeToFirebase, FirebaseDistributionError } from "./firebase-distribution.mjs";
 
 // ---------------------------------------------------------------------------
@@ -47,6 +48,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const BACKEND_ROOT = path.resolve(__dirname, ".."); // Backend-MedicalVault
 const REPO_ROOT = path.resolve(BACKEND_ROOT, ".."); // Medical Vault
+
+// Load local release configuration when present. Existing shell/CI variables
+// remain authoritative because dotenv does not override them by default.
+dotenv.config({ path: path.join(BACKEND_ROOT, ".env") });
+
 const DEFAULT_FLUTTER_ROOT = path.join(REPO_ROOT, "MedicalVault");
 const DEFAULT_PUBSPEC_PATH = path.join(DEFAULT_FLUTTER_ROOT, "pubspec.yaml");
 const DEFAULT_FLUTTER_APK_PATH = path.join(

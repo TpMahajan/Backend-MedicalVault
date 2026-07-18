@@ -30,6 +30,7 @@ import { Session } from "../models/Session.js";
 import { Document } from "../models/File.js";
 import { SosEvent } from "../models/SosEvent.js";
 import { InventoryOrder } from "../models/InventoryOrder.js";
+import { StoreOrder } from "../models/StoreOrder.js";
 import { SuperAdminActivityLog } from "../models/SuperAdminActivityLog.js";
 import { AdvertisementClickLog } from "../models/AdvertisementClickLog.js";
 import { clearPublicConfigCache } from "./publicConfig.js";
@@ -3504,6 +3505,91 @@ router.delete("/products/:id", requireSuperAdminAuth, async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to delete product",
+      error: error.message,
+    });
+  }
+});
+
+// ---------------- STORE TRANSACTIONS ----------------
+router.get("/store-orders", requireSuperAdminAuth, async (req, res) => {
+  try {
+    const search = String(req.query.search || "").trim();
+    const status = String(req.query.status || "").trim().toUpperCase();
+    const paymentStatus = String(req.query.paymentStatus || "").trim().toUpperCase();
+    const page = Math.max(Number(req.query.page || 1), 1);
+    const limit = Math.min(Math.max(Number(req.query.limit || 20), 1), 100);
+
+    const query = {};
+    if (status) query.status = status;
+    if (paymentStatus) query.paymentStatus = paymentStatus;
+    if (search) {
+      query.$or = [
+        { "delivery.fullName": { $regex: search, $options: "i" } },
+        { "delivery.phone": { $regex: search, $options: "i" } },
+        { "items.name": { $regex: search, $options: "i" } },
+        { principalId: { $regex: search, $options: "i" } },
+      ];
+      if (mongoose.Types.ObjectId.isValid(search)) {
+        query.$or.push({ _id: search });
+      }
+    }
+
+    const [orders, total, summary] = await Promise.all([
+      StoreOrder.find(query)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      StoreOrder.countDocuments(query),
+      StoreOrder.aggregate([
+        { $match: { paymentStatus: "PAID" } },
+        {
+          $group: {
+            _id: null,
+            totalRevenue: { $sum: "$totals.total" },
+            totalOrders: { $sum: 1 },
+          },
+        },
+      ]),
+    ]);
+
+    return res.json({
+      success: true,
+      orders,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+      },
+      summary: {
+        totalRevenue: summary[0]?.totalRevenue || 0,
+        paidOrders: summary[0]?.totalOrders || 0,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch store orders",
+      error: error.message,
+    });
+  }
+});
+
+router.get("/store-orders/:id", requireSuperAdminAuth, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid order id" });
+    }
+    const order = await StoreOrder.findById(req.params.id).lean();
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    return res.json({ success: true, order });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch order",
       error: error.message,
     });
   }

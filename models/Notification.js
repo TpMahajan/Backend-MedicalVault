@@ -70,6 +70,10 @@ notificationSchema.index({ recipientId: 1, read: 1, createdAt: -1 });
 notificationSchema.index({ recipientRole: 1, read: 1, createdAt: -1 });
 notificationSchema.index({ type: 1, createdAt: -1 });
 notificationSchema.index({ "data.idempotencyKey": 1, recipientId: 1 }, { sparse: true });
+// Stable compound sort for cursor-based pagination: createdAt ties (which do
+// happen when several notifications are created in the same batch/millisecond)
+// are broken by _id so the cursor never skips or repeats a record.
+notificationSchema.index({ recipientId: 1, createdAt: -1, _id: -1 });
 
 // Virtual for time ago
 notificationSchema.virtual('timeAgo').get(function() {

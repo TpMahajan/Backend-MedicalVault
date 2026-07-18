@@ -130,12 +130,19 @@ const resolvePaymentStatus = (paymentMethod) => {
 
 const resolveProductImage = async (product) => {
   const media = product?.media || {};
-  const fromMedia =
-    asText(media.thumbnail) ||
-    (Array.isArray(media.images) ? asText(media.images[0]) : "") ||
-    asText(product?.imageUrl);
-  const direct = toAbsoluteUploadsUrl(fromMedia);
-  if (direct) return direct;
+  const imageCandidates = [
+    asText(media.thumbnail),
+    Array.isArray(media.images) ? asText(media.images[0]) : "",
+    asText(product?.imageUrl),
+  ].filter(Boolean);
+
+  // A stale media thumbnail may contain an old raw storage key. Keep trying
+  // the product's other image fields instead of letting that value hide a
+  // valid uploaded image URL.
+  for (const candidate of imageCandidates) {
+    const direct = toAbsoluteUploadsUrl(candidate);
+    if (direct) return direct;
+  }
 
   const imageKey = asText(product?.imageKey);
   if (imageKey) {
@@ -150,7 +157,7 @@ const resolveProductImage = async (product) => {
     }
   }
 
-  return /^https?:\/\//i.test(fromMedia) ? fromMedia : "";
+  return "";
 };
 
 const mapProductForClient = async (product, inventoryEntry = null) => {
