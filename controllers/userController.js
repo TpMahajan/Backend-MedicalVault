@@ -3,6 +3,31 @@ import { Session } from "../models/Session.js";
 import { Appointment } from "../models/Appointment.js";
 import { buildUserResponse } from "../utils/userResponse.js";
 
+// Baseline fields every doctor may see once any session grant exists, plus
+// the exact field(s) each structured-data scope unlocks. A scope absent from
+// the active grant means its field(s) must not even be selected from
+// MongoDB, not merely omitted from the response — selecting-then-stripping
+// risks a future response-shaping change accidentally reintroducing it.
+const DOCTOR_BASE_FIELDS = "name profilePicture age gender dateOfBirth bloodType createdAt";
+const STRUCTURED_SCOPE_FIELDS = {
+  profile: "height weight mobile email",
+  allergies: "allergies",
+  conditions: "medicalHistory",
+  medications: "medications",
+  emergencyInformation: "emergencyContact",
+  // Appointments live in a separate collection, not a User field — handled
+  // separately by any endpoint that reads Appointment directly.
+};
+
+const doctorProjectionForGrant = (grant) => {
+  const scopes = grant?.structuredDataScopes || [];
+  const fields = [DOCTOR_BASE_FIELDS];
+  for (const scope of scopes) {
+    if (STRUCTURED_SCOPE_FIELDS[scope]) fields.push(STRUCTURED_SCOPE_FIELDS[scope]);
+  }
+  return fields.join(" ");
+};
+
 // @desc    Update user profile
 // @route   PUT /api/user/profile
 // @access  Private
@@ -180,11 +205,18 @@ export const updateFCMToken = async (req, res) => {
   }
 };
 
-const getUserProjection = (authRole) => {
+const getUserProjection = (authRole, req) => {
   const role = String(authRole || "").toLowerCase();
   if (role === "admin") {
     // Admin receives minimum necessary demographic profile.
     return "name profilePicture age gender dateOfBirth bloodType email mobile createdAt status";
+  }
+  if (role === "doctor") {
+    // A doctor's structured-data visibility is scoped exactly to their
+    // active SessionAccessGrant — checkSession attaches it as
+    // req.sessionAccessGrant, or rejects the request entirely if none
+    // exists, so a doctor never reaches this projection ungated.
+    return doctorProjectionForGrant(req?.sessionAccessGrant);
   }
   return "-password";
 };
@@ -199,7 +231,7 @@ export const getUserProfile = async (req, res) => {
     const userId = String(req.params.id || "");
     const isSelf = authRole === "patient" && authId === userId;
 
-    const selectFields = getUserProjection(authRole);
+    const selectFields = getUserProjection(authRole, req);
     const user = await User.findById(userId).select(selectFields).lean();
 
     if (!user) {
@@ -239,6 +271,8 @@ export const getMedicalCard = async (req, res) => {
     const selectFields =
       authRole === "admin"
         ? "name profilePicture age gender dateOfBirth bloodType email mobile emergencyContact"
+        : authRole === "doctor"
+        ? doctorProjectionForGrant(req.sessionAccessGrant)
         : "name profilePicture age gender dateOfBirth bloodType height weight email mobile medications allergies emergencyContact";
 
     const user = await User.findById(userId).select(selectFields).lean();

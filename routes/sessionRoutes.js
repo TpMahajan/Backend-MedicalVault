@@ -12,14 +12,32 @@ import { persistSessionHistory } from "../services/sessionHistoryPersistence.js"
 import { BUCKET_NAME } from "../config/s3.js";
 import { generateSignedUrl } from "../utils/s3Utils.js";
 import { RefreshToken } from "../models/RefreshToken.js";
-import { emitNewDirectMessage } from "../services/chatPresenceRealtime.js";
+import { emitNewDirectMessage, emitMessageDeleted } from "../services/chatPresenceRealtime.js";
 import { resolveDoctorPatientLink } from "../services/doctorPatientLink.js";
+import {
+  materializeGrantForSession,
+  syncGrantExpiry,
+  revokeGrant,
+  resolveActiveGrant,
+  buildApprovalPreview,
+  getSharingPreferences,
+  updateSharingPreferences,
+  DOCUMENT_CATEGORIES,
+  STRUCTURED_DATA_SCOPES,
+} from "../services/sessionAccessGrantService.js";
+import { emitSessionPermissionsUpdated } from "../services/chatPresenceRealtime.js";
 
 const router = express.Router();
 const ENABLE_DEBUG_ROUTES =
   String(process.env.ENABLE_DEBUG_ROUTES || "false").toLowerCase() === "true";
 const hasAWSCredentials =
   !!process.env.AWS_ACCESS_KEY_ID && !!process.env.AWS_SECRET_ACCESS_KEY;
+// Server-authoritative: eligibility for "delete for everyone" is always
+// computed from this value and the server's own clock, never the client's.
+const CHAT_DELETE_FOR_EVERYONE_WINDOW_HOURS = (() => {
+  const parsed = Number.parseFloat(process.env.CHAT_DELETE_FOR_EVERYONE_WINDOW_HOURS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 60;
+})();
 
 const asText = (value) => (value == null ? "" : String(value).trim());
 
@@ -851,8 +869,8 @@ router.get("/chat/threads", async (req, res) => {
     const isDoctor = role === "doctor";
     const counterpartField = isDoctor ? "$patientId" : "$doctorId";
     const matchStage = isDoctor
-      ? { doctorId: authObjectId }
-      : { patientId: authObjectId };
+      ? { doctorId: authObjectId, hiddenForUsers: { $ne: authObjectId } }
+      : { patientId: authObjectId, hiddenForUsers: { $ne: authObjectId } };
 
     const threadsRaw = await DirectMessage.aggregate([
       { $match: matchStage },
@@ -862,7 +880,14 @@ router.get("/chat/threads", async (req, res) => {
           _id: counterpartField,
           doctorId: { $first: "$doctorId" },
           patientId: { $first: "$patientId" },
-          lastMessage: { $first: "$message" },
+          // A tombstoned last message must not leak its original text into
+          // the thread-list preview.
+          lastMessage: {
+            $first: {
+              $cond: [{ $eq: ["$isDeletedForEveryone", true] }, "", "$message"],
+            },
+          },
+          lastMessageDeleted: { $first: "$isDeletedForEveryone" },
           lastSenderRole: { $first: "$senderRole" },
           lastAt: { $first: "$createdAt" },
           lastMessageId: { $first: "$_id" },
@@ -954,6 +979,7 @@ router.get("/chat/threads", async (req, res) => {
           doctorId: asText(thread?.doctorId),
           patientId: asText(thread?.patientId),
           lastMessage: asText(thread?.lastMessage),
+          lastMessageDeleted: thread?.lastMessageDeleted === true,
           lastSenderRole: asText(thread?.lastSenderRole).toLowerCase(),
           lastAt: thread?.lastAt || null,
           unreadCount: Number(thread?.unreadCount || 0),
@@ -976,8 +1002,34 @@ router.get("/chat/threads", async (req, res) => {
   }
 });
 
+const toChatMessageListEntry = (entry) => ({
+  id: entry._id.toString(),
+  doctorId: asText(entry.doctorId),
+  patientId: asText(entry.patientId),
+  sessionId: asText(entry.sessionId),
+  clientMessageId: asText(entry.clientMessageId),
+  senderRole: asText(entry.senderRole).toLowerCase(),
+  senderId: asText(entry.senderId),
+  recipientRole: asText(entry.recipientRole).toLowerCase(),
+  recipientId: asText(entry.recipientId),
+  // A tombstoned message never surfaces its original text through this (or
+  // any other normal) read path, regardless of who is asking.
+  message: entry.isDeletedForEveryone ? "" : asText(entry.message),
+  createdAt: entry.createdAt,
+  readByRecipient: entry.readByRecipient === true,
+  readAt: entry.readAt || null,
+  isDeletedForEveryone: entry.isDeletedForEveryone === true,
+  deletedForEveryoneAt: entry.deletedForEveryoneAt || null,
+});
+
 // ---------------- Direct Chat Messages ----------------
-// GET /api/sessions/chat/messages/:counterpartId
+// GET /api/sessions/chat/messages/:counterpartId?limit=&before=
+//
+// Reverse-cursor pagination: omit `before` for the latest page (newest
+// messages, same as before this endpoint supported pagination); pass the
+// oldest currently-loaded message's `id` as `before` to fetch the next page
+// of older messages when the user scrolls up. `hasMore` indicates whether an
+// older page still exists.
 router.get("/chat/messages/:counterpartId", async (req, res) => {
   try {
     const role = asText(req.auth?.role).toLowerCase();
@@ -985,8 +1037,9 @@ router.get("/chat/messages/:counterpartId", async (req, res) => {
     const counterpartId = asText(req.params.counterpartId);
     const limit = Math.max(
       1,
-      Math.min(500, Number.parseInt(req.query.limit, 10) || 200)
+      Math.min(100, Number.parseInt(req.query.limit, 10) || 30)
     );
+    const before = asText(req.query.before);
 
     if (!["doctor", "patient"].includes(role)) {
       return res.status(403).json({
@@ -999,6 +1052,12 @@ router.get("/chat/messages/:counterpartId", async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Invalid chat participant identifier.",
+      });
+    }
+    if (before && !isValidObjectId(before)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid pagination cursor.",
       });
     }
 
@@ -1015,52 +1074,63 @@ router.get("/chat/messages/:counterpartId", async (req, res) => {
 
     const hiddenBeforeMessageId = await getHiddenWatermark({ doctorId, patientId, role });
 
-    const docs = await DirectMessage.find({
+    // Both watermarks narrow the same _id lower/upper bound, so combine them
+    // into a single $gt rather than two separate conditions on the same key.
+    const lowerBoundId =
+      hiddenBeforeMessageId && (!before || asText(hiddenBeforeMessageId) > before)
+        ? hiddenBeforeMessageId
+        : null;
+
+    const query = {
       doctorId: asObjectId(doctorId),
       patientId: asObjectId(patientId),
-      ...(hiddenBeforeMessageId ? { _id: { $gt: hiddenBeforeMessageId } } : {}),
-    })
-      .sort({ createdAt: -1 })
-      .limit(limit)
+      hiddenForUsers: { $ne: asObjectId(authId) },
+    };
+    if (before && lowerBoundId) {
+      query._id = { $gt: lowerBoundId, $lt: asObjectId(before) };
+    } else if (before) {
+      query._id = { $lt: asObjectId(before) };
+    } else if (lowerBoundId) {
+      query._id = { $gt: lowerBoundId };
+    }
+
+    const docs = await DirectMessage.find(query)
+      .sort({ _id: -1 })
+      .limit(limit + 1)
       .lean();
 
-    const messages = docs.reverse().map((entry) => ({
-      id: entry._id.toString(),
-      doctorId: asText(entry.doctorId),
-      patientId: asText(entry.patientId),
-      sessionId: asText(entry.sessionId),
-      clientMessageId: asText(entry.clientMessageId),
-      senderRole: asText(entry.senderRole).toLowerCase(),
-      senderId: asText(entry.senderId),
-      recipientRole: asText(entry.recipientRole).toLowerCase(),
-      recipientId: asText(entry.recipientId),
-      message: asText(entry.message),
-      createdAt: entry.createdAt,
-      readByRecipient: entry.readByRecipient === true,
-      readAt: entry.readAt || null,
-    }));
+    const hasMore = docs.length > limit;
+    const page = hasMore ? docs.slice(0, limit) : docs;
+    const messages = page.reverse().map(toChatMessageListEntry);
 
-    await DirectMessage.updateMany(
-      {
-        doctorId: asObjectId(doctorId),
-        patientId: asObjectId(patientId),
-        recipientRole: role,
-        recipientId: asObjectId(authId),
-        readByRecipient: false,
-      },
-      {
-        $set: {
-          readByRecipient: true,
-          readAt: new Date(),
+    // Only marking-as-read on the initial (non-paginated) fetch avoids
+    // re-marking already-read older messages as "just read" every time the
+    // user scrolls up through history.
+    if (!before) {
+      await DirectMessage.updateMany(
+        {
+          doctorId: asObjectId(doctorId),
+          patientId: asObjectId(patientId),
+          recipientRole: role,
+          recipientId: asObjectId(authId),
+          readByRecipient: false,
         },
-      }
-    );
+        {
+          $set: {
+            readByRecipient: true,
+            readAt: new Date(),
+          },
+        }
+      );
+    }
 
     return res.json({
       success: true,
       relationType: relation.relationType || "session",
       relationId: relation.relationId || "",
       count: messages.length,
+      hasMore,
+      nextBefore: hasMore ? messages[0]?.id || null : null,
       messages,
     });
   } catch (error) {
@@ -1164,6 +1234,175 @@ router.delete("/chat/threads/:counterpartId", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to delete chat thread",
+      error: error.message,
+    });
+  }
+});
+
+// ---------------- Delete Individual Direct Message ----------------
+// Shared setup for both single-message deletion endpoints: resolves the
+// message, confirms the requester is a participant in its conversation, and
+// rejects an already-fully-deleted message. Ownership (for "for-everyone")
+// and window-eligibility checks are done by each route individually since
+// their rules differ.
+const loadOwnMessageForDeletion = async ({ req, res }) => {
+  const role = asText(req.auth?.role).toLowerCase();
+  const authId = asText(req.auth?.id);
+  const messageId = asText(req.params.messageId);
+
+  if (!["doctor", "patient"].includes(role)) {
+    res.status(403).json({
+      success: false,
+      code: "NOT_CONVERSATION_MEMBER",
+      message: "Only doctors and patients can delete chat messages.",
+    });
+    return null;
+  }
+  if (!isValidObjectId(authId) || !isValidObjectId(messageId)) {
+    res.status(400).json({
+      success: false,
+      code: "MESSAGE_NOT_FOUND",
+      message: "Invalid message identifier.",
+    });
+    return null;
+  }
+
+  const chatMessage = await DirectMessage.findById(messageId);
+  if (!chatMessage) {
+    res.status(404).json({
+      success: false,
+      code: "MESSAGE_NOT_FOUND",
+      message: "Message not found.",
+    });
+    return null;
+  }
+
+  const isParticipant =
+    (role === "doctor" && asText(chatMessage.doctorId) === authId) ||
+    (role === "patient" && asText(chatMessage.patientId) === authId);
+  if (!isParticipant) {
+    res.status(403).json({
+      success: false,
+      code: "NOT_CONVERSATION_MEMBER",
+      message: "You are not a participant in this conversation.",
+    });
+    return null;
+  }
+
+  return { role, authId, chatMessage };
+};
+
+// DELETE /api/sessions/chat/messages/:messageId/for-me
+// Hides the message from the requesting participant only. Idempotent: an
+// already-hidden message simply stays hidden and still returns success.
+router.delete("/chat/messages/:messageId/for-me", async (req, res) => {
+  try {
+    const resolved = await loadOwnMessageForDeletion({ req, res });
+    if (!resolved) return;
+    const { authId, chatMessage } = resolved;
+
+    const alreadyHidden = chatMessage.hiddenForUsers.some(
+      (id) => asText(id) === authId
+    );
+    if (!alreadyHidden) {
+      await DirectMessage.updateOne(
+        { _id: chatMessage._id },
+        { $addToSet: { hiddenForUsers: asObjectId(authId) } }
+      );
+    }
+
+    return res.json({
+      success: true,
+      messageId: asText(chatMessage._id),
+      deletionType: "for-me",
+    });
+  } catch (error) {
+    console.error("Delete message (for-me) error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to delete message",
+      error: error.message,
+    });
+  }
+});
+
+// DELETE /api/sessions/chat/messages/:messageId/for-everyone
+// Only the original sender, only within the configured recall window,
+// and only for message types this feature supports (plain text — no
+// system/audit/session-control messages exist on this model to protect
+// against, but the check is explicit rather than assumed). Content is
+// scrubbed server-side; the row is kept as a tombstone.
+router.delete("/chat/messages/:messageId/for-everyone", async (req, res) => {
+  try {
+    const resolved = await loadOwnMessageForDeletion({ req, res });
+    if (!resolved) return;
+    const { role, authId, chatMessage } = resolved;
+
+    if (chatMessage.isDeletedForEveryone) {
+      // Idempotent replay: already deleted for everyone, nothing left to do.
+      return res.json({
+        success: true,
+        messageId: asText(chatMessage._id),
+        deletionType: "for-everyone",
+        alreadyDeleted: true,
+      });
+    }
+
+    const isSender = asText(chatMessage.senderId) === authId && asText(chatMessage.senderRole).toLowerCase() === role;
+    if (!isSender) {
+      return res.status(403).json({
+        success: false,
+        code: "DELETE_FOR_EVERYONE_NOT_ALLOWED",
+        message: "Only the sender can delete this message for everyone.",
+      });
+    }
+
+    const windowMs = CHAT_DELETE_FOR_EVERYONE_WINDOW_HOURS * 60 * 60 * 1000;
+    const ageMs = Date.now() - new Date(chatMessage.createdAt).getTime();
+    if (ageMs > windowMs) {
+      return res.status(403).json({
+        success: false,
+        code: "DELETE_WINDOW_EXPIRED",
+        message: `This message can no longer be deleted for everyone (older than ${CHAT_DELETE_FOR_EVERYONE_WINDOW_HOURS} hours).`,
+      });
+    }
+
+    const deletedForEveryoneAt = new Date();
+    await DirectMessage.updateOne(
+      { _id: chatMessage._id, isDeletedForEveryone: false },
+      {
+        $set: {
+          isDeletedForEveryone: true,
+          deletedForEveryoneAt,
+          deletedForEveryoneBy: asObjectId(authId),
+          // Blank the content itself so any code path that forgets to check
+          // isDeletedForEveryone (a future query, a cache, a log line) still
+          // cannot leak the original text.
+          message: "",
+        },
+      }
+    );
+
+    const recipientId = asText(chatMessage.recipientId);
+    emitMessageDeleted({
+      recipientId,
+      counterpartId: authId,
+      messageId: asText(chatMessage._id),
+      deletionType: "for-everyone",
+      deletedAt: deletedForEveryoneAt.toISOString(),
+    });
+
+    return res.json({
+      success: true,
+      messageId: asText(chatMessage._id),
+      deletionType: "for-everyone",
+      deletedAt: deletedForEveryoneAt.toISOString(),
+    });
+  } catch (error) {
+    console.error("Delete message (for-everyone) error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to delete message",
       error: error.message,
     });
   }
@@ -1306,10 +1545,12 @@ router.get("/requests", async (req, res) => {
     // Clean up expired sessions first
     await Session.cleanExpiredSessions();
 
-    // Fetch pending requests for this patient
+    // Keep accepted sessions in the patient's Requests surface until they end
+    // or naturally expire. Previously this endpoint returned only `pending`,
+    // forcing clients to rely on an unreliable local cache after acceptance.
     const requests = await Session.find({
       patientId: req.auth.id,
-      status: "pending",
+      status: { $in: ["pending", "accepted"] },
       expiresAt: { $gt: new Date() }
     })
       .populate(
@@ -1499,6 +1740,19 @@ router.post("/:id/respond", async (req, res) => {
 
     const savedSession = await session.save();
 
+    let accessGrant = null;
+    if (status === "accepted") {
+      // Materializes the authoritative SessionAccessGrant for this session
+      // right now, from the patient's explicit approval-screen selection
+      // (req.body.selection) or their saved defaults if none was supplied
+      // (e.g. a legacy client that predates the sharing UI). This is the
+      // only place a doctor's document/structured-data access is granted.
+      accessGrant = await materializeGrantForSession({
+        session: savedSession,
+        selection: req.body.selection || {},
+      });
+    }
+
     console.log(`📋 Session ${sessionId} ${status} by patient ${req.auth.id}`);
     console.log('✅ Session saved to database:', {
       _id: savedSession._id,
@@ -1578,7 +1832,26 @@ router.post("/:id/respond", async (req, res) => {
         status: session.status,
         expiresAt: session.expiresAt,
         respondedAt: session.respondedAt
-      }
+      },
+      data: {
+        request: {
+          _id: session._id,
+          status: session.status,
+          expiresAt: session.expiresAt,
+        },
+        relationship: accessGrant
+          ? {
+              sessionId: String(accessGrant.sessionId),
+              selectedDocumentIds: accessGrant.selectedDocumentIds.map(String),
+              selectedCategories: accessGrant.selectedCategories,
+              structuredDataScopes: accessGrant.structuredDataScopes,
+              capabilities: accessGrant.capabilities,
+              status: accessGrant.status,
+              expiresAt: accessGrant.expiresAt,
+              version: accessGrant.version,
+            }
+          : null,
+      },
     });
 
   } catch (error) {
@@ -2251,6 +2524,18 @@ router.delete("/end/:sessionId", auth, async (req, res) => {
       throw new Error("Failed to persist ended session");
     }
 
+    // Ending a session revokes its access grant immediately — no cached
+    // client state can extend access past this point since every
+    // document/structured-data check re-resolves the grant per request.
+    await revokeGrant({ sessionId: session._id, revokedBy: req.auth.id });
+    emitSessionPermissionsUpdated({
+      recipientId: req.auth.id,
+      sessionId: session._id,
+      status: "revoked",
+      version: null,
+      changedScope: "session_ended",
+    });
+
     console.log(`🗑️ Session ${sessionId} ended by doctor ${req.auth.id}`);
     console.log('📋 Session end details:', {
       sessionId: sessionId,
@@ -2855,6 +3140,25 @@ router.post("/extend/:sessionId/respond", async (req, res) => {
     );
     const doctorName = resolveParticipantName(session.doctorId, "Doctor");
 
+    if (requestedStatus === "accepted") {
+      // Extension updates only the expiry — the previously-granted document
+      ///structured-data/capability scope is left completely untouched, so
+      // extending never silently expands what was shared.
+      await syncGrantExpiry({ sessionId: session._id, expiresAt: session.expiresAt });
+      const updatedGrant = await resolveActiveGrant({
+        sessionId: session._id,
+        doctorId: doctorRecipientId,
+        patientId: session.patientId,
+      });
+      emitSessionPermissionsUpdated({
+        recipientId: doctorRecipientId,
+        sessionId: session._id,
+        status: updatedGrant?.status || "active",
+        version: updatedGrant?.version || null,
+        changedScope: "expiry",
+      });
+    }
+
     try {
       const { Notification } = await import("../models/Notification.js");
       const { broadcastNotification } = await import(
@@ -3025,8 +3329,346 @@ router.patch('/:sessionId/update', async (req, res) => {
 });
 
 
-export default router;
+// =====================================================================
+// Patient-controlled session data sharing
+// =====================================================================
 
+// ---------------- Default sharing preferences ----------------
+// GET /api/sessions/sharing-preferences
+router.get("/sharing-preferences", async (req, res) => {
+  try {
+    if (req.auth?.role !== "patient") {
+      return res.status(403).json({ success: false, message: "Patient access required" });
+    }
+    const preferences = await getSharingPreferences(req.auth.id);
+    return res.json({ success: true, data: { preferences } });
+  } catch (error) {
+    console.error("Fetch sharing preferences error:", error);
+    return res.status(500).json({ success: false, message: "Failed to load sharing preferences" });
+  }
+});
+
+// PATCH /api/sessions/sharing-preferences
+router.patch("/sharing-preferences", async (req, res) => {
+  try {
+    if (req.auth?.role !== "patient") {
+      return res.status(403).json({ success: false, message: "Patient access required" });
+    }
+    const { categoryDefaults, structuredDataDefaults, capabilities } = req.body || {};
+    const preferences = await updateSharingPreferences(req.auth.id, {
+      categoryDefaults,
+      structuredDataDefaults,
+      capabilities,
+    });
+    return res.json({ success: true, data: { preferences } });
+  } catch (error) {
+    console.error("Update sharing preferences error:", error);
+    return res.status(500).json({ success: false, message: "Failed to update sharing preferences" });
+  }
+});
+
+// ---------------- Approval-screen preview ----------------
+// GET /api/sessions/:id/approval-preview
+// Returns category/document counts and pre-selection defaults for the
+// patient's approval screen. Read-only — approving is still done via
+// POST /:id/respond with an explicit `selection` body.
+router.get("/:id/approval-preview", async (req, res) => {
+  try {
+    if (req.auth?.role !== "patient") {
+      return res.status(403).json({ success: false, message: "Patient access required" });
+    }
+    const session = await Session.findById(req.params.id)
+      .populate(
+        "doctorId",
+        "name email avatar profilePicture profilePictureUrl specialty specialization"
+      )
+      .lean();
+    if (!session) {
+      return res.status(404).json({ success: false, message: "Session request not found" });
+    }
+    if (String(session.patientId) !== String(req.auth.id)) {
+      return res.status(403).json({ success: false, message: "You can only preview your own requests" });
+    }
+    const preview = await buildApprovalPreview({ patientId: req.auth.id });
+    return res.json({
+      success: true,
+      data: {
+        doctor: await buildDoctorSummary(session.doctorId),
+        sessionDurationMinutes: 20,
+        ...preview,
+      },
+    });
+  } catch (error) {
+    console.error("Approval preview error:", error);
+    return res.status(500).json({ success: false, message: "Failed to load approval preview" });
+  }
+});
+
+// ---------------- Doctor: read the shared-data summary for a session ----------------
+// GET /api/sessions/:sessionId/shared-data
+// Returns exactly what the doctor's active grant currently allows — never
+// the patient's full document/structured-data set. Absence of a category or
+// scope here means it was not shared, not merely "not yet loaded".
+router.get("/:sessionId/shared-data", async (req, res) => {
+  try {
+    if (req.auth?.role !== "doctor") {
+      return res.status(403).json({ success: false, message: "Doctor access required" });
+    }
+    if (!req.params.sessionId?.match(/^[0-9a-fA-F]{24}$/)) {
+      return res.status(400).json({ success: false, message: "Invalid session id" });
+    }
+    const session = await Session.findById(req.params.sessionId).select("doctorId patientId").lean();
+    if (!session || String(session.doctorId) !== String(req.auth.id)) {
+      return res.status(404).json({ success: false, message: "Session not found" });
+    }
+    const grant = await resolveActiveGrant({
+      sessionId: session._id,
+      doctorId: req.auth.id,
+      patientId: session.patientId,
+    });
+    if (!grant) {
+      return res.status(403).json({
+        success: false,
+        code: "SESSION_ACCESS_REVOKED_OR_EXPIRED",
+        message: "This session's access has expired or been revoked.",
+      });
+    }
+    const { Document } = await import("../models/File.js");
+    const docs = await Document.find({ _id: { $in: grant.selectedDocumentIds } })
+      .select("_id title category createdAt")
+      .lean();
+    return res.json({
+      success: true,
+      data: {
+        sessionId: String(session._id),
+        documents: docs.map((doc) => ({
+          id: String(doc._id),
+          title: doc.title,
+          category: doc.category,
+          createdAt: doc.createdAt,
+        })),
+        selectedCategories: grant.selectedCategories,
+        structuredDataScopes: grant.structuredDataScopes,
+        capabilities: grant.capabilities,
+        expiresAt: grant.expiresAt,
+        version: grant.version,
+      },
+    });
+  } catch (error) {
+    console.error("Fetch shared-data error:", error);
+    return res.status(500).json({ success: false, message: "Failed to load shared data" });
+  }
+});
+
+// ---------------- Patient: view the live scope of an active grant ----------------
+// The patient needs this view to revoke one selected document without ending
+// the whole consultation. Return only the documents already in this grant.
+router.get("/:sessionId/access-grant", async (req, res) => {
+  try {
+    if (req.auth?.role !== "patient") {
+      return res.status(403).json({ success: false, message: "Patient access required" });
+    }
+    const { SessionAccessGrant } = await import("../models/SessionAccessGrant.js");
+    const grant = await SessionAccessGrant.findOne({ sessionId: req.params.sessionId }).lean();
+    if (!grant || String(grant.patientId) !== String(req.auth.id)) {
+      return res.status(404).json({ success: false, message: "Access grant not found" });
+    }
+    const { Document } = await import("../models/File.js");
+    const documents = await Document.find({ _id: { $in: grant.selectedDocumentIds } })
+      .select("_id title category createdAt")
+      .lean();
+    return res.json({
+      success: true,
+      data: {
+        status: grant.status,
+        version: grant.version,
+        expiresAt: grant.expiresAt,
+        documents: documents.map((document) => ({
+          id: String(document._id),
+          title: document.title || "Document",
+          category: document.category || "",
+          createdAt: document.createdAt,
+        })),
+        selectedDocumentIds: grant.selectedDocumentIds.map(String),
+        structuredDataScopes: grant.structuredDataScopes,
+        capabilities: grant.capabilities,
+      },
+    });
+  } catch (error) {
+    console.error("Fetch patient access grant error:", error);
+    return res.status(500).json({ success: false, message: "Failed to load session access" });
+  }
+});
+
+// ---------------- Patient: update an active grant ----------------
+// PATCH /api/sessions/:sessionId/access-grant
+// Body may include any of: addDocumentIds, removeDocumentIds,
+// structuredDataScopes (full replacement array), capabilities (partial),
+// expectedVersion (optimistic concurrency — rejected with 409 if stale).
+router.patch("/:sessionId/access-grant", async (req, res) => {
+  try {
+    if (req.auth?.role !== "patient") {
+      return res.status(403).json({ success: false, message: "Patient access required" });
+    }
+    if (!req.params.sessionId?.match(/^[0-9a-fA-F]{24}$/)) {
+      return res.status(400).json({ success: false, message: "Invalid session id" });
+    }
+    const { SessionAccessGrant } = await import("../models/SessionAccessGrant.js");
+    const grant = await SessionAccessGrant.findOne({ sessionId: req.params.sessionId });
+    if (!grant || String(grant.patientId) !== String(req.auth.id)) {
+      return res.status(404).json({ success: false, message: "Access grant not found" });
+    }
+    if (grant.status !== "active") {
+      return res.status(409).json({ success: false, message: "This session's access is no longer active" });
+    }
+    const { expectedVersion, addDocumentIds, removeDocumentIds, structuredDataScopes, capabilities } = req.body || {};
+    if (expectedVersion !== undefined && Number(expectedVersion) !== grant.version) {
+      // A stale client (e.g. holding a pre-revocation grant snapshot) must
+      // never be able to overwrite a newer state, most importantly a
+      // revocation that happened after the client last fetched the grant.
+      return res.status(409).json({
+        success: false,
+        code: "GRANT_VERSION_STALE",
+        message: "This session's permissions changed elsewhere. Refresh and try again.",
+      });
+    }
+
+    let documentIds = new Set(grant.selectedDocumentIds.map(String));
+    if (Array.isArray(addDocumentIds)) {
+      for (const id of addDocumentIds) {
+        if (mongoose.Types.ObjectId.isValid(id)) documentIds.add(String(id));
+      }
+    }
+    if (Array.isArray(removeDocumentIds)) {
+      for (const id of removeDocumentIds) documentIds.delete(String(id));
+    }
+    grant.selectedDocumentIds = Array.from(documentIds).map(asObjectId);
+
+    if (Array.isArray(structuredDataScopes)) {
+      grant.structuredDataScopes = structuredDataScopes.filter((scope) =>
+        STRUCTURED_DATA_SCOPES.includes(scope)
+      );
+    }
+    if (capabilities && typeof capabilities === "object") {
+      if (typeof capabilities.canDownloadDocuments === "boolean") {
+        grant.capabilities.canDownloadDocuments = capabilities.canDownloadDocuments;
+      }
+      if (typeof capabilities.canUploadDocuments === "boolean") {
+        grant.capabilities.canUploadDocuments = capabilities.canUploadDocuments;
+      }
+    }
+    grant.version += 1;
+    await grant.save();
+
+    emitSessionPermissionsUpdated({
+      recipientId: String(grant.doctorId),
+      sessionId: grant.sessionId,
+      status: grant.status,
+      version: grant.version,
+      changedScope: "partial_update",
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        selectedDocumentIds: grant.selectedDocumentIds.map(String),
+        structuredDataScopes: grant.structuredDataScopes,
+        capabilities: grant.capabilities,
+        version: grant.version,
+      },
+    });
+  } catch (error) {
+    console.error("Update access grant error:", error);
+    return res.status(500).json({ success: false, message: "Failed to update access grant" });
+  }
+});
+
+// ---------------- Patient: revoke a single document from an active grant ----------------
+// DELETE /api/sessions/:sessionId/access-grant/documents/:documentId
+router.delete("/:sessionId/access-grant/documents/:documentId", async (req, res) => {
+  try {
+    if (req.auth?.role !== "patient") {
+      return res.status(403).json({ success: false, message: "Patient access required" });
+    }
+    const { SessionAccessGrant } = await import("../models/SessionAccessGrant.js");
+    const grant = await SessionAccessGrant.findOne({ sessionId: req.params.sessionId });
+    if (!grant || String(grant.patientId) !== String(req.auth.id)) {
+      return res.status(404).json({ success: false, message: "Access grant not found" });
+    }
+    if (grant.status !== "active") {
+      return res.json({ success: true, data: { alreadyInactive: true } });
+    }
+    const before = grant.selectedDocumentIds.length;
+    grant.selectedDocumentIds = grant.selectedDocumentIds.filter(
+      (id) => String(id) !== String(req.params.documentId)
+    );
+    const changed = grant.selectedDocumentIds.length !== before;
+    if (changed) {
+      grant.version += 1;
+      await grant.save();
+      emitSessionPermissionsUpdated({
+        recipientId: String(grant.doctorId),
+        sessionId: grant.sessionId,
+        status: grant.status,
+        version: grant.version,
+        changedScope: "document_revoked",
+      });
+    }
+    return res.json({ success: true, data: { removed: changed, version: grant.version } });
+  } catch (error) {
+    console.error("Revoke document error:", error);
+    return res.status(500).json({ success: false, message: "Failed to revoke document access" });
+  }
+});
+
+// ---------------- Patient: revoke the entire session's access ----------------
+// POST /api/sessions/:sessionId/revoke
+// Idempotent: revoking an already-revoked/expired grant still returns
+// success rather than an error, since the end state the caller wants
+// ("this doctor can no longer access anything for this session") already
+// holds.
+router.post("/:sessionId/revoke", async (req, res) => {
+  try {
+    if (req.auth?.role !== "patient") {
+      return res.status(403).json({ success: false, message: "Patient access required" });
+    }
+    const { SessionAccessGrant } = await import("../models/SessionAccessGrant.js");
+    const existing = await SessionAccessGrant.findOne({ sessionId: req.params.sessionId });
+    if (!existing || String(existing.patientId) !== String(req.auth.id)) {
+      return res.status(404).json({ success: false, message: "Access grant not found" });
+    }
+
+    const grant = await revokeGrant({ sessionId: req.params.sessionId, revokedBy: req.auth.id });
+    const finalGrant = grant || existing; // already revoked/expired — reuse for the response
+
+    emitSessionPermissionsUpdated({
+      recipientId: String(finalGrant.doctorId),
+      sessionId: finalGrant.sessionId,
+      status: "revoked",
+      version: finalGrant.version,
+      changedScope: "full_session",
+    });
+
+    // Also end the underlying Session so the doctor's session list and any
+    // other session-scoped check reflect this immediately too, not just
+    // document/structured-data access.
+    await Session.updateOne(
+      { _id: req.params.sessionId, status: "accepted" },
+      { $set: { status: "ended", endedAt: new Date(), isActive: false } }
+    );
+
+    return res.json({
+      success: true,
+      message: "Session access revoked",
+      data: { status: "revoked", version: finalGrant.version },
+    });
+  } catch (error) {
+    console.error("Revoke session error:", error);
+    return res.status(500).json({ success: false, message: "Failed to revoke session access" });
+  }
+});
+
+export default router;
 
 
 

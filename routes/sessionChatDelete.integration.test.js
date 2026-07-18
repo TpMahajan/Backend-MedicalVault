@@ -196,6 +196,8 @@ await jest.unstable_mockModule("../utils/notifications.js", () => ({
 await jest.unstable_mockModule("../services/chatPresenceRealtime.js", () => ({
   emitNewDirectMessage: jest.fn(),
   emitTypingEvent: jest.fn(),
+  emitMessageDeleted: jest.fn(),
+  emitSessionPermissionsUpdated: jest.fn(),
 }));
 await jest.unstable_mockModule("../services/sessionHistoryPersistence.js", () => ({
   persistSessionHistory: jest.fn(async () => {}),

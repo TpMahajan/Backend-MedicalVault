@@ -1,0 +1,33 @@
+{
+  "status": "release-pending",
+  "version": "1.0.24",
+  "buildNumber": 31,
+  "minimumSupportedVersion": "1.0.18",
+  "minimumSupportedBuildNumber": 18,
+  "apkFileName": "1.0.24+31.apk",
+  "fileSizeBytes": 97831091,
+  "sha256": "9893b437880df38a56c1e520fe884dace6ca42002b733cf68ebf3cd3f883d736",
+  "metadataPath": "/Users/tusharmahajan/Ai Ally/Medical Vault/Backend-MedicalVault/app-update.json",
+  "sourceApkPath": "/Users/tusharmahajan/Ai Ally/Medical Vault/MedicalVault/build/app/outputs/flutter-apk/app-release.apk",
+  "releaseNotes": "Fixed Google Sign-In / Sign-up.,Lost and Found improvements.,Nearby Healthcare now opens with Google Maps fallback actions when Places is unavailable.,Document upload and update flow reliability improvements.",
+  "localVerification": null,
+  "firebaseDistribution": {
+    "status": "uploaded",
+    "androidAppId": "1:17869523090:android:4e9fa2ca8f13c122533e4b",
+    "groups": "qa-team",
+    "testers": null,
+    "firebaseConsoleUri": "https://console.firebase.google.com/project/medicalvaultnotifications/appdistribution/app/android:com.example.hello/releases/0emvpik5ovmtg?utm_source=firebase-tools",
+    "testerUri": "https://appdistribution.firebase.google.com/testerapps/1:17869523090:android:4e9fa2ca8f13c122533e4b/releases/0emvpik5ovmtg?utm_source=firebase-tools",
+    "uploadedAtIst": "2026-07-18 18:15:28 IST"
+  },
+  "deploymentTrigger": {
+    "triggered": false,
+    "reason": "not requested or not authorized this run"
+  },
+  "remoteVerification": null,
+  "timestamps": {
+    "preparedAtIst": "2026-07-18 18:15:28 IST",
+    "preparedAtUtc": "2026-07-18T12:45:28.430Z"
+  },
+  "gitCommit": "15e03815e77bc3b9f1bbb98d56dc5114c46bc2f7"
+}

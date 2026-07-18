@@ -3,6 +3,7 @@ import { auth } from "../middleware/auth.js";
 import { requirePatient } from "../middleware/auth.js";
 import { Appointment } from "../models/Appointment.js";
 import { Document } from "../models/File.js";
+import { DoctorUser } from "../models/DoctorUser.js";
 import { BUCKET_NAME } from "../config/s3.js";
 import { generateSignedUrl } from "../utils/s3Utils.js";
 
@@ -21,6 +22,8 @@ const getPublicBaseUrl = () => {
 };
 
 const asText = (value) => (value == null ? "" : String(value).trim());
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+const TIME_ONLY = /^([01]\d|2[0-3]):[0-5]\d$/;
 
 const toAbsoluteUploadsUrl = (value) => {
   const raw = asText(value);
@@ -98,6 +101,56 @@ const normalizeAppointmentDoctor = async (appointment) => {
     doctorSpecialization: appointment.doctorSpecialization || specialization,
   };
 };
+
+// GET /api/patient/appointments/doctors
+// This intentionally exposes only the fields a patient needs to choose a
+// clinician. Contact information, credentials and linked-patient data remain
+// private to the doctor/account-management surfaces.
+router.get("/appointments/doctors", async (_req, res) => {
+  try {
+    const doctors = await DoctorUser
+      .find({ isActive: true })
+      .select(
+        "name specialty specialization location avatar avatarUrl profilePicture profilePictureUrl yearsOfExperience languages bio"
+      )
+      .sort({ name: 1 })
+      .limit(200)
+      .lean();
+
+    const directory = await Promise.all(
+      doctors.map(async (doctor) => {
+        const profilePictureUrl =
+          (await resolveDoctorAvatarUrl(doctor)) ||
+          toAbsoluteUploadsUrl(
+            doctor.profilePictureUrl ||
+              doctor.profilePicture ||
+              doctor.avatarUrl ||
+              doctor.avatar
+          );
+        return {
+          id: String(doctor._id),
+          name: asText(doctor.name),
+          specialization: asText(doctor.specialty || doctor.specialization),
+          location: asText(doctor.location),
+          profilePictureUrl: profilePictureUrl || null,
+          yearsOfExperience: Number(doctor.yearsOfExperience) || 0,
+          languages: Array.isArray(doctor.languages)
+            ? doctor.languages.map(asText).filter(Boolean).slice(0, 8)
+            : [],
+          bio: asText(doctor.bio).slice(0, 1000),
+        };
+      })
+    );
+
+    return res.json({ success: true, doctors: directory, count: directory.length });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load the doctor directory.",
+      error: error.message,
+    });
+  }
+});
 
 // POST /api/patient/appointments/request - Patient requests appointment (for self or linked family member)
 router.post("/appointments/request", async (req, res) => {
@@ -400,6 +453,28 @@ router.post("/appointments/:id/reschedule-request", async (req, res) => {
     const { id } = req.params;
     const { preferredDate, preferredTime, reason } = req.body;
 
+    const normalizedDate = asText(preferredDate);
+    const normalizedTime = asText(preferredTime);
+    if (!DATE_ONLY.test(normalizedDate) || !TIME_ONLY.test(normalizedTime)) {
+      return res.status(400).json({
+        success: false,
+        message: "Choose a valid preferred date and time.",
+      });
+    }
+    const requestedDate = new Date(`${normalizedDate}T00:00:00.000Z`);
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    if (
+      Number.isNaN(requestedDate.getTime()) ||
+      requestedDate.toISOString().slice(0, 10) !== normalizedDate ||
+      requestedDate < today
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Choose a preferred date that is today or later.",
+      });
+    }
+
     const appointment = await Appointment.findOne({
       _id: id,
       patientId,
@@ -428,9 +503,9 @@ router.post("/appointments/:id/reschedule-request", async (req, res) => {
     }
 
     appointment.rescheduleRequestedAt = new Date();
-    appointment.rescheduleReason = reason || "";
-    if (preferredDate) appointment.appointmentDate = new Date(preferredDate);
-    if (preferredTime) appointment.appointmentTime = preferredTime;
+    appointment.rescheduleReason = asText(reason).slice(0, 1000);
+    appointment.appointmentDate = requestedDate;
+    appointment.appointmentTime = normalizedTime;
     await appointment.save();
 
     res.json({

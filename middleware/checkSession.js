@@ -1,7 +1,23 @@
-﻿import { User } from "../models/User.js";
-import { canDoctorAccessPatient } from "../services/accessControl.js";
+﻿import mongoose from "mongoose";
+import { User } from "../models/User.js";
+import { Session } from "../models/Session.js";
+import { resolveActiveGrant } from "../services/sessionAccessGrantService.js";
 
 const privilegedRoles = new Set(["admin", "superadmin"]);
+
+// A doctor's most recent accepted, non-expired session with this patient —
+// used only to locate which SessionAccessGrant to check, never itself as an
+// authorization decision. The grant (or its absence) is always the real gate.
+const findMostRecentAcceptedSession = async (doctorId, patientId) =>
+  Session.findOne({
+    doctorId,
+    patientId,
+    status: "accepted",
+    expiresAt: { $gt: new Date() },
+  })
+    .sort({ expiresAt: -1 })
+    .select("_id")
+    .lean();
 
 const normalizeRole = (role) => String(role || "").trim().toLowerCase();
 
@@ -57,16 +73,37 @@ export const checkSession = async (req, res, next) => {
       return res.status(403).json({ success: false, message: "Access denied" });
     }
 
-    const allowed = await canDoctorAccessPatient(String(req.auth.id), String(patientId));
-    if (!allowed) {
+    if (!mongoose.Types.ObjectId.isValid(patientId)) {
+      return res.status(403).json({ success: false, message: "Access denied" });
+    }
+
+    // A doctor's access is authorized exclusively by an active
+    // SessionAccessGrant for a currently-accepted session — not by any
+    // standing/long-term relationship record. This is the deliberate
+    // replacement for the previous binary "has an accepted session"
+    // check: the grant additionally scopes exactly which documents and
+    // structured-data are visible, which callers must apply themselves
+    // using req.sessionAccessGrant (this middleware only decides
+    // pass/fail, since what "using" the grant means differs per route).
+    const recentSession = await findMostRecentAcceptedSession(req.auth.id, patientId);
+    const grant = recentSession
+      ? await resolveActiveGrant({
+          sessionId: recentSession._id,
+          doctorId: req.auth.id,
+          patientId,
+        })
+      : null;
+
+    if (!grant) {
       return res.status(403).json({
         success: false,
-        message: "No active doctor-patient relationship",
+        message: "No active, authorized session for this patient",
         code: "NO_ACTIVE_SESSION",
       });
     }
 
     req.patientId = patientId;
+    req.sessionAccessGrant = grant;
     return next();
   } catch (error) {
     console.error("Session access guard error:", error);

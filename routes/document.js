@@ -26,6 +26,7 @@ import {
 } from "../utils/s3Utils.js";
 import { sendNotification } from "../utils/notifications.js";
 import { canDoctorAccessPatient } from "../services/accessControl.js";
+import { grantAllowsDocument, filterDocumentsForRequester } from "../services/sessionAccessGrantService.js";
 import { writeAuditLog } from "../middleware/auditLogger.js";
 import { uploadLimiter } from "../middleware/rateLimit.js";
 import DocumentReader from "../services/documentReader.js";
@@ -1123,7 +1124,13 @@ const tryProxyStoredDocument = async (
   }
 };
 
-const canAccessDocument = async (req, doc) => {
+// `capability` is "view" (preview/preview-url/proxy) or "download". A doctor
+// is authorized only through their active SessionAccessGrant for this exact
+// document — never through canDoctorAccessPatient/any standing relationship,
+// and never for edit/delete (callers for those routes must reject the
+// doctor role outright rather than call this function with a capability for
+// them, since no grant capability corresponds to mutating a patient's vault).
+const canAccessDocument = async (req, doc, capability = "view") => {
   const role = String(req.auth?.role || "").toLowerCase();
   const requesterId = String(req.auth?.id || "");
   const patientId = String(doc.userId || "");
@@ -1149,7 +1156,11 @@ const canAccessDocument = async (req, doc) => {
     return !!profile && relationship?.permissions?.documentsView === true;
   }
   if (role === "doctor") {
-    return canDoctorAccessPatient(requesterId, patientId);
+    const grant = req.sessionAccessGrant;
+    if (!grant) return false;
+    if (!grantAllowsDocument(grant, doc._id)) return false;
+    if (capability === "download") return grant.capabilities?.canDownloadDocuments === true;
+    return grant.capabilities?.canViewDocuments === true;
   }
   return false;
 };
@@ -1794,9 +1805,10 @@ router.post(
 // ---------------- List Files ----------------
 router.get("/user/:userId", auth, checkSession, async (req, res) => {
   try {
-    const docs = await Document.find({ userId: req.params.userId }).sort({
+    const allDocs = await Document.find({ userId: req.params.userId }).sort({
       createdAt: -1,
     });
+    const docs = filterDocumentsForRequester(req, allDocs);
 
     // Generate signed URLs for each document
     const docsWithUrl = await Promise.all(
@@ -1835,9 +1847,10 @@ router.get("/user/:userId", auth, checkSession, async (req, res) => {
 // ---------------- Patient Files (alias for user) ----------------
 router.get("/patient/:patientId", auth, checkSession, async (req, res) => {
   try {
-    const docs = await Document.find({
+    const allDocs = await Document.find({
       userId: req.params.patientId,
     }).sort({ createdAt: -1 });
+    const docs = filterDocumentsForRequester(req, allDocs);
 
     // Generate signed URLs for each document
     const docsWithUrl = await Promise.all(
@@ -1876,7 +1889,8 @@ router.get("/patient/:patientId", auth, checkSession, async (req, res) => {
 // ---------------- Grouped Files ----------------
 router.get("/user/:userId/grouped", auth, checkSession, async (req, res) => {
   try {
-    const docs = await Document.find({ userId: req.params.userId });
+    const allDocs = await Document.find({ userId: req.params.userId });
+    const docs = filterDocumentsForRequester(req, allDocs);
 
     const grouped = {
       reports: docs.filter((d) => d.category?.toLowerCase() === "report"),
@@ -2023,7 +2037,8 @@ router.get("/grouped/:email", auth, checkSessionByEmail, async (req, res) => {
 
     console.log(`✅ User found: ${user._id}`);
 
-    const docs = await Document.find({ userId: user._id.toString() });
+    const allDocs = await Document.find({ userId: user._id.toString() });
+    const docs = filterDocumentsForRequester(req, allDocs);
     console.log(`📁 Found ${docs.length} documents for user`);
 
     const grouped = {
@@ -2264,7 +2279,7 @@ router.get("/:id/download", auth, checkSession, async (req, res) => {
     const doc = await Document.findById(req.params.id);
     if (!doc) return res.status(404).json({ msg: "File not found" });
 
-    const allowed = await canAccessDocument(req, doc);
+    const allowed = await canAccessDocument(req, doc, "download");
     if (!allowed) {
       return res.status(403).json({ msg: "Unauthorized access" });
     }
@@ -2453,6 +2468,12 @@ router.get("/:id/proxy", auth, checkSession, async (req, res) => {
 // ---------------- Update Document ----------------
 router.put("/:id", auth, requireVerified, checkSession, async (req, res) => {
   try {
+    // No SessionAccessGrant capability corresponds to editing a patient's
+    // document — a session only ever grants view/download/upload. A doctor
+    // must never be able to edit a patient's existing document metadata.
+    if (String(req.auth?.role || "").toLowerCase() === "doctor") {
+      return res.status(403).json({ success: false, msg: "Unauthorized access" });
+    }
     if (!isValidObjectId(req.params.id)) {
       return res.status(400).json({ success: false, msg: "Invalid file id" });
     }
@@ -2548,6 +2569,10 @@ router.put("/:id", auth, requireVerified, checkSession, async (req, res) => {
 // ---------------- Delete ----------------
 router.delete("/:id", auth, requireVerified, checkSession, async (req, res) => {
   try {
+    // Same rule as PUT above: no grant capability authorizes deletion.
+    if (String(req.auth?.role || "").toLowerCase() === "doctor") {
+      return res.status(403).json({ msg: "Unauthorized access" });
+    }
     if (!isValidObjectId(req.params.id)) {
       return res.status(400).json({ msg: "Invalid file id" });
     }

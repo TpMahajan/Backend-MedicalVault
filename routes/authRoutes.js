@@ -1184,6 +1184,124 @@ const updateSessionPolicyHandler = async (req, res) => {
 router.put("/session/policy", auth, updateSessionPolicyHandler);
 router.patch("/session/policy", auth, updateSessionPolicyHandler);
 
+// ---------------- Account Settings ----------------
+// A single role-aware contract keeps web settings durable for both patients
+// and doctors. It is intentionally limited to account preferences; medical
+// sharing and Family Care permissions retain their dedicated, consent-aware
+// APIs.
+const settingBoolean = (value) => value === true;
+const allowedLanguages = new Set(["en", "hi", "es", "ru", "ko", "ja", "zh"]);
+const preferenceKeys = {
+  notifications: ["newPatients", "appointmentReminders", "labResults", "medicationUpdates", "emergencyAlerts", "accountAlerts"],
+  privacy: ["dataSharing", "analytics", "marketing", "thirdParty"],
+  appearance: ["compactMode", "showAvatars", "animations"],
+};
+
+const accountSettingsView = (principal, role) => {
+  const preferences = principal?.preferences || {};
+  const security = principal?.securitySettings || {};
+  const doctor = role === "doctor";
+  return {
+    language: allowedLanguages.has(asText(preferences.language)) ? preferences.language : "en",
+    timezone: asText(preferences.timezone).slice(0, 80) || "Asia/Kolkata",
+    appearance: {
+      theme: preferences.theme === "dark" ? "dark" : "light",
+      compactMode: settingBoolean(preferences.appearance?.compactMode),
+      showAvatars: preferences.appearance?.showAvatars !== false,
+      animations: preferences.appearance?.animations !== false,
+    },
+    notifications: doctor
+      ? {
+          newPatients: preferences.notifications?.newPatients !== false,
+          appointmentReminders: preferences.notifications?.appointmentReminders !== false,
+          labResults: settingBoolean(preferences.notifications?.labResults),
+          medicationUpdates: preferences.notifications?.medicationUpdates !== false,
+          emergencyAlerts: preferences.notifications?.emergencyAlerts !== false,
+        }
+      : {
+          appointmentReminders: preferences.notifications?.appointmentReminders !== false,
+          medicationUpdates: preferences.notifications?.medicationUpdates !== false,
+          emergencyAlerts: preferences.notifications?.emergencyAlerts !== false,
+          accountAlerts: preferences.notifications?.accountAlerts !== false,
+        },
+    privacy: doctor
+      ? {
+          dataSharing: settingBoolean(preferences.privacy?.dataSharing),
+          analytics: preferences.privacy?.analytics !== false,
+          marketing: settingBoolean(preferences.privacy?.marketing),
+          thirdParty: settingBoolean(preferences.privacy?.thirdParty),
+        }
+      : {
+          analytics: preferences.privacy?.analytics !== false,
+          marketing: settingBoolean(preferences.privacy?.marketing),
+        },
+    security: {
+      ...(doctor ? { twoFactorAuth: settingBoolean(security.twoFactorAuth) } : {}),
+      sessionTimeout: Number(security.sessionTimeout) || 30,
+      ...(doctor ? { passwordExpiry: Number(security.passwordExpiry) || 90 } : {}),
+      loginNotifications: security.loginNotifications !== false,
+    },
+    isActive: principal?.isActive !== false,
+  };
+};
+
+const updateAccountSettings = async (req, res) => {
+  try {
+    const role = lower(req.auth?.role);
+    const principalId = asText(req.auth?.id);
+    const doctor = role === "doctor";
+    const Model = doctor ? DoctorUser : role === patientRole ? User : null;
+    if (!Model || !principalId) return res.status(403).json({ success: false, message: "Patient or doctor access required" });
+
+    const body = req.body || {};
+    const update = {};
+    if (body.language !== undefined && allowedLanguages.has(asText(body.language))) update["preferences.language"] = asText(body.language);
+    if (body.timezone !== undefined && asText(body.timezone).length <= 80) update["preferences.timezone"] = asText(body.timezone) || "Asia/Kolkata";
+    if (["light", "dark"].includes(asText(body.appearance?.theme))) update["preferences.theme"] = asText(body.appearance.theme);
+    for (const key of preferenceKeys.appearance) if (typeof body.appearance?.[key] === "boolean") update[`preferences.appearance.${key}`] = body.appearance[key];
+    for (const key of preferenceKeys.notifications) {
+      if (typeof body.notifications?.[key] === "boolean" && (doctor || !["newPatients", "labResults"].includes(key))) update[`preferences.notifications.${key}`] = body.notifications[key];
+    }
+    for (const key of preferenceKeys.privacy) {
+      if (typeof body.privacy?.[key] === "boolean" && (doctor || !["dataSharing", "thirdParty"].includes(key))) update[`preferences.privacy.${key}`] = body.privacy[key];
+    }
+    if (typeof body.security?.sessionTimeout === "number" && body.security.sessionTimeout >= 5 && body.security.sessionTimeout <= 480) update["securitySettings.sessionTimeout"] = body.security.sessionTimeout;
+    if (typeof body.security?.loginNotifications === "boolean") update["securitySettings.loginNotifications"] = body.security.loginNotifications;
+    if (doctor && typeof body.security?.twoFactorAuth === "boolean") update["securitySettings.twoFactorAuth"] = body.security.twoFactorAuth;
+    if (doctor && typeof body.security?.passwordExpiry === "number" && body.security.passwordExpiry >= 30 && body.security.passwordExpiry <= 365) update["securitySettings.passwordExpiry"] = body.security.passwordExpiry;
+
+    const principal = await Model.findByIdAndUpdate(principalId, { $set: update }, { new: true, runValidators: true }).select("-password");
+    if (!principal) return res.status(404).json({ success: false, message: "Account not found" });
+    return res.json({ success: true, message: "Settings updated", settings: accountSettingsView(principal, role) });
+  } catch {
+    return res.status(500).json({ success: false, message: "Failed to update settings" });
+  }
+};
+
+router.get("/account-settings", auth, (req, res) => {
+  const role = lower(req.auth?.role);
+  const principal = role === "doctor" ? req.doctor : role === patientRole ? req.user : null;
+  if (!principal) return res.status(403).json({ success: false, message: "Patient or doctor access required" });
+  return res.json({ success: true, role, settings: accountSettingsView(principal, role) });
+});
+router.put("/account-settings", auth, updateAccountSettings);
+
+router.get("/device-sessions", auth, async (req, res) => {
+  const principalId = asText(req.auth?.id);
+  const role = lower(req.auth?.role);
+  if (!principalId || ![patientRole, "doctor"].includes(role)) return res.status(403).json({ success: false, message: "Patient or doctor access required" });
+  const sessions = await RefreshToken.find({ principalId, role, revokedAt: null, expiresAt: { $gt: new Date() } })
+    .select("jti deviceInfo userAgent createdByIp lastActiveAt createdAt")
+    .sort({ lastActiveAt: -1 }).lean();
+  return res.json({ success: true, sessions: sessions.map((session) => ({ id: session.jti, deviceInfo: session.deviceInfo, userAgent: session.userAgent, ipAddress: session.createdByIp, lastActiveAt: session.lastActiveAt, createdAt: session.createdAt, current: asText(req.auth?.sid) === asText(session.jti) })) });
+});
+
+router.delete("/device-sessions/:sessionId", auth, async (req, res) => {
+  const result = await RefreshToken.updateOne({ principalId: asText(req.auth?.id), role: lower(req.auth?.role), jti: asText(req.params.sessionId), revokedAt: null }, { $set: { revokedAt: new Date(), revokedReason: "device_logout" } });
+  if (!result.matchedCount) return res.status(404).json({ success: false, message: "Device session not found" });
+  return res.json({ success: true, message: "Device session signed out" });
+});
+
 // ---------------- Dashboard Display Preferences ----------------
 // GET /api/auth/dashboard-preferences
 router.get("/dashboard-preferences", auth, async (req, res) => {

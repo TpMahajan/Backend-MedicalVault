@@ -1,16 +1,16 @@
 {
   "latestVersion": "1.0.24",
   "latestBuild": 23,
-  "latestBuildNumber": 30,
+  "latestBuildNumber": 31,
   "minimumSupportedVersion": "1.0.18",
   "minimumSupportedBuild": 18,
   "minimumSupportedBuildNumber": 18,
   "mandatory": false,
   "apkUrl": "",
   "releaseNotes": "Fixed Google Sign-In / Sign-up.,Lost and Found improvements.,Nearby Healthcare now opens with Google Maps fallback actions when Places is unavailable.,Document upload and update flow reliability improvements.",
-  "sha256": "7ba9d65df017bf2c803e7428ae4169bf18a76f81e172ffb3c548b0c5ac271925",
-  "checksum": "7ba9d65df017bf2c803e7428ae4169bf18a76f81e172ffb3c548b0c5ac271925",
-  "apkFileName": "1.0.24+30.apk",
+  "sha256": "9893b437880df38a56c1e520fe884dace6ca42002b733cf68ebf3cd3f883d736",
+  "checksum": "9893b437880df38a56c1e520fe884dace6ca42002b733cf68ebf3cd3f883d736",
+  "apkFileName": "1.0.24+31.apk",
   "releaseDate": "2026-07-14T08:45:41.995Z",
-  "generatedAt": "2026-07-18T10:15:25.261Z"
+  "generatedAt": "2026-07-18T12:44:51.303Z"
 }

@@ -130,6 +130,34 @@ const UserSchema = new mongoose.Schema(
       showTopDoctors: { type: Boolean, default: true },
     },
 
+    // Account-level web and mobile preferences. These are deliberately kept
+    // separate from health-data sharing controls so a cosmetic/notification
+    // choice can never widen clinical data access.
+    preferences: {
+      language: { type: String, default: "en", trim: true, maxlength: 16 },
+      timezone: { type: String, default: "Asia/Kolkata", trim: true, maxlength: 80 },
+      theme: { type: String, default: "light", enum: ["light", "dark"] },
+      notifications: {
+        appointmentReminders: { type: Boolean, default: true },
+        medicationUpdates: { type: Boolean, default: true },
+        emergencyAlerts: { type: Boolean, default: true },
+        accountAlerts: { type: Boolean, default: true },
+      },
+      privacy: {
+        analytics: { type: Boolean, default: true },
+        marketing: { type: Boolean, default: false },
+      },
+      appearance: {
+        compactMode: { type: Boolean, default: false },
+        showAvatars: { type: Boolean, default: true },
+        animations: { type: Boolean, default: true },
+      },
+    },
+    securitySettings: {
+      sessionTimeout: { type: Number, default: 30, min: 5, max: 480 },
+      loginNotifications: { type: Boolean, default: true },
+    },
+
     // 🔹 Profile Switching fields
     linkedProfiles: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
 

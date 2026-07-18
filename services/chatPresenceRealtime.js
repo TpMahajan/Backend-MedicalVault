@@ -103,6 +103,52 @@ export function emitNewDirectMessage({ recipientId, message }) {
   });
 }
 
+// Notifies the other participant that a message was deleted, so an open
+// conversation screen updates immediately instead of waiting for the next
+// poll. Carries only safe, already-public state (ids, deletion type/time,
+// the replacement copy) — never the original message content, matching the
+// same content-scrubbing rule as the REST response for this action.
+export function emitMessageDeleted({
+  recipientId,
+  counterpartId,
+  messageId,
+  deletionType,
+  deletedAt,
+}) {
+  const payload = {
+    type: "chat:message_deleted",
+    counterpartId: asText(counterpartId),
+    messageId: asText(messageId),
+    deletionType,
+    deletedAt,
+  };
+  return sendToPrincipal(recipientId, payload);
+}
+
+// Notifies the doctor side of a session that their SessionAccessGrant
+// changed (created, updated, or revoked in whole or in part), so an open
+// patient-profile/document screen can immediately drop inaccessible records
+// or close entirely instead of waiting for the next manual refresh. Carries
+// only the new authoritative state (never document content) — the recipient
+// must treat this as a signal to re-fetch/re-render from the grant, not as
+// the full grant payload itself, since scope shapes can grow over time.
+export function emitSessionPermissionsUpdated({
+  recipientId,
+  sessionId,
+  status,
+  version,
+  changedScope,
+}) {
+  const payload = {
+    type: "session:permissions_updated",
+    sessionId: asText(sessionId),
+    status,
+    version,
+    changedScope: changedScope || null,
+  };
+  return sendToPrincipal(recipientId, payload);
+}
+
 export function initChatPresenceRealtime(server) {
   const wss = new WebSocketServer({ noServer: true });
 

@@ -16,6 +16,7 @@ import { auth } from '../middleware/auth.js';
 import { fcmLimiter } from '../middleware/rateLimit.js';
 import { User } from '../models/User.js';
 import { checkSession } from '../middleware/checkSession.js';
+import { filterDocumentsForRequester } from '../services/sessionAccessGrantService.js';
 import { checkRole, requireOwnerOrRoles } from '../middleware/rbac.js';
 import { auditTrail } from '../middleware/auditLogger.js';
 import {
@@ -103,9 +104,10 @@ router.get('/:id/records', auth, checkSession, auditTrail({
     }
 
     const patientId = String(req.params.id || "");
-    const records = (user.medicalRecords || []).filter(
+    const ownRecords = (user.medicalRecords || []).filter(
       (record) => String(record?.userId || "") === patientId
     );
+    const records = filterDocumentsForRequester(req, ownRecords);
 
     const grouped = {
       reports: records.filter((record) => record.category?.toLowerCase() === "report"),
