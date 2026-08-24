@@ -69,7 +69,14 @@ const DEFAULT_CLASSIFIER_TIMEOUT_MS = 2500;
 const DEFAULT_CATEGORY_CLASSIFIER_TIMEOUT_MS = 3000;
 const DEFAULT_VALIDATION_PDF_PAGES = 2;
 const DEFAULT_VALIDATION_TEXT_TIMEOUT_MS = 15000;
-const DEFAULT_VALIDATION_OCR_TIMEOUT_MS = 20000;
+// Dual-language (eng+hin) Tesseract OCR on a phone-camera-sized image
+// routinely takes 20-25s+ on constrained production CPUs (observed on
+// Render). The previous 20s default was shorter than real OCR runs, so the
+// request would time out and reject the upload as "not medical" a few
+// seconds before the OCR promise it abandoned actually resolved
+// successfully in the background. 45s gives real OCR runs enough headroom
+// while staying well under typical platform request timeouts (~100s).
+const DEFAULT_VALIDATION_OCR_TIMEOUT_MS = 45000;
 const VALIDATION_PDF_PAGES = parsePositiveInteger(
   process.env.DOCUMENT_VALIDATION_PDF_PAGES,
   DEFAULT_VALIDATION_PDF_PAGES,
