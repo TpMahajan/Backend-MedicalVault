@@ -26,6 +26,21 @@ export const validateStartupConfig = () => {
     "DATA_ENCRYPTION_KEY must be a 32-byte key (64 hex chars or base64)"
   );
 
+  if (String(process.env.GUEST_CLINICAL_SESSIONS_ENABLED || "false").toLowerCase() === "true") {
+    ensure(
+      strongSecret(process.env.GUEST_SESSION_SECRET),
+      "GUEST_SESSION_SECRET must be at least 32 characters when guest clinical sessions are enabled"
+    );
+    ensure(
+      strongSecret(process.env.GUEST_IP_HMAC_SECRET),
+      "GUEST_IP_HMAC_SECRET must be at least 32 characters when guest clinical sessions are enabled"
+    );
+    ensure(
+      Boolean(process.env.RESEND_API_KEY || (process.env.SMTP_USER && process.env.SMTP_PASS)),
+      "an email provider is required when guest clinical sessions are enabled"
+    );
+  }
+
   if (isProduction) {
     ensure(strongSecret(process.env.JWT_SECRET), "JWT_SECRET must be at least 32 characters in production");
     if (process.env.JWT_REFRESH_SECRET) {
@@ -41,4 +56,3 @@ export const validateStartupConfig = () => {
     );
   }
 };
-

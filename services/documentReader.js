@@ -62,6 +62,7 @@ class DocumentReader {
         try {
           const result = await this.extractFromPDF(tempFilePath, {
             parseParams: options.pdfParseParams,
+            ocrFallback: options.ocrFallback,
           });
           extractedText = result.text;
           metadata = { ...metadata, ...result.metadata };
@@ -240,29 +241,73 @@ class DocumentReader {
           ? options.parseParams
           : {};
       const result = await pdfParser.getText(parseParams);
-      
-      // Clean up the parser
-      await pdfParser.destroy();
-      
+
       console.log(`🔍 PDF parsing completed successfully`);
-      
+
       // Format the text for better readability
       const formattedText = this.formatPDFText(result);
-      
+
       console.log(`✅ PDF parsing completed:`, {
         pages: result.pages?.length || 0,
         textLength: formattedText.length,
         hasInfo: !!result.info
       });
-      
+
+      // Scanned/photographed PDFs (very common for medical documents saved
+      // via a phone's "scan" feature) have no embedded text layer, so
+      // pdf-parse returns little or nothing here. Render the pages as
+      // images and OCR them the same way image uploads already are,
+      // instead of treating the document as unreadable.
+      const ocrFallbackEnabled = options.ocrFallback?.enabled !== false;
+      const ocrMinTextLength = Number(options.ocrFallback?.minTextLength) || 30;
+      const embeddedTextLength = (result.text || '').replace(/[^a-zA-Z0-9]/g, '').length;
+      let ocrFallbackUsed = false;
+      let ocrText = '';
+
+      if (ocrFallbackEnabled && embeddedTextLength < ocrMinTextLength) {
+        try {
+          console.log(`⚠️ PDF has little/no embedded text (${embeddedTextLength} chars) — attempting OCR fallback for scanned pages`);
+          const screenshotResult = await pdfParser.getScreenshot({
+            ...(parseParams.first ? { first: parseParams.first } : {}),
+            ...(parseParams.last ? { last: parseParams.last } : {}),
+            ...(parseParams.partial?.length ? { partial: parseParams.partial } : {}),
+            scale: options.ocrFallback?.scale || 2,
+          });
+          const languages = options.ocrFallback?.languages || 'eng+hin';
+          const pageTexts = [];
+          for (const page of screenshotResult?.pages || []) {
+            const { data: { text } } = await this._withOcrWorker(languages, (worker) =>
+              worker.recognize(page.data)
+            );
+            if (text && text.trim()) {
+              pageTexts.push(
+                `\n📄 **Page ${page.pageNumber}**\n${'─'.repeat(30)}\n\n${text.trim()}`
+              );
+            }
+          }
+          ocrText = pageTexts.join('\n\n').trim();
+          ocrFallbackUsed = ocrText.length > 0;
+          console.log(`✅ PDF OCR fallback completed. Recovered text length: ${ocrText.length}`);
+        } catch (ocrError) {
+          console.warn(`⚠️ PDF OCR fallback failed: ${ocrError.message}`);
+        }
+      }
+
+      await pdfParser.destroy();
+
+      const finalText = ocrFallbackUsed
+        ? [formattedText, ocrText].filter(Boolean).join('\n\n').trim()
+        : formattedText;
+
       return {
-        text: formattedText,
+        text: finalText,
         metadata: {
           pages: result.pages?.length || 0,
           info: result.info,
           version: result.version,
           originalText: result.text || '',
-          parseParams
+          parseParams,
+          ocrFallbackUsed
         }
       };
     } catch (error) {

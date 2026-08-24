@@ -130,6 +130,15 @@ const UserSchema = new mongoose.Schema(
       showTopDoctors: { type: Boolean, default: true },
     },
 
+    // 🔹 Document upload preferences (per-account, synced across devices).
+    // aiMedicalCheckDisabled lets a patient bypass the AI/keyword medical
+    // content check on upload (e.g. if the checker is misbehaving) so they
+    // can still save a document; the malware/magic-byte security checks in
+    // routes/document.js always run regardless of this flag.
+    uploadPreferences: {
+      aiMedicalCheckDisabled: { type: Boolean, default: false },
+    },
+
     // Account-level web and mobile preferences. These are deliberately kept
     // separate from health-data sharing controls so a cosmetic/notification
     // choice can never widen clinical data access.

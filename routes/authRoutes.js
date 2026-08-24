@@ -1385,6 +1385,89 @@ const updateDashboardPreferencesHandler = async (req, res) => {
 router.put("/dashboard-preferences", auth, updateDashboardPreferencesHandler);
 router.patch("/dashboard-preferences", auth, updateDashboardPreferencesHandler);
 
+// ---------------- Document Upload Preferences ----------------
+// GET /api/auth/upload-preferences
+router.get("/upload-preferences", auth, async (req, res) => {
+  try {
+    const principalId = asText(req.auth?.id);
+    const role = lower(req.auth?.role);
+
+    if (!principalId || role !== patientRole) {
+      return res.json({
+        success: true,
+        uploadPreferences: { aiMedicalCheckDisabled: false },
+        readOnly: true,
+      });
+    }
+
+    const user = await User.findById(principalId)
+      .select("uploadPreferences")
+      .lean();
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.json({
+      success: true,
+      uploadPreferences: {
+        aiMedicalCheckDisabled: user.uploadPreferences?.aiMedicalCheckDisabled === true,
+      },
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch upload preferences" });
+  }
+});
+
+// PUT/PATCH /api/auth/upload-preferences
+const updateUploadPreferencesHandler = async (req, res) => {
+  try {
+    const principalId = asText(req.auth?.id);
+    const role = lower(req.auth?.role);
+
+    if (role !== patientRole || !principalId) {
+      return res.status(403).json({
+        success: false,
+        message: "Patient access required",
+      });
+    }
+
+    if (req.body?.aiMedicalCheckDisabled === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: "aiMedicalCheckDisabled is required",
+      });
+    }
+    const aiMedicalCheckDisabled = req.body.aiMedicalCheckDisabled === true;
+
+    const result = await User.findByIdAndUpdate(
+      principalId,
+      { $set: { "uploadPreferences.aiMedicalCheckDisabled": aiMedicalCheckDisabled } },
+      { new: true, projection: "uploadPreferences" },
+    ).lean();
+
+    if (!result) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.json({
+      success: true,
+      uploadPreferences: {
+        aiMedicalCheckDisabled: result.uploadPreferences?.aiMedicalCheckDisabled === true,
+      },
+      message: "Upload preferences updated",
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to update upload preferences" });
+  }
+};
+
+router.put("/upload-preferences", auth, updateUploadPreferencesHandler);
+router.patch("/upload-preferences", auth, updateUploadPreferencesHandler);
+
 // POST /api/auth/session/heartbeat
 router.post("/session/heartbeat", auth, async (req, res) => {
   try {

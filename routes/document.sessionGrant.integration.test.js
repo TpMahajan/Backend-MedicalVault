@@ -123,6 +123,26 @@ describe("GET /files/user/:userId — doctor list filtering", () => {
     expect(res.body.documents[0]._id).toBe(DOC_VIEWABLE);
   });
 
+  it("paginates only after grant filtering, without exposing ungranted totals", async () => {
+    injectedGrant = {
+      capabilities: { canViewDocuments: true },
+      selectedDocumentIds: [DOC_VIEWABLE],
+    };
+    const res = await request(app).get(
+      `/api/files/user/${PATIENT_ID}?page=1&limit=1`,
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.documents).toHaveLength(1);
+    expect(res.body.documents[0]._id).toBe(DOC_VIEWABLE);
+    expect(res.body.count).toBe(1);
+    expect(res.body.pagination).toEqual({
+      page: 1,
+      limit: 1,
+      total: 1,
+      hasMore: false,
+    });
+  });
+
   it("returns everything unfiltered for a patient viewing their own documents", async () => {
     injectedRole = "patient";
     injectedGrant = null;

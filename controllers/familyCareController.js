@@ -335,7 +335,13 @@ export const createProfile = async (req, res) => {
       idempotencyRecord.status = "failed";
       idempotencyRecord.failureCode = "MANAGED_PROFILE_LIMIT_REACHED";
       await idempotencyRecord.save();
-      return sendError(res, 403, "MANAGED_PROFILE_LIMIT_REACHED", "Your Family Care profile limit has been reached");
+      return sendError(
+        res,
+        403,
+        "MANAGED_PROFILE_LIMIT_REACHED",
+        `You are using ${existing} of ${maxProfiles} managed Family Care profiles.`,
+        { managedProfiles: String(existing), managedProfileLimit: String(maxProfiles) },
+      );
     }
 
     const payload = createProfilePayload({ patch, actorId: req.auth.id, relationship });
@@ -643,10 +649,11 @@ export const dashboard = async (req, res) => {
     const requestedDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || "")) ? String(req.query.date) : new Date().toISOString().slice(0, 10);
     const start = new Date(`${requestedDate}T00:00:00.000Z`);
     const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
-    const [appointments, documents, doseEvents] = await Promise.all([
+    const [appointments, documents, doseEvents, managedProfiles] = await Promise.all([
       Appointment.find({ $or: [{ patientProfileId: { $in: profileIds } }, { patientProfileId: null, patientId: { $in: identityIds } }], appointmentDate: { $gte: start }, status: { $in: ["scheduled", "confirmed", "rescheduled"] } }).sort({ appointmentDate: 1 }).lean(),
       Document.find({ $or: [{ patientProfileId: { $in: profileIds } }, { patientProfileId: null, userId: { $in: identityIds } }] }).sort({ uploadedAt: -1 }).limit(Math.max(profileIds.length * 5, 5)).lean(),
       MedicationDoseEvent.find({ patientProfileId: { $in: profileIds }, originalLocalDate: requestedDate }).lean(),
+      PatientProfile.countDocuments({ primaryOwnerUserId: req.auth.id, profileType: "managed", status: "active" }),
     ]);
     const entries = active.map((entry) => {
       const profile = entry.patientProfileId;
@@ -682,7 +689,7 @@ export const dashboard = async (req, res) => {
     const summaryMedicationState = entries.some((item) => item.medicationStatus.state === "attention")
       ? "attention"
       : entries.some((item) => item.medicationStatus.state === "scheduled") ? "scheduled" : "no_data";
-    return res.json({ success: true, data: { date: requestedDate, timezone: asText(req.query.timezone, 80) || "Asia/Kolkata", profiles: entries, familyAlerts: [], summary: { profiles: entries.length, appointmentsToday: entries.reduce((sum, item) => sum + item.appointments.today.length, 0), medicationState: summaryMedicationState } } });
+    return res.json({ success: true, data: { date: requestedDate, timezone: asText(req.query.timezone, 80) || "Asia/Kolkata", profiles: entries, managedProfiles: { used: managedProfiles, limit: Math.max(0, Number(req.familyCareEntitlement.limits.maxManagedProfiles) || 0) }, familyAlerts: [], summary: { profiles: entries.length, appointmentsToday: entries.reduce((sum, item) => sum + item.appointments.today.length, 0), medicationState: summaryMedicationState } } });
   } catch (error) {
     console.error("Family Care dashboard failed:", error.message);
     return res.status(500).json({ success: false, message: "Unable to load Family Care dashboard" });

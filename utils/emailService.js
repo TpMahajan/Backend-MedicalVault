@@ -205,6 +205,22 @@ export const sendPasswordResetEmail = async (to, name, resetLink, expiresInMinut
   return data;
 };
 
+/** A deliberately plain, single-purpose OTP email for guest clinical access.
+ * The code is never logged and does not contain patient or invitation data. */
+export const sendGuestSessionOtpEmail = async (to, code) => {
+  const text = `Medical Vault guest clinical session\n\nYour email verification code is: ${code}\n\nIt expires in 5 minutes. This verifies control of this email address only; it does not verify medical credentials.`;
+  const html = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto"><h2>Medical Vault</h2><p>Your guest clinical-session email verification code is:</p><p style="font-size:30px;font-weight:700;letter-spacing:4px">${code}</p><p>This code expires in 5 minutes. Email verification does not verify medical credentials.</p><p>If you did not request this, you can ignore this email.</p></div>`;
+  if (resend) {
+    const { data, error } = await resend.emails.send({ from: MAIL_FROM_RESEND, to, subject: "Your Medical Vault verification code", html, text });
+    if (!error && data?.id) return data;
+  }
+  if (smtpTransporter) {
+    const info = await smtpTransporter.sendMail({ from: process.env.MAIL_FROM_SMTP || MAIL_FROM, to, subject: "Your Medical Vault verification code", html, text });
+    return { id: info?.messageId };
+  }
+  throw new Error("No email provider available for guest verification");
+};
+
 /**
  * Initialize email service and check configuration
  */
@@ -241,4 +257,3 @@ export const checkEmailConfig = () => {
 
   return true;
 };
-

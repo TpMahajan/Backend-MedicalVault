@@ -135,7 +135,10 @@ export const createFamilyAppointment = async (req, res) => {
   await writeAuditLog({ req, action: "family_appointment_created", resourceType: "Appointment", resourceId: appointment._id, patientProfileId: profile._id, statusCode: 201 });
   try {
     const { sendNotificationToDoctor } = await import("../utils/notifications.js");
-    if (doctor.fcmToken) await sendNotificationToDoctor(String(doctor._id), "New Family Care appointment request", `${profile.displayName} has requested an appointment.`, { type: "APPOINTMENT_PENDING", appointmentId: String(appointment._id), patientProfileId: String(profile._id) });
+    // Lock-screen text is deliberately generic - the family member's name is
+    // PHI-adjacent and must not render on a locked device; full detail is
+    // still in `data` for the in-app view.
+    if (doctor.fcmToken) await sendNotificationToDoctor(String(doctor._id), "Medical Vault", "A new appointment request is waiting for you. Open the app to review.", { type: "APPOINTMENT_PENDING", appointmentId: String(appointment._id), patientProfileId: String(profile._id), patientName: profile.displayName });
   } catch (_) {
     // Appointment creation is durable even if a best-effort device delivery fails.
   }

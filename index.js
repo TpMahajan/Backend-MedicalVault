@@ -32,6 +32,7 @@ import doctorAuthRoutes from "./routes/doctorAuth.js"; // doctor auth ✅
 import appointmentRoutes from "./routes/appointments.js"; // appointments ✅
 import userRoutes from "./routes/user.js"; // user management
 import sessionRoutes from "./routes/sessionRoutes.js"; // session requests
+import { guestClinicalSessionRoutes, publicGuestClinicalSessionRoutes } from "./routes/guestClinicalSessions.js";
 import notificationRoutes from "./routes/notifications.js"; // notifications
 import profileRoutes from "./routes/profiles.js"; // profile switching
 import aiAssistantRoutes from "./routes/aiAssistant.js"; // AI assistant ✅
@@ -235,6 +236,8 @@ app.use("/api/patient", patientAppointmentRoutes); // patient appointments (Flut
 app.use("/api/qr", qrRoutes); // QR
 app.use("/api/users", userRoutes); // user management
 app.use("/api/sessions", sessionRoutes); // session requests
+app.use("/api/guest-sessions", guestClinicalSessionRoutes);
+app.use("/api/public/guest-sessions", publicGuestClinicalSessionRoutes);
 app.use("/api/notifications", notificationRoutes); // notifications
 app.use("/api/profiles", profileRoutes); // profile switching
 app.use("/api/ai", aiAssistantRoutes); // AI assistant ✅
@@ -264,6 +267,8 @@ app.use("/api/v1/patient", patientAppointmentRoutes);
 app.use("/api/v1/qr", qrRoutes);
 app.use("/api/v1/users", userRoutes);
 app.use("/api/v1/sessions", sessionRoutes);
+app.use("/api/v1/guest-sessions", guestClinicalSessionRoutes);
+app.use("/api/v1/public/guest-sessions", publicGuestClinicalSessionRoutes);
 app.use("/api/v1/notifications", notificationRoutes);
 app.use("/api/v1/profiles", profileRoutes);
 app.use("/api/v1/ai", aiAssistantRoutes);

@@ -686,8 +686,15 @@ const extractTextForMedicalValidation = async ({
             languages: VALIDATION_OCR_LANGUAGES,
             timeoutMs: VALIDATION_OCR_TIMEOUT_MS,
           },
+          ocrFallback: {
+            enabled: true,
+            languages: VALIDATION_OCR_LANGUAGES,
+            minTextLength: MIN_MEDICAL_TEXT_LENGTH,
+          },
         }),
-        isImage ? VALIDATION_OCR_TIMEOUT_MS : VALIDATION_TEXT_TIMEOUT_MS,
+        isImage
+          ? VALIDATION_OCR_TIMEOUT_MS
+          : VALIDATION_TEXT_TIMEOUT_MS + VALIDATION_OCR_TIMEOUT_MS,
         isImage ? "ocr" : "text_extraction",
       );
       if (!extracted?.success) {
@@ -716,8 +723,13 @@ const extractTextForMedicalValidation = async ({
       const extracted = await withTimeout(
         documentReader.extractFromPDF(localFilePath, {
           parseParams: { first: VALIDATION_PDF_PAGES },
+          ocrFallback: {
+            enabled: true,
+            languages: VALIDATION_OCR_LANGUAGES,
+            minTextLength: MIN_MEDICAL_TEXT_LENGTH,
+          },
         }),
-        VALIDATION_TEXT_TIMEOUT_MS,
+        VALIDATION_TEXT_TIMEOUT_MS + VALIDATION_OCR_TIMEOUT_MS,
         "pdf_text_extraction",
       );
       return { success: true, text: extracted?.text || "" };
@@ -1505,7 +1517,9 @@ router.post(
         });
       }
 
-      const targetUser = await User.findById(targetUserId).select("_id").lean();
+      const targetUser = await User.findById(targetUserId)
+        .select("_id uploadPreferences")
+        .lean();
       if (!targetUser) {
         return rejectUploadedFile({
           statusCode: 404,
@@ -1555,19 +1569,47 @@ router.post(
         );
       }
 
+      // A patient can opt out of the AI/keyword medical-content check from
+      // Settings > Controls (e.g. as a fallback while the checker is
+      // misbehaving) so they can still save the document. This never
+      // bypasses the magic-byte/malware security checks above, which
+      // always run.
+      const aiMedicalCheckDisabled =
+        requesterRole === "patient" &&
+        targetUser.uploadPreferences?.aiMedicalCheckDisabled === true;
+
       // ✅ Properly handle date conversion
-      const validationResult = await validateMedicalDocumentContent({
-        usingS3Storage,
-        s3Key,
-        s3Bucket,
-        localFilePath,
-        mimeType: req.file.mimetype,
-        title,
-        originalName: req.file.originalname,
-        category: requestedCategory || category,
-        userId: requesterId,
-        role: requesterRole,
-      });
+      const validationResult = aiMedicalCheckDisabled
+        ? {
+            allow: true,
+            reason: "ai_medical_check_disabled_by_user",
+            normalizedText: "",
+            classificationText: normalizeExtractedText(
+              [requestedCategory || category, title, req.file.originalname]
+                .filter(Boolean)
+                .join(" "),
+            ),
+            verification: buildVerificationPayload({
+              status: "accepted",
+              label: "UNKNOWN",
+              method: "user_disabled",
+              reason:
+                "The uploader turned off the AI medical-document check in Settings.",
+              confidence: "unknown",
+            }),
+          }
+        : await validateMedicalDocumentContent({
+            usingS3Storage,
+            s3Key,
+            s3Bucket,
+            localFilePath,
+            mimeType: req.file.mimetype,
+            title,
+            originalName: req.file.originalname,
+            category: requestedCategory || category,
+            userId: requesterId,
+            role: requesterRole,
+          });
 
       if (!validationResult.allow) {
         await cleanupRejectedUpload({
@@ -1698,11 +1740,15 @@ router.post(
             });
             await notification.save();
 
-            // Send push notification
+            // Send push notification. The lock-screen title/body are
+            // deliberately generic - the doctor name, document category,
+            // and document title are PHI-adjacent and must not render on a
+            // locked device; the full detail is still available in `data`
+            // for the app to show once the user has unlocked and opened it.
             await sendNotification(
               targetUserId,
-              "New Document Uploaded",
-              `Dr. ${doctor.name} uploaded a new ${chosenCategory.toLowerCase()} to your medical records`,
+              "Medical Vault",
+              "You have a new document update. Open the app to view it.",
               {
                 type: "FILE_UPLOAD",
                 documentId: doc._id.toString(),
@@ -1808,11 +1854,49 @@ router.get("/user/:userId", auth, checkSession, async (req, res) => {
     const allDocs = await Document.find({ userId: req.params.userId }).sort({
       createdAt: -1,
     });
-    const docs = filterDocumentsForRequester(req, allDocs);
+    let docs = [...filterDocumentsForRequester(req, allDocs)];
+    const pagingRequested = req.query.page !== undefined || req.query.limit !== undefined;
+    const page = Math.max(1, Number.parseInt(String(req.query.page || "1"), 10) || 1);
+    const limit = Math.min(50, Math.max(1, Number.parseInt(String(req.query.limit || "30"), 10) || 30));
+    const normalizeCategory = (value) => String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/ details$/, "")
+      .replace(/s$/, "");
+    const category = normalizeCategory(req.query.category);
+    const search = String(req.query.search || "").trim().toLowerCase();
+    const after = new Date(String(req.query.after || ""));
+
+    // Apply public list filters only after the established authorization filter.
+    // This keeps pagination from revealing the existence of an unshared file.
+    if (category) {
+      docs = docs.filter((doc) => normalizeCategory(doc.category || doc.type) === category);
+    }
+    if (search) {
+      docs = docs.filter((doc) => [doc.title, doc.fileName, doc.originalName]
+        .some((value) => String(value || "").toLowerCase().includes(search)));
+    }
+    if (!Number.isNaN(after.getTime())) {
+      docs = docs.filter((doc) => {
+        const documentDate = new Date(doc.date || doc.createdAt || doc.uploadedAt || 0);
+        return !Number.isNaN(documentDate.getTime()) && documentDate >= after;
+      });
+    }
+    const sort = String(req.query.sort || "newest").toLowerCase();
+    docs.sort((left, right) => {
+      if (sort === "name_asc" || sort === "name_desc") {
+        const comparison = String(left.title || left.fileName || "").localeCompare(String(right.title || right.fileName || ""));
+        return sort === "name_desc" ? -comparison : comparison;
+      }
+      const comparison = new Date(left.date || left.createdAt || left.uploadedAt || 0) - new Date(right.date || right.createdAt || right.uploadedAt || 0);
+      return sort === "oldest" ? comparison : -comparison;
+    });
+    const total = docs.length;
+    const pageDocs = pagingRequested ? docs.slice((page - 1) * limit, page * limit) : docs;
 
     // Generate signed URLs for each document
     const docsWithUrl = await Promise.all(
-      docs.map(async (doc) => {
+      pageDocs.map(async (doc) => {
         try {
           const signedUrl = await generateSignedUrl(doc.s3Key, doc.s3Bucket);
           return {
@@ -1832,8 +1916,11 @@ router.get("/user/:userId", auth, checkSession, async (req, res) => {
 
     res.json({
       success: true,
-      count: docsWithUrl.length,
+      count: pagingRequested ? total : docsWithUrl.length,
       documents: docsWithUrl,
+      ...(pagingRequested
+        ? { pagination: { page, limit, total, hasMore: page * limit < total } }
+        : {}),
     });
   } catch (err) {
     res.status(500).json({

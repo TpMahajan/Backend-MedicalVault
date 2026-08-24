@@ -80,6 +80,7 @@ const fileSchema = new mongoose.Schema(
           "ocr",
           "manual_review_required",
           "ai_classifier",
+          "user_disabled",
         ],
         default: "inconclusive",
       },

@@ -628,11 +628,13 @@ router.post("/request", auth, async (req, res) => {
       });
       await notification.save();
 
-      // Send push notification
+      // Send push notification. Lock-screen text is deliberately generic -
+      // the doctor's identity is PHI-adjacent and must not render on a
+      // locked device; full detail is still in `data` for the in-app view.
       await sendNotification(
         patientId,
-        "New Session Request",
-        `${doctorName} is requesting access to your medical records`,
+        "Medical Vault",
+        "A doctor is requesting access to your medical records. Open the app to review.",
         {
           type: "SESSION_REQUEST",
           sessionId: session._id.toString(),
@@ -2566,14 +2568,17 @@ router.delete("/end/:sessionId", auth, async (req, res) => {
       });
       await notification.save();
 
-      // Send push notification
+      // Send push notification. Lock-screen text is deliberately generic -
+      // the doctor's identity is PHI-adjacent and must not render on a
+      // locked device; full detail is still in `data` for the in-app view.
       await sendNotification(
         patientId.toString(),
-        'Session Ended',
-        `Dr. ${doctorName} has ended your access session.`,
+        'Medical Vault',
+        'Your medical records access session has ended. Open the app for details.',
         {
           type: 'SESSION_ENDED',
           sessionId: sessionId,
+          doctorName: doctorName,
           endedAt: persistedSession.endedAt.toISOString()
         }
       );

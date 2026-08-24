@@ -56,7 +56,7 @@ async function sendNotification(userId, title, body, data = {}, options = {}) {
       return false;
     }
 
-    console.log(`📱 [${notificationType}] Sending notification to user: ${user.name || user.email} (${userId})`);
+    console.log(`📱 [${notificationType}] Sending notification to user ${userId}`);
 
     // Send the push notification
     const result = await sendPushNotification(
@@ -66,7 +66,7 @@ async function sendNotification(userId, title, body, data = {}, options = {}) {
     );
 
     if (result.success) {
-      console.log(`✅ [${notificationType}] Notification sent successfully to: ${user.email || user._id}`);
+      console.log(`✅ [${notificationType}] Notification sent successfully to user ${userId}`);
       return true;
     }
 
@@ -108,7 +108,7 @@ async function sendNotificationToDoctor(doctorId, title, body, data = {}, option
       return false;
     }
 
-    console.log(`📱 [${notificationType}] Sending notification to doctor: ${doctor.name || doctor.email} (${doctorId})`);
+    console.log(`📱 [${notificationType}] Sending notification to doctor ${doctorId}`);
 
     // Send the push notification
     const result = await sendPushNotification(
@@ -118,7 +118,7 @@ async function sendNotificationToDoctor(doctorId, title, body, data = {}, option
     );
 
     if (result.success) {
-      console.log(`✅ [${notificationType}] Notification sent successfully to doctor: ${doctor.email || doctor._id}`);
+      console.log(`✅ [${notificationType}] Notification sent successfully to doctor ${doctorId}`);
       return true;
     }
 
