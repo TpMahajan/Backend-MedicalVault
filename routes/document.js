@@ -1,10 +1,13 @@
 import express from "express";
 import multer from "multer";
-import multerS3 from "multer-s3";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import {
+  DeleteObjectCommand,
+  GetObjectCommand,
+  PutObjectCommand,
+} from "@aws-sdk/client-s3";
 import axios from "axios";
 import { auth } from "../middleware/auth.js";
 import { requireVerified } from "../middleware/requireVerified.js";
@@ -662,13 +665,19 @@ const classifyMedicalTextWithAI = async (
   }
 };
 
-const withTimeout = (promise, timeoutMs, label) =>
-  Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(`${label}_timeout`)), timeoutMs);
-    }),
-  ]);
+const withTimeout = (promise, timeoutMs, label) => {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}_timeout`)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+};
+
+const extensionByMimeType = {
+  "application/pdf": "pdf",
+  "image/jpeg": "jpg",
+  "image/png": "png",
+};
 
 const extractTextForMedicalValidation = async ({
   usingS3Storage,
@@ -676,6 +685,7 @@ const extractTextForMedicalValidation = async ({
   s3Bucket,
   localFilePath,
   mimeType,
+  buffer,
   skipImageOcr = false,
 }) => {
   const normalizedMimeType = String(mimeType || "").toLowerCase();
@@ -684,7 +694,53 @@ const extractTextForMedicalValidation = async ({
     return { success: false, text: "", reason: "image_ocr_skipped" };
   }
 
+  if (usingS3Storage && buffer) {
+    // The buffer is already in memory from the upload request itself, so
+    // this never re-downloads the object that is being (or was just)
+    // written to S3 in parallel.
+    try {
+      const extracted = await withTimeout(
+        documentReader.extractTextFromBuffer(
+          buffer,
+          extensionByMimeType[normalizedMimeType] || "",
+          {
+            pdfParseParams: { first: VALIDATION_PDF_PAGES },
+            imageOcrOptions: {
+              languages: VALIDATION_OCR_LANGUAGES,
+              timeoutMs: VALIDATION_OCR_TIMEOUT_MS,
+            },
+            ocrFallback: {
+              enabled: true,
+              languages: VALIDATION_OCR_LANGUAGES,
+              minTextLength: MIN_MEDICAL_TEXT_LENGTH,
+            },
+          },
+        ),
+        isImage
+          ? VALIDATION_OCR_TIMEOUT_MS
+          : VALIDATION_TEXT_TIMEOUT_MS + VALIDATION_OCR_TIMEOUT_MS,
+        isImage ? "ocr" : "text_extraction",
+      );
+      if (!extracted?.success) {
+        return {
+          success: false,
+          text: "",
+          reason: extracted?.error || "buffer_extract_failed",
+        };
+      }
+      return { success: true, text: extracted.text || "" };
+    } catch (error) {
+      return {
+        success: false,
+        text: "",
+        reason: error.message || "buffer_extract_failed",
+      };
+    }
+  }
+
   if (usingS3Storage && s3Key && s3Bucket) {
+    // Fallback path (not expected during a normal upload, which always has
+    // a buffer): re-fetch from S3 if the bytes weren't passed in.
     try {
       const extracted = await withTimeout(
         documentReader.extractTextFromS3(s3Key, s3Bucket, {
@@ -766,6 +822,7 @@ const validateMedicalDocumentContent = async ({
   s3Bucket,
   localFilePath,
   mimeType,
+  buffer,
   title,
   originalName,
   category,
@@ -810,6 +867,7 @@ const validateMedicalDocumentContent = async ({
     s3Bucket,
     localFilePath,
     mimeType,
+    buffer,
     skipImageOcr:
       isImage &&
       ALLOW_INCONCLUSIVE_MEDICAL_UPLOADS &&
@@ -1228,12 +1286,22 @@ const readFirstBytesFromLocalFile = async (filePath, byteCount = 16) => {
   }
 };
 
-const validateMagicBytes = async ({ bucket, key, mimeType, localFilePath }) => {
+const validateMagicBytes = async ({
+  bucket,
+  key,
+  mimeType,
+  localFilePath,
+  buffer,
+}) => {
   const allowedSignatures =
     magicSignatureByMime[String(mimeType || "").toLowerCase()];
   if (!allowedSignatures || allowedSignatures.length === 0) return true;
   let firstBytes;
-  if (localFilePath) {
+  if (buffer) {
+    // Already have the bytes in memory (S3-mode upload, not yet written to
+    // S3) - no need to read anything from disk or the network.
+    firstBytes = buffer.subarray(0, 16);
+  } else if (localFilePath) {
     firstBytes = await readFirstBytesFromLocalFile(localFilePath);
   } else {
     const object = await s3Client.send(
@@ -1257,24 +1325,25 @@ const validateMagicBytes = async ({ bucket, key, mimeType, localFilePath }) => {
 };
 
 // ---------------- AWS S3 Storage ----------------
-const s3Storage = multerS3({
-  s3: s3Client,
-  bucket: BUCKET_NAME,
-  key: (req, file, cb) => {
-    const baseName = path.parse(file.originalname).name.replace(/\s+/g, "_");
-    const ext = path.extname(file.originalname).toLowerCase();
-    const fileName = `medical-vault/${Date.now()}-${baseName}${ext}`;
-    cb(null, fileName);
-  },
-  contentType: multerS3.AUTO_CONTENT_TYPE,
-  metadata: (req, file, cb) => {
-    cb(null, {
-      fieldName: file.fieldname,
-      originalName: file.originalname,
-      uploadedBy: req.auth?.id || "unknown",
-    });
-  },
-});
+// Uses memory storage rather than multerS3's stream-straight-to-S3 upload,
+// so the file's bytes are available locally as a Buffer as soon as the
+// multipart parse finishes. The medical/OCR check reads that buffer
+// directly, and the actual S3 PUT (below, in the route handler) runs
+// concurrently with that check - nothing ever re-downloads the object
+// from S3 to validate it.
+const buildS3ObjectKey = (originalname) => {
+  const baseName = path.parse(originalname).name.replace(/\s+/g, "_");
+  const ext = path.extname(originalname).toLowerCase();
+  return `medical-vault/${Date.now()}-${baseName}${ext}`;
+};
+
+const buildS3ObjectUrl = (bucket, key) =>
+  `https://${bucket}.s3.${REGION}.amazonaws.com/${String(key || "")
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/")}`;
+
+const s3MemoryStorage = multer.memoryStorage();
 
 const localDiskStorage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -1303,7 +1372,7 @@ const createUploadMiddleware = (storage) =>
     },
   });
 
-const s3Upload = createUploadMiddleware(s3Storage);
+const s3Upload = createUploadMiddleware(s3MemoryStorage);
 const localUpload = createUploadMiddleware(localDiskStorage);
 
 const singleDocumentUpload = (req, res, next) => {
@@ -1324,6 +1393,14 @@ const singleDocumentUpload = (req, res, next) => {
             req.file.key = `medical-vault/${storedFileName}`;
             req.file.bucket = "local";
             req.file.location = buildLocalUploadUrl(req, storedFileName);
+          } else if (req.file && req.documentUploadStorage === "s3") {
+            // Not uploaded yet - just the destination this request will
+            // write to. The route handler uploads req.file.buffer here
+            // concurrently with the medical/OCR check.
+            const objectKey = buildS3ObjectKey(req.file.originalname);
+            req.file.key = objectKey;
+            req.file.bucket = BUCKET_NAME;
+            req.file.location = buildS3ObjectUrl(BUCKET_NAME, objectKey);
           }
           return next();
         }
@@ -1536,19 +1613,99 @@ router.post(
         });
       }
 
-      // Security checks always run (both storage modes) before any medical
-      // classification. Malware scanning is S3-only because the external
-      // scanner fetches objects by bucket/key.
-      try {
-        const magicOk = await validateMagicBytes({
-          bucket: s3Bucket,
-          key: s3Key,
-          mimeType: req.file.mimetype,
-          localFilePath: usingS3Storage ? "" : localFilePath,
+      // Magic-byte check reads the buffer we already have in memory (S3
+      // mode) or the file already on disk (local mode) - it never touches
+      // S3, so an obviously corrupt/mismatched file is rejected before
+      // anything is uploaded or OCR'd.
+      const magicOk = await validateMagicBytes({
+        mimeType: req.file.mimetype,
+        buffer: usingS3Storage ? req.file.buffer : undefined,
+        localFilePath: usingS3Storage ? "" : localFilePath,
+      });
+      if (!magicOk) {
+        await cleanupRejectedUpload({
+          usingS3Storage,
+          s3Bucket,
+          s3Key,
+          localFilePath,
         });
-        if (!magicOk) {
-          throw new Error("Magic-byte validation failed");
-        }
+        logUploadStage("security_check_failed", req, { targetUserId });
+
+        return res.status(400).json(
+          uploadErrorPayload({
+            code: "FILE_SECURITY_CHECK_FAILED",
+            message: "Uploaded file failed security checks",
+          }),
+        );
+      }
+
+      // From here, the S3 upload and the AI/keyword medical-content check
+      // run concurrently instead of sequentially - the check reads the
+      // buffer directly, so it never has to wait for (or re-download) the
+      // object this request is writing to S3.
+      const s3UploadPromise = usingS3Storage
+        ? s3Client.send(
+            new PutObjectCommand({
+              Bucket: s3Bucket,
+              Key: s3Key,
+              Body: req.file.buffer,
+              ContentType: req.file.mimetype,
+              Metadata: {
+                fieldName: "file",
+                originalName: req.file.originalname,
+                uploadedBy: req.auth?.id || "unknown",
+              },
+            }),
+          )
+        : Promise.resolve();
+
+      // A patient can opt out of the AI/keyword medical-content check from
+      // Settings > Controls (e.g. as a fallback while the checker is
+      // misbehaving) so they can still save the document. This never
+      // bypasses the magic-byte/malware security checks, which always run.
+      const aiMedicalCheckDisabled =
+        requesterRole === "patient" &&
+        targetUser.uploadPreferences?.aiMedicalCheckDisabled === true;
+
+      const validationPromise = aiMedicalCheckDisabled
+        ? Promise.resolve({
+            allow: true,
+            reason: "ai_medical_check_disabled_by_user",
+            normalizedText: "",
+            classificationText: normalizeExtractedText(
+              [requestedCategory || category, title, req.file.originalname]
+                .filter(Boolean)
+                .join(" "),
+            ),
+            verification: buildVerificationPayload({
+              status: "accepted",
+              label: "UNKNOWN",
+              method: "user_disabled",
+              reason:
+                "The uploader turned off the AI medical-document check in Settings.",
+              confidence: "unknown",
+            }),
+          })
+        : validateMedicalDocumentContent({
+            usingS3Storage,
+            s3Key,
+            s3Bucket,
+            localFilePath,
+            buffer: usingS3Storage ? req.file.buffer : undefined,
+            mimeType: req.file.mimetype,
+            title,
+            originalName: req.file.originalname,
+            category: requestedCategory || category,
+            userId: requesterId,
+            role: requesterRole,
+          });
+
+      // Malware scanning is S3-only (the external scanner pulls the object
+      // by bucket/key), so it has to wait for the upload above to land.
+      // The medical/OCR check does not depend on it and is already running
+      // in parallel.
+      try {
+        await s3UploadPromise;
         if (usingS3Storage) {
           await runMalwareScan({
             bucket: s3Bucket,
@@ -1576,47 +1733,7 @@ router.post(
         );
       }
 
-      // A patient can opt out of the AI/keyword medical-content check from
-      // Settings > Controls (e.g. as a fallback while the checker is
-      // misbehaving) so they can still save the document. This never
-      // bypasses the magic-byte/malware security checks above, which
-      // always run.
-      const aiMedicalCheckDisabled =
-        requesterRole === "patient" &&
-        targetUser.uploadPreferences?.aiMedicalCheckDisabled === true;
-
-      // ✅ Properly handle date conversion
-      const validationResult = aiMedicalCheckDisabled
-        ? {
-            allow: true,
-            reason: "ai_medical_check_disabled_by_user",
-            normalizedText: "",
-            classificationText: normalizeExtractedText(
-              [requestedCategory || category, title, req.file.originalname]
-                .filter(Boolean)
-                .join(" "),
-            ),
-            verification: buildVerificationPayload({
-              status: "accepted",
-              label: "UNKNOWN",
-              method: "user_disabled",
-              reason:
-                "The uploader turned off the AI medical-document check in Settings.",
-              confidence: "unknown",
-            }),
-          }
-        : await validateMedicalDocumentContent({
-            usingS3Storage,
-            s3Key,
-            s3Bucket,
-            localFilePath,
-            mimeType: req.file.mimetype,
-            title,
-            originalName: req.file.originalname,
-            category: requestedCategory || category,
-            userId: requesterId,
-            role: requesterRole,
-          });
+      const validationResult = await validationPromise;
 
       if (!validationResult.allow) {
         await cleanupRejectedUpload({

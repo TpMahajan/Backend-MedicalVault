@@ -37,6 +37,93 @@ class DocumentReader {
   }
 
   /**
+   * Dispatches extraction to the right handler for a file extension. Shared
+   * by extractTextFromS3 (input = a local temp file path) and
+   * extractTextFromBuffer (input = an in-memory Buffer, no disk/network
+   * I/O) - extractFromPDF/extractFromImage both accept either.
+   */
+  async _extractByExtension(input, fileExtension, metadataBase, options = {}) {
+    let extractedText = '';
+    let metadata = { ...metadataBase };
+
+    if (this.supportedTypes.pdf.includes(fileExtension)) {
+      console.log(`📖 Extracting text from PDF...`);
+      try {
+        const result = await this.extractFromPDF(input, {
+          parseParams: options.pdfParseParams,
+          ocrFallback: options.ocrFallback,
+        });
+        extractedText = result.text;
+        metadata = { ...metadata, ...result.metadata };
+        console.log(`✅ PDF extraction completed. Text length: ${extractedText.length}`);
+      } catch (pdfError) {
+        console.warn(`⚠️ PDF extraction failed, trying fallback: ${pdfError.message}`);
+        // Fallback: return basic metadata without text extraction
+        extractedText = `[PDF Document - Text extraction failed: ${pdfError.message}]`;
+        metadata = {
+          ...metadata,
+          extractionError: pdfError.message,
+          fallbackUsed: true
+        };
+        console.log(`🔄 Using fallback for PDF extraction`);
+      }
+    } else if (this.supportedTypes.image.includes(fileExtension)) {
+      console.log(`🖼️ Extracting text from image using OCR...`);
+      const result = await this.extractFromImage(input, options.imageOcrOptions);
+      extractedText = result.text;
+      metadata = { ...metadata, ...result.metadata };
+      console.log(`✅ Image OCR completed. Text length: ${extractedText.length}`);
+    } else if (this.supportedTypes.text.includes(fileExtension) && typeof input === 'string') {
+      console.log(`📝 Extracting text from text file...`);
+      const result = await this.extractFromText(input);
+      extractedText = result.text;
+      metadata = { ...metadata, ...result.metadata };
+      console.log(`✅ Text extraction completed. Text length: ${extractedText.length}`);
+    } else {
+      throw new Error(`Unsupported file type: ${fileExtension}. Supported types: ${Object.values(this.supportedTypes).flat().join(', ')}`);
+    }
+
+    return {
+      success: true,
+      text: extractedText,
+      metadata,
+      wordCount: extractedText.split(/\s+/).length,
+      characterCount: extractedText.length
+    };
+  }
+
+  /**
+   * Extract text directly from an in-memory Buffer - no S3 download and no
+   * temp file. Used to validate a just-uploaded file without re-fetching
+   * the copy that was (or is concurrently being) written to S3.
+   * @param {Buffer} buffer - The file's raw bytes
+   * @param {string} fileExtension - e.g. "pdf", "png", "jpg" (no leading dot)
+   */
+  async extractTextFromBuffer(buffer, fileExtension, options = {}) {
+    const normalizedExtension = String(fileExtension || '').toLowerCase().replace(/^\./, '');
+    try {
+      return await this._extractByExtension(
+        buffer,
+        normalizedExtension,
+        {
+          fileType: this.getFileType(normalizedExtension),
+          fileExtension: normalizedExtension,
+          extractedAt: new Date().toISOString()
+        },
+        options,
+      );
+    } catch (error) {
+      console.error('❌ Buffer extraction error:', error.message);
+      return {
+        success: false,
+        error: error.message,
+        text: '',
+        metadata: {}
+      };
+    }
+  }
+
+  /**
    * Extract text from a document stored in S3
    * @param {string} s3Key - The S3 key of the document
    * @param {string} bucketName - The S3 bucket name
@@ -44,78 +131,30 @@ class DocumentReader {
    */
   async extractTextFromS3(s3Key, bucketName, options = {}) {
     let tempFilePath = null;
-    
+
     try {
       console.log(`📥 Downloading file from S3: ${s3Key} from bucket: ${bucketName}`);
-      
+
       // Download file from S3 to temporary location
       tempFilePath = await this.downloadFromS3(s3Key, bucketName);
       console.log(`✅ File downloaded to: ${tempFilePath}`);
-      
+
       // Get file extension
       const fileExtension = path.extname(s3Key).toLowerCase().substring(1);
       console.log(`📄 File extension: ${fileExtension}`);
-      
-      // Extract text based on file type
-      let extractedText = '';
-      let metadata = {
-        fileType: this.getFileType(fileExtension),
-        fileExtension,
-        s3Key,
-        extractedAt: new Date().toISOString()
-      };
 
-      if (this.supportedTypes.pdf.includes(fileExtension)) {
-        console.log(`📖 Extracting text from PDF...`);
-        try {
-          const result = await this.extractFromPDF(tempFilePath, {
-            parseParams: options.pdfParseParams,
-            ocrFallback: options.ocrFallback,
-          });
-          extractedText = result.text;
-          metadata = { ...metadata, ...result.metadata };
-          console.log(`✅ PDF extraction completed. Text length: ${extractedText.length}`);
-        } catch (pdfError) {
-          console.warn(`⚠️ PDF extraction failed, trying fallback: ${pdfError.message}`);
-          // Fallback: return basic metadata without text extraction
-          extractedText = `[PDF Document - Text extraction failed: ${pdfError.message}]`;
-          metadata = { 
-            ...metadata, 
-            extractionError: pdfError.message,
-            fallbackUsed: true
-          };
-          console.log(`🔄 Using fallback for PDF extraction`);
-        }
-      } else if (this.supportedTypes.image.includes(fileExtension)) {
-        console.log(`🖼️ Extracting text from image using OCR...`);
-        const result = await this.extractFromImage(
-          tempFilePath,
-          options.imageOcrOptions
-        );
-        extractedText = result.text;
-        metadata = { ...metadata, ...result.metadata };
-        console.log(`✅ Image OCR completed. Text length: ${extractedText.length}`);
-      } else if (this.supportedTypes.text.includes(fileExtension)) {
-        console.log(`📝 Extracting text from text file...`);
-        const result = await this.extractFromText(tempFilePath);
-        extractedText = result.text;
-        metadata = { ...metadata, ...result.metadata };
-        console.log(`✅ Text extraction completed. Text length: ${extractedText.length}`);
-      } else {
-        throw new Error(`Unsupported file type: ${fileExtension}. Supported types: ${Object.values(this.supportedTypes).flat().join(', ')}`);
-      }
+      const result = await this._extractByExtension(
+        tempFilePath,
+        fileExtension,
+        { fileType: this.getFileType(fileExtension), fileExtension, s3Key, extractedAt: new Date().toISOString() },
+        options,
+      );
 
       // Clean up temporary file
       await this.cleanupTempFile(tempFilePath);
       tempFilePath = null;
 
-      return {
-        success: true,
-        text: extractedText,
-        metadata,
-        wordCount: extractedText.split(/\s+/).length,
-        characterCount: extractedText.length
-      };
+      return result;
 
     } catch (error) {
       console.error('❌ Document extraction error:', error);
@@ -126,12 +165,12 @@ class DocumentReader {
         errorMessage: error.message,
         errorStack: error.stack
       });
-      
+
       // Clean up temporary file if it exists
       if (tempFilePath) {
         await this.cleanupTempFile(tempFilePath);
       }
-      
+
       return {
         success: false,
         error: error.message,
@@ -203,31 +242,41 @@ class DocumentReader {
   /**
    * Extract text from PDF file
    */
-  async extractFromPDF(filePath, options = {}) {
+  async extractFromPDF(input, options = {}) {
     try {
-      console.log(`📖 Starting PDF extraction for: ${filePath}`);
-      
-      // Check if file exists
-      if (!fs.existsSync(filePath)) {
-        throw new Error(`PDF file not found: ${filePath}`);
+      const isBuffer = Buffer.isBuffer(input);
+      console.log(`📖 Starting PDF extraction for: ${isBuffer ? '<in-memory buffer>' : input}`);
+
+      let dataBuffer;
+      if (isBuffer) {
+        if (input.length === 0) {
+          throw new Error('PDF buffer is empty');
+        }
+        dataBuffer = input;
+        console.log(`📊 PDF buffer size: ${dataBuffer.length} bytes`);
+      } else {
+        // Check if file exists
+        if (!fs.existsSync(input)) {
+          throw new Error(`PDF file not found: ${input}`);
+        }
+
+        // Check file size
+        const stats = fs.statSync(input);
+        console.log(`📊 PDF file size: ${stats.size} bytes`);
+
+        if (stats.size === 0) {
+          throw new Error('PDF file is empty');
+        }
+
+        console.log(`📄 Reading PDF file...`);
+        dataBuffer = fs.readFileSync(input);
+        console.log(`📄 PDF buffer size: ${dataBuffer.length} bytes`);
       }
-      
-      // Check file size
-      const stats = fs.statSync(filePath);
-      console.log(`📊 PDF file size: ${stats.size} bytes`);
-      
-      if (stats.size === 0) {
-        throw new Error('PDF file is empty');
-      }
-      
+
       // Dynamic import to handle ES module compatibility
       console.log(`📦 Importing pdf-parse module...`);
       const pdfParseModule = await import('pdf-parse');
       console.log(`📦 PDF parse module loaded. Available exports:`, Object.keys(pdfParseModule));
-      
-      console.log(`📄 Reading PDF file...`);
-      const dataBuffer = fs.readFileSync(filePath);
-      console.log(`📄 PDF buffer size: ${dataBuffer.length} bytes`);
       
       console.log(`🔍 Parsing PDF content...`);
       // Handle different export formats - pdf-parse exports PDFParse as a class
@@ -324,7 +373,7 @@ class DocumentReader {
     } catch (error) {
       console.error(`❌ PDF extraction error:`, error);
       console.error(`PDF extraction details:`, {
-        filePath,
+        input: Buffer.isBuffer(input) ? '<in-memory buffer>' : input,
         errorMessage: error.message,
         errorStack: error.stack
       });
